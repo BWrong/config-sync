@@ -1,0 +1,148 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fbfaf8;
+  --fg: #1c1b19;
+  --muted: #6f6a63;
+  --line: #e2ded7;
+  --accent: #8a5a2b;
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181a;
+    --fg: #eceae6;
+    --muted: #97928a;
+    --line: #2c2e31;
+    --accent: #d8a15f;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+code,
+pre {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.brand {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.chips {
+  display: flex;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.chip {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.chip b {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.inventory {
+  padding: 16px;
+}
+
+.empty {
+  margin: 64px auto;
+  max-width: 20rem;
+  color: var(--muted);
+  text-align: center;
+  font-size: 15px;
+}
+
+.empty small {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.row:first-child {
+  border-top: 0;
+}
+
+.paths {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.paths code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.arrow {
+  color: var(--muted);
+}
+
+.status {
+  flex: none;
+  color: var(--muted);
+}
+
+.status-Pending,
+.status-TargetMissing {
+  color: var(--accent);
+}
+
+.error {
+  margin: 24px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--fg);
+}
+
+.error pre {
+  overflow: auto;
+  color: var(--muted);
+  white-space: pre-wrap;
+}

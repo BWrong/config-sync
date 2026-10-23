@@ -1,0 +1,17 @@
+[package]
+name = "config-sync-app"
+description = "config-sync 的 Tauri 2 外壳：命令只做转发"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "config_sync_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+config-sync-core = { path = "../crates/core" }
+tauri = { version = "2", features = [] }

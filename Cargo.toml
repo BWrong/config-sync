@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "src-tauri"]
+# `cargo test` 只跑 Core：外壳没有测试，且它的 build.rs 需要前端产物先构建。
+default-members = ["crates/core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
