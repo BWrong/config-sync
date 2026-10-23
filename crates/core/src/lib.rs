@@ -128,7 +128,14 @@ impl Core {
         let facts = state::GitFacts::read(&self.source_dir)?;
         let mut entries = Vec::new();
 
-        for rel in paths::managed_relative_paths(&mirror_root)? {
+        let (rels, skipped_symlinks) = paths::managed_relative_paths(&mirror_root)?;
+        if skipped_symlinks > 0 {
+            // C2：符号链接被跳过 → 提示而非无声丢失；清单仍返回（用户可自行处理）。
+            eprintln!(
+                "config-sync: 跳过 {skipped_symlinks} 个符号链接（v1 不支持符号链接语义）"
+            );
+        }
+        for rel in rels {
             let source = mirror_root.join(&rel);
             let target = self.home.join(&rel);
             let status = state::derive(self.disk(rel.as_path())?, &repo_path(&rel), &facts);

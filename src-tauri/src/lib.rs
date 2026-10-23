@@ -231,6 +231,21 @@ fn commit_and_push(state: State<'_, AppState>) -> Result<PushOutcome, CoreError>
     state.runtime().core.commit_and_push()
 }
 
+/// 冲突解决：按文件二选一（保留本机 / 采用远端），然后重新提交。
+#[tauri::command]
+fn resolve_conflict(
+    state: State<'_, AppState>,
+    target: String,
+    side: String,
+) -> Result<(), CoreError> {
+    let side = match side.as_str() {
+        "ours" => config_sync_core::resolve::Side::Ours,
+        "theirs" => config_sync_core::resolve::Side::Theirs,
+        other => return Err(CoreError { kind: ErrorKind::Io, message: format!("未知的解决方向：{other}"), stderr: None }),
+    };
+    state.runtime().core.resolve_conflict(Path::new(&target), side)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -255,6 +270,7 @@ pub fn run() {
             finish_onboarding,
             pull,
             commit_and_push,
+            resolve_conflict,
             settings_view,
             save_settings
         ])

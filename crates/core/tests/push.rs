@@ -30,7 +30,7 @@ const CONTENT_RULES: &[(&str, &str, &str)] = &[
     ("github_pat_", "token=github_pat_11ABCDEFG\n", "token=github_patX11ABCDEFG\n"),
     ("AKIA", "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n", "aws_access_key_id = AKIBIOSFODNN7EXAMPLE\n"),
     (r"xox[baprs]-", "slack=xoxb-1234567890-abcdef\n", "slack=xoxz-1234567890-abcdef\n"),
-    ("sk-", "openai=sk-proj-abcdef123456\n", "openai=sk_proj_abcdef123456\n"),
+    ("sk-", "openai=sk-proj-abcdef1234567890abcdef\n", "openai=sk_proj_abcdef123456\n"),
 ];
 
 fn head_message(f: &fixtures::Fixture) -> String {

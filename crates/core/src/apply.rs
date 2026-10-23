@@ -92,7 +92,8 @@ impl Core {
                 }
             }
             None => {
-                for rel in paths::managed_relative_paths(&mirror_root)? {
+                let (rels, _skipped) = paths::managed_relative_paths(&mirror_root)?;
+                for rel in rels {
                     items.push(self.plan_item(&rel, &mirror_root, &facts)?);
                 }
             }

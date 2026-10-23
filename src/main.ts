@@ -138,6 +138,13 @@ let applySummary: ApplySummary | null = null;
 /** 上一次应用的结果（或报错），同样放进清单模板里。 */
 let applyReportHtml = "";
 
+/** 任一源操作（拉取/推送/应用/冲突解决）进行中：禁用其它源操作按钮，避免 git 序列交错。 */
+function setBusy(value: boolean): void {
+  app.querySelectorAll<HTMLButtonElement>(
+    "[data-pull],[data-push],[data-apply],[data-add],.resolve-choose",
+  ).forEach((b) => { b.disabled = value; });
+}
+
 function statusBar(status: RepoStatus): string {
   return `
     <header class="bar">
@@ -164,6 +171,14 @@ function rows(entries: InventoryEntry[]): string {
           </span>
           <span class="status status-${entry.status}">${STATUS_LABEL[entry.status]}</span>
         </button>
+        ${
+          entry.status === "Conflict"
+            ? `<span class="resolve-actions">
+                <button type="button" class="resolve-choose" data-side="ours">保留本机</button>
+                <button type="button" class="resolve-choose" data-side="theirs">采用远端</button>
+              </span>`
+            : ""
+        }
         <button type="button" class="row-edit" data-edit title="打开源目录里的副本">编辑</button>
         <div class="diff"></div>
       </li>`,
@@ -214,6 +229,27 @@ async function toggleDiff(row: HTMLLIElement): Promise<void> {
   }
 }
 
+/** 冲突解决：二选一。theirs 会覆盖本机未提交版本（C1 防线：先确认）。 */
+async function resolveRow(row: HTMLLIElement, button: HTMLButtonElement): Promise<void> {
+  const side = button.dataset.side!;
+  const target = row.dataset.target!;
+  const local = side === "theirs"
+    ? "「采用远端」会用远端版本覆盖这个文件的本机未提交改动，覆盖后不可恢复。确定吗？"
+    : "保留本机版本，并把这个文件重新提交。确定吗？";
+  if (!window.confirm(local)) return;
+  button.disabled = true;
+  const slot = row.querySelector<HTMLDivElement>(".diff")!;
+  try {
+    await invoke("resolve_conflict", { target, side });
+    await renderInventory();
+  } catch (error) {
+    slot.dataset.loaded = "false";
+    slot.innerHTML = errorPanel(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function diffLines(text: string): string {
   return text
     .split("\n")
@@ -243,7 +279,7 @@ async function pull(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>("[data-pull]")!;
   const slot = app.querySelector<HTMLDivElement>(".action-error")!;
   pushReportHtml = "";
-  button.disabled = true;
+  setBusy(true);
   button.textContent = "正在拉取…";
   try {
     await invoke("pull");
@@ -251,14 +287,15 @@ async function pull(): Promise<void> {
   } catch (error) {
     // 没有远端 / 没有上游 / 网络失败 / 无法快进：message 分类，stderr 原样展示。
     slot.innerHTML = errorPanel(error);
-    button.disabled = false;
     button.textContent = "拉取";
+  } finally {
+    setBusy(false);
   }
 }
 
 async function pushChanges(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>("[data-push]")!;
-  button.disabled = true;
+  setBusy(true);
   button.textContent = "正在推送…";
   try {
     const outcome = await invoke<PushOutcome>("commit_and_push");
@@ -271,6 +308,7 @@ async function pushChanges(): Promise<void> {
     pushReportHtml = errorPanel(error);
   }
   // 无论成败都重读：成功后 ahead 归零、清单转「一致」；失败时状态条也要反映已提交的现状。
+  setBusy(false);
   await renderInventory();
 }
 
@@ -279,6 +317,7 @@ const ACTION_LABEL: Record<ApplyAction, string> = { Create: "新建", Overwrite:
 /** 「应用」第一步：向 Core 要一份完整计划，只预览，一个字节都不写。 */
 async function startApply(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>("[data-apply]");
+  setBusy(true);
   if (button) {
     button.disabled = true;
     button.textContent = "正在计算…";
@@ -288,13 +327,11 @@ async function startApply(): Promise<void> {
     applyPlan = preview.plan;
     applySummary = preview.summary;
     applyReportHtml = "";
+    setBusy(false);
     await renderInventory();
   } catch (error) {
     app.querySelector<HTMLDivElement>(".action-error")!.innerHTML = errorPanel(error);
-    if (button) {
-      button.disabled = false;
-      button.textContent = "应用";
-    }
+    setBusy(false);
   }
 }
 
@@ -440,6 +477,10 @@ async function renderInventory(): Promise<void> {
       void pushChanges(),
     );
     app.querySelector<HTMLButtonElement>("[data-apply]")?.addEventListener("click", () => void startApply());
+    app.querySelectorAll<HTMLButtonElement>(".resolve-choose").forEach((button) => {
+      const row = button.closest<HTMLLIElement>(".row");
+      if (row) button.addEventListener("click", () => void resolveRow(row, button));
+    });
     bindSettingsEntry();
   } catch (error) {
     renderError(error);

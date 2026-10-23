@@ -34,7 +34,8 @@ const CONTENT_RULES: &[&str] = &[
     "github_pat_",
     "AKIA",
     r"xox[baprs]-",
-    "sk-",
+    // 避开 `task-`/`disk-` 之类普通文本的误伤：需要 16+ 位密钥体才算命中。
+    r"sk-[A-Za-z0-9_-]{16,}",
 ];
 
 static CONTENT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
