@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
 /** 与 Core 的 `InventoryEntry.status` 一一对应；中文文案只活在前端。 */
@@ -36,6 +37,19 @@ interface CoreError {
   stderr: string | null;
 }
 
+/** 与 Core 的 `AddResult` 一一对应：单元变体是字符串，`Rejected` 带原因。 */
+type AddResult =
+  | "Added"
+  | "AlreadyManaged"
+  | "AlreadyManagedDiffers"
+  | { Rejected: { reason: string } };
+
+interface AddOutcome {
+  /** 被添加的路径；目录会展开成其中每个文件。 */
+  target: string;
+  result: AddResult;
+}
+
 interface Settings {
   source_dir: string;
   editor_command: string;
@@ -58,6 +72,9 @@ const STATUS_LABEL: Record<Status, string> = {
 };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
+
+/** 上一次添加的结果（或报错）。放进 renderInventory 的模板里，重渲染不会丢。 */
+let addReportHtml = "";
 
 function statusBar(status: RepoStatus): string {
   return `
@@ -150,6 +167,18 @@ async function renderInventory(): Promise<void> {
     app.innerHTML = `
       ${statusBar(status)}
       <main class="inventory">
+        <div class="add-bar">
+          <button type="button" class="add-files">添加文件…</button>
+          <details class="add-paste">
+            <summary>粘贴路径</summary>
+            <form class="add-paths">
+              <textarea name="paths" rows="3" spellcheck="false"
+                placeholder="一行一个路径，文件或整棵目录；支持 ~ 开头"></textarea>
+              <button type="submit">添加</button>
+            </form>
+          </details>
+        </div>
+        <div class="add-report">${addReportHtml}</div>
         ${
           entries.length === 0
             ? `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`
@@ -168,8 +197,66 @@ async function renderInventory(): Promise<void> {
   }
 }
 
-/** 错误面板 + 一个回到设置的入口：源目录指错时人不用重启应用。 */
-function renderError(error: unknown): void {
+/** 添加结果的汇总：新增的行已经在清单里，这里只补「已在清单中 / 没添加」的说明。 */
+function addReport(outcomes: AddOutcome[]): string {
+  const count = (match: (result: AddResult) => boolean) =>
+    outcomes.filter((outcome) => match(outcome.result)).length;
+  const added = count((result) => result === "Added");
+  const managed = count((result) => result === "AlreadyManaged" || result === "AlreadyManagedDiffers");
+
+  const notes = outcomes.flatMap((outcome) => {
+    const result = outcome.result;
+    const path = `<code>${escapeHtml(outcome.target)}</code>`;
+    if (result === "Added") return [];
+    if (result === "AlreadyManaged") return [`<li>${path} 已在清单中，没有重复添加。</li>`];
+    if (result === "AlreadyManagedDiffers") {
+      return [`<li>${path} 已在清单中，但磁盘上的内容与源文件不同；没有覆盖，展开该行可看差异。</li>`];
+    }
+    return [`<li>${path} 没有添加：${escapeHtml(result.Rejected.reason)}</li>`];
+  });
+
+  return `<p class="add-summary">添加 ${added} 个文件 · 已在清单中 ${managed} 个 · 未添加 ${
+    outcomes.length - added - managed
+  } 个</p>${notes.length ? `<ul class="add-notes">${notes.join("")}</ul>` : ""}`;
+}
+
+/** 添加后清单立即重读：新行出现、状态由 Core 重算，不自动应用也不推送。 */
+async function addPaths(paths: string[]): Promise<void> {
+  try {
+    addReportHtml = addReport(await invoke<AddOutcome[]>("add", { paths }));
+  } catch (error) {
+    addReportHtml = errorPanel(error);
+  }
+  await renderInventory();
+}
+
+async function pickFiles(): Promise<void> {
+  try {
+    const selected = await open({ multiple: true, title: "选择要添加的文件" });
+    if (!selected) return;
+    await addPaths(Array.isArray(selected) ? selected : [selected]);
+  } catch (error) {
+    addReportHtml = errorPanel(error);
+    await renderInventory();
+  }
+}
+
+async function submitPasted(form: HTMLFormElement): Promise<void> {
+  const textarea = form.querySelector<HTMLTextAreaElement>("textarea")!;
+  const paths = textarea.value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (paths.length === 0) {
+    addReportHtml = `<p class="add-summary">先粘贴至少一个路径（文件或整棵目录）。</p>`;
+    await renderInventory();
+    return;
+  }
+  textarea.value = "";
+  await addPaths(paths);
+}
+
+/** 错误面板 + 一个回到设置的入口：源目录指错时人不用重启应用。 */function renderError(error: unknown): void {
   app.innerHTML = `
     ${errorPanel(error)}
     <div class="actions"><button class="nav" data-settings>设置</button></div>`;
@@ -346,6 +433,17 @@ function escapeHtml(text: string): string {
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!,
   );
 }
+
+// 添加控件在每次重渲染后都是新的，所以用事件委派挂在 #app 上，只绑一次。
+app.addEventListener("click", (event) => {
+  if ((event.target as HTMLElement).closest(".add-files")) void pickFiles();
+});
+app.addEventListener("submit", (event) => {
+  const form = (event.target as HTMLElement).closest<HTMLFormElement>(".add-paths");
+  if (!form) return;
+  event.preventDefault();
+  void submitPasted(form);
+});
 
 app.innerHTML = `<p class="empty">正在读取清单…</p>`;
 void boot();

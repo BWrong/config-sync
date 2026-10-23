@@ -356,3 +356,75 @@ pre {
 .onboarding .actions {
   margin: 16px 0 0;
 }
+
+.add-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.add-bar button,
+.add-paste summary {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.add-paste[open] {
+  flex: 1;
+  margin-bottom: 8px;
+}
+
+.add-paste[open] summary {
+  width: max-content;
+  margin-bottom: 8px;
+}
+
+.add-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  max-width: 46rem;
+}
+
+.add-paths textarea {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.add-paths button {
+  align-self: flex-start;
+}
+
+.add-report:not(:empty) {
+  margin-bottom: 12px;
+}
+
+.add-summary {
+  margin: 0 0 0;
+  color: var(--muted);
+}
+
+.add-notes {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.add-notes code {
+  color: var(--fg);
+}

@@ -8,7 +8,7 @@ mod settings;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use config_sync_core::{Core, CoreError, ErrorKind, FileDiff, InventoryEntry, RepoStatus};
+use config_sync_core::{AddOutcome, Core, CoreError, ErrorKind, FileDiff, InventoryEntry, RepoStatus};
 use serde::Serialize;
 use settings::Settings;
 use tauri::State;
@@ -100,6 +100,12 @@ fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreEr
     state.runtime().core.clone(&remote)
 }
 
+/// 把路径（文件或整棵子树）收进源目录；每条路径各自成败，逐条返回。
+#[tauri::command]
+fn add(state: State<'_, AppState>, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome>, CoreError> {
+    state.runtime().core.add(&paths)
+}
+
 #[derive(Serialize)]
 struct SettingsView {
     settings: Settings,
@@ -133,6 +139,7 @@ fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<(), C
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::from_environment())
         .invoke_handler(tauri::generate_handler![
             inventory,
@@ -141,6 +148,7 @@ pub fn run() {
             has_repo,
             source_dir,
             clone_remote,
+            add,
             settings_view,
             save_settings
         ])
