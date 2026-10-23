@@ -2,12 +2,25 @@ import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
 
 /** 与 Core 的 `InventoryEntry.status` 一一对应；中文文案只活在前端。 */
-type Status = "InSync" | "TargetMissing" | "Pending";
+type Status =
+  | "Conflict"
+  | "PendingCommit"
+  | "PendingPull"
+  | "TargetMissing"
+  | "InSync"
+  | "Pending";
 
 interface InventoryEntry {
   source: string;
   target: string;
   status: Status;
+}
+
+interface FileDiff {
+  target: string;
+  status: Status;
+  /** unified diff 文本，空串 = 两侧没有差异。 */
+  text: string;
 }
 
 interface RepoStatus {
@@ -24,8 +37,11 @@ interface CoreError {
 }
 
 const STATUS_LABEL: Record<Status, string> = {
-  InSync: "一致",
+  Conflict: "冲突",
+  PendingCommit: "待提交",
+  PendingPull: "待拉取",
   TargetMissing: "目标缺失",
+  InSync: "一致",
   Pending: "待应用",
 };
 
@@ -47,15 +63,62 @@ function rows(entries: InventoryEntry[]): string {
   return entries
     .map(
       (entry) => `
-      <li class="row">
-        <span class="paths">
-          <code>${escapeHtml(entry.source)}</code>
-          <span class="arrow">↔</span>
-          <code>${escapeHtml(entry.target)}</code>
-        </span>
-        <span class="status status-${entry.status}">${STATUS_LABEL[entry.status]}</span>
+      <li class="row" data-target="${escapeHtml(entry.target)}">
+        <button type="button" class="row-head" aria-expanded="false">
+          <span class="paths">
+            <code>${escapeHtml(entry.source)}</code>
+            <span class="arrow">↔</span>
+            <code>${escapeHtml(entry.target)}</code>
+          </span>
+          <span class="status status-${entry.status}">${STATUS_LABEL[entry.status]}</span>
+        </button>
+        <div class="diff"></div>
       </li>`,
     )
+    .join("");
+}
+
+/** 点行展开该文件的 diff；diff 由 Core 生成，这里只按行着色。 */
+async function toggleDiff(row: HTMLLIElement): Promise<void> {
+  const head = row.querySelector<HTMLButtonElement>(".row-head")!;
+  const slot = row.querySelector<HTMLDivElement>(".diff")!;
+  if (row.classList.contains("open")) {
+    row.classList.remove("open");
+    head.setAttribute("aria-expanded", "false");
+    return;
+  }
+
+  row.classList.add("open");
+  head.setAttribute("aria-expanded", "true");
+  if (slot.dataset.loaded === "true") return;
+
+  slot.dataset.loaded = "true";
+  slot.innerHTML = `<p class="diff-hint">正在读取差异…</p>`;
+  try {
+    const diff = await invoke<FileDiff>("diff", { target: row.dataset.target });
+    slot.innerHTML = diff.text
+      ? `<pre class="diff-text">${diffLines(diff.text)}</pre>`
+      : `<p class="diff-hint">两侧内容相同，没有差异。</p>`;
+  } catch (error) {
+    slot.innerHTML = errorPanel(error);
+  }
+}
+
+function diffLines(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      const kind = /^(\+\+\+|---)/.test(line)
+        ? "meta"
+        : line.startsWith("@@")
+          ? "hunk"
+          : line.startsWith("+")
+            ? "add"
+            : line.startsWith("-")
+              ? "del"
+              : "ctx";
+      return `<span class="diff-line diff-${kind}">${escapeHtml(line) || " "}</span>`;
+    })
     .join("");
 }
 
@@ -80,6 +143,12 @@ async function renderInventory(): Promise<void> {
             : `<ul class="rows">${rows(entries)}</ul>`
         }
       </main>`;
+
+    app.querySelector<HTMLUListElement>(".rows")?.addEventListener("click", (event) => {
+      const head = (event.target as HTMLElement).closest(".row-head");
+      const row = head?.closest<HTMLLIElement>(".row");
+      if (row) void toggleDiff(row);
+    });
   } catch (error) {
     app.innerHTML = `${errorPanel(error)}`;
   }
@@ -149,6 +218,8 @@ async function boot(): Promise<void> {
       return;
     }
     await renderInventory();
+    // 没有刷新按钮（fs watch 在 v0.3）：从终端切回来时重新推导一遍。
+    window.addEventListener("focus", () => void renderInventory());
   } catch (error) {
     app.innerHTML = `${errorPanel(error)}`;
   }

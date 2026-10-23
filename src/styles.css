@@ -5,6 +5,8 @@
   --muted: #6f6a63;
   --line: #e2ded7;
   --accent: #8a5a2b;
+  --danger: #a2372a;
+  --add: #2f6b3a;
   font: 13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
 }
 
@@ -15,6 +17,8 @@
     --muted: #97928a;
     --line: #2c2e31;
     --accent: #d8a15f;
+    --danger: #e0796b;
+    --add: #7fbf8a;
   }
 }
 
@@ -94,16 +98,36 @@ pre {
 }
 
 .row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 9px 12px;
   border-top: 1px solid var(--line);
 }
 
 .row:first-child {
   border-top: 0;
+}
+
+.row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.row-head:hover,
+.row.open .row-head {
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+.row-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .paths {
@@ -129,8 +153,57 @@ pre {
 }
 
 .status-Pending,
-.status-TargetMissing {
+.status-TargetMissing,
+.status-PendingCommit,
+.status-PendingPull {
   color: var(--accent);
+}
+
+.status-Conflict {
+  color: var(--danger);
+}
+
+.diff {
+  display: none;
+}
+
+.row.open .diff {
+  display: block;
+  border-top: 1px solid var(--line);
+}
+
+.diff-text {
+  margin: 0;
+  padding: 8px 12px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre;
+}
+
+.diff-line {
+  display: block;
+}
+
+.diff-add {
+  color: var(--add);
+}
+
+.diff-del {
+  color: var(--danger);
+}
+
+.diff-hunk {
+  color: var(--accent);
+}
+
+.diff-meta {
+  color: var(--muted);
+}
+
+.diff-hint {
+  margin: 0;
+  padding: 8px 12px;
+  color: var(--muted);
 }
 
 .error {

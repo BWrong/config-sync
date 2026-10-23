@@ -30,6 +30,8 @@ fn inventory_mirrors_home_subtree_and_compares_content() {
     let source = f.write_source("home/.zshrc", "export A=1\n");
     let missing_target = f.write_source("home/.config/nvim/init.lua", "-- 空\n");
     let target = f.write_home(".zshrc", "export A=1\n");
+    // 已提交，git 侧干净：状态就只由磁盘内容决定。
+    f.commit_all("config-sync: 2 files");
 
     let entries = core.inventory().unwrap();
     assert_eq!(
