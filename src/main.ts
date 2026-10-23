@@ -131,6 +131,36 @@ interface Candidate {
   exists: boolean;
 }
 
+/** 全 app 只有这一套图标：16 的方格、1.5 的笔画、圆头圆角，颜色一律 currentColor。
+ *  字形图标（↓ ✓ ⚠）依赖字体，跨平台粗细不一，所以这里全部画成 SVG。 */
+const ICON = {
+  check: '<path d="M3.4 8.4l3 3 6.2-7" />',
+  circle: '<circle cx="8" cy="8" r="5.1" />',
+  dot: '<circle cx="8" cy="8" r="3.4" fill="currentColor" stroke="none" />',
+  arrowRight: '<path d="M3.2 8h9.4M9.4 4.8L12.6 8l-3.2 3.2" />',
+  arrowDown: '<path d="M8 3.2v9.4M4.8 9.4L8 12.6l3.2-3.2" />',
+  arrowUp: '<path d="M8 12.8V3.4M4.8 6.6L8 3.4l3.2 3.2" />',
+  cross: '<path d="M4.4 4.4l7.2 7.2M11.6 4.4l-7.2 7.2" />',
+  warn: '<path d="M8 2.8l5.6 10.4H2.4L8 2.8Z" /><path d="M8 6.6v3.2" /><path d="M8 11.6h.01" />',
+  plus: '<path d="M8 3.2v9.6M3.2 8h9.6" />',
+  download: '<path d="M8 2.6v7.6M4.9 7.2L8 10.3l3.1-3.1" /><path d="M2.9 13.1h10.2" />',
+  upload: '<path d="M8 10.4V2.8M4.9 5.9L8 2.8l3.1 3.1" /><path d="M2.9 13.1h10.2" />',
+  sync: '<path d="M2.6 8a5.4 5.4 0 0 1 9.1-3.9" /><path d="M12 1.8v2.8H9.2" /><path d="M13.4 8a5.4 5.4 0 0 1-9.1 3.9" /><path d="M4 14.2v-2.8h2.8" />',
+  folder: '<path d="M2.2 11.9V4.9a1.1 1.1 0 0 1 1.1-1.1h2.9l1.3 1.6h5.2a1.1 1.1 0 0 1 1.1 1.1v5.4a1.1 1.1 0 0 1-1.1 1.1H3.3a1.1 1.1 0 0 1-1.1-1.1Z" />',
+  pencil: '<path d="M3.2 12.8l1-3 5.9-5.9a1.5 1.5 0 0 1 2.1 2.1l-5.9 5.9-3.1 1z" /><path d="M9.4 4.7l1.9 1.9" />',
+  trash: '<path d="M6.2 2.6h3.6M3.2 4.6h9.6M4.7 4.6l.6 8a1 1 0 0 0 1 .9h3.4a1 1 0 0 0 1-.9l.6-8M6.6 7v4.2M9.4 7v4.2" />',
+  sliders: '<path d="M2.6 5.6h3M8.5 5.6h5" /><circle cx="7" cy="5.6" r="1.5" /><path d="M2.6 10.4h5M10.5 10.4h2.9" /><circle cx="9" cy="10.4" r="1.5" />',
+  back: '<path d="M9.6 3.6L5.2 8l4.4 4.4M5.2 8h6.4" />',
+} as const;
+
+type IconName = keyof typeof ICON;
+
+function glyph(name: IconName, size = 16): string {
+  return `<svg class="glyph" viewBox="0 0 16 16" width="${size}" height="${size}" fill="none"
+    stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+    aria-hidden="true">${ICON[name]}</svg>`;
+}
+
 const STATUS_LABEL: Record<Status, string> = {
   Conflict: "冲突",
   PendingCommit: "待提交",
@@ -142,21 +172,21 @@ const STATUS_LABEL: Record<Status, string> = {
 };
 
 /** 状态图标：颜色之外再给一个形状，色弱也能分清。 */
-const STATUS_ICON: Record<Status, string> = {
-  Conflict: "⚠",
-  PendingCommit: "●",
-  PendingPushDelete: "✕",
-  PendingPull: "↓",
-  TargetMissing: "○",
-  InSync: "✓",
-  Pending: "→",
+const STATUS_ICON: Record<Status, IconName> = {
+  Conflict: "warn",
+  PendingCommit: "dot",
+  PendingPushDelete: "cross",
+  PendingPull: "arrowDown",
+  TargetMissing: "circle",
+  InSync: "check",
+  Pending: "arrowRight",
 };
 
 /** 图例：只看形状猜不出含义，清单下面常驻一条对照。 */
 const STATUS_LEGEND = (Object.keys(STATUS_LABEL) as Status[])
   .map(
     (status) =>
-      `<span><i class="legend-icon status-${status}">${STATUS_ICON[status]}</i> ${STATUS_LABEL[status]}</span>`,
+      `<span class="legend-item status-${status}">${glyph(STATUS_ICON[status], 14)}${STATUS_LABEL[status]}</span>`,
   )
   .join("");
 
@@ -201,14 +231,10 @@ function splitPath(path: string): { dir: string; name: string } {
   return cut === -1 ? { dir: "", name: path } : { dir: path.slice(0, cut + 1), name: path.slice(cut + 1) };
 }
 
-/** 顶栏的「打开目录」按钮：放在「设置」左边，两页共用一份标记。 */
-const OPEN_DIR_BUTTON = `
-      <button class="nav icon" data-open-dir title="打开源目录" aria-label="打开源目录">
-        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none"
-          stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2 11.8V4.6a1 1 0 0 1 1-1h3.1l1.4 1.7h5.5a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z" />
-        </svg>
-      </button>`;
+/** 顶栏右侧的两个入口：打开源目录、设置。都是同样的方形图标按钮，两页共用一份标记。 */
+const OPEN_DIR_BUTTON = `<button class="nav icon" data-open-dir title="打开源目录" aria-label="打开源目录">${glyph("folder", 15)}</button>`;
+
+const SETTINGS_BUTTON = `<button class="nav icon" data-settings title="设置" aria-label="设置">${glyph("sliders", 15)}</button>`;
 
 /** 任一源操作（拉取/推送/应用/冲突解决）进行中：禁用其它源操作按钮，避免 git 序列交错。 */
 function setBusy(value: boolean): void {
@@ -217,16 +243,23 @@ function setBusy(value: boolean): void {
   ).forEach((b) => { b.disabled = value; });
 }
 
+/** 图标按钮不能换成文案（会撑破固定宽度），进行中改成转圈，同时更新无障碍名。 */
+function markBusy(button: HTMLButtonElement, busy: boolean, label: string): void {
+  button.classList.toggle("busy", busy);
+  button.title = label;
+  button.setAttribute("aria-label", label);
+}
+
 function statusBar(status: RepoStatus): string {
   return `
     <header class="bar">
       <span class="chips">
         <span class="chip">分支 <b>${escapeHtml(status.branch)}</b></span>
-        <span class="chip">↑${status.ahead} ↓${status.behind}</span>
+        <span class="chip">${glyph("arrowUp", 11)}${status.ahead} ${glyph("arrowDown", 11)}${status.behind}</span>
         <span class="chip">未提交 <b>${status.dirty}</b></span>
       </span>
 ${OPEN_DIR_BUTTON}
-      <button class="nav" data-settings title="设置">设置</button>
+${SETTINGS_BUTTON}
     </header>`;
 }
 
@@ -234,13 +267,13 @@ ${OPEN_DIR_BUTTON}
 function pendingHint(status: RepoStatus): string {
   const parts: string[] = [];
   if (status.dirty > 0) {
-    parts.push(`<span>● 本机有 ${status.dirty} 处改动还没提交，推送会一并提交</span>`);
+    parts.push(`<span>${glyph("dot", 13)}本机有 ${status.dirty} 处改动还没提交，推送会一并提交</span>`);
   }
   if (status.ahead > 0) {
-    parts.push(`<span>↑ 本机有 ${status.ahead} 个提交还没推到远端</span>`);
+    parts.push(`<span>${glyph("arrowUp", 13)}本机有 ${status.ahead} 个提交还没推到远端</span>`);
   }
   if (status.behind > 0) {
-    parts.push(`<span>↓ 远端有 ${status.behind} 个提交还没拉下来，先拉取</span>`);
+    parts.push(`<span>${glyph("arrowDown", 13)}远端有 ${status.behind} 个提交还没拉下来，先拉取</span>`);
   }
   return parts.length ? `<p class="pending-hint">${parts.join("")}</p>` : "";
 }
@@ -289,9 +322,8 @@ function rows(entries: InventoryEntry[]): string {
           title="选择这一行" aria-label="选择这一行" ${entry.deleted ? "disabled" : ""} />
         <button type="button" class="row-head" aria-expanded="false" title="展开或收起差异">
           <span class="status status-${entry.status}" role="img"
-            title="${STATUS_LABEL[entry.status]}" aria-label="${STATUS_LABEL[entry.status]}">
-            <span class="status-icon" aria-hidden="true">${STATUS_ICON[entry.status]}</span>
-          </span>
+            title="${STATUS_LABEL[entry.status]}" aria-label="${STATUS_LABEL[entry.status]}"
+          >${glyph(STATUS_ICON[entry.status], 16)}</span>
           <span class="paths" title="${pair}">
             <code${gone} title="源目录里的副本"><span class="dir">${escapeHtml(mirror.dir)}</span>${escapeHtml(mirror.name)}</code>
             <span class="arrow">↔</span>
@@ -310,12 +342,7 @@ function rows(entries: InventoryEntry[]): string {
         }
         ${entry.deleted ? "" : `<span class="row-actions">
           <button type="button" class="row-action" data-edit title="编辑：打开源目录里的副本"
-            aria-label="编辑">
-            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none"
-              stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 13l1.1-3.1 6-6a1.5 1.5 0 0 1 2.1 2.1l-6 6L3 13zM9.5 4.6l1.9 1.9" />
-            </svg>
-          </button>
+            aria-label="编辑">${glyph("pencil", 16)}</button>
         </span>`}
         <div class="diff"></div>
       </li>`;
@@ -346,8 +373,8 @@ function confirmAction(message: string, okLabel: string, danger = false): Promis
     const overlay = document.createElement("div");
     overlay.className = "modal";
     overlay.innerHTML = `
-      <div class="modal-box" role="dialog" aria-modal="true">
-        <p class="modal-text">${escapeHtml(message)}</p>
+      <div class="modal-box" role="dialog" aria-modal="true" aria-describedby="modal-text">
+        <p class="modal-text" id="modal-text">${escapeHtml(message)}</p>
         <div class="modal-actions">
           <button type="button" class="modal-cancel">取消</button>
           <button type="button" class="modal-ok${danger ? " danger" : ""}">${escapeHtml(okLabel)}</button>
@@ -485,23 +512,23 @@ async function pull(): Promise<void> {
   const slot = app.querySelector<HTMLDivElement>(".action-error")!;
   pushReportHtml = "";
   setBusy(true);
-  button.textContent = "正在拉取…";
+  markBusy(button, true, "正在拉取…");
   try {
     await invoke("pull");
     await renderInventory();
   } catch (error) {
     // 没有远端 / 没有上游 / 网络失败 / 无法快进：message 分类，stderr 原样展示。
     slot.innerHTML = errorPanel(error);
-    button.textContent = "拉取";
   } finally {
+    markBusy(button, false, "拉取");
     setBusy(false);
   }
 }
 
 async function pushChanges(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>("[data-push]")!;
+  markBusy(button, true, "正在推送…");
   setBusy(true);
-  button.textContent = "正在推送…";
   try {
     const outcome = await invoke<PushOutcome>("commit_and_push");
     pushReportHtml = outcome.committed
@@ -513,16 +540,17 @@ async function pushChanges(): Promise<void> {
     pushReportHtml = errorPanel(error);
   }
   // 无论成败都重读：成功后 ahead 归零、清单转「一致」；失败时状态条也要反映已提交的现状。
+  markBusy(button, false, "推送");
   setBusy(false);
   await renderInventory();
 }
 
 /** 跳过项的图标：一句话太长，用图标 + 悬停说明。 */
-const SKIP_HINT: Record<SkipReason, { icon: string; label: string }> = {
-  InSync: { icon: "✓", label: "内容已一致，不用写" },
-  SourceMissing: { icon: "○", label: "源目录里没有这个副本，不会覆盖目标" },
-  Uncommitted: { icon: "●", label: "源目录里还有未提交的改动，先推送再应用" },
-  Conflict: { icon: "⚠", label: "源目录与远端都改了这个文件，先解决冲突" },
+const SKIP_HINT: Record<SkipReason, { icon: IconName; label: string }> = {
+  InSync: { icon: "check", label: "内容已一致，不用写" },
+  SourceMissing: { icon: "circle", label: "源目录里没有这个副本，不会覆盖目标" },
+  Uncommitted: { icon: "dot", label: "源目录里还有未提交的改动，先推送再应用" },
+  Conflict: { icon: "warn", label: "源目录与远端都改了这个文件，先解决冲突" },
 };
 
 const ACTION_LABEL: Record<ApplyAction, string> = { Create: "新建", Overwrite: "覆盖", Skip: "跳过" };
@@ -533,7 +561,7 @@ async function startApply(): Promise<void> {
   setBusy(true);
   if (button) {
     button.disabled = true;
-    button.textContent = "正在计算…";
+    markBusy(button, true, "正在计算…");
   }
   try {
     const preview = await invoke<ApplyPreview>("plan_apply", { targets: null });
@@ -544,6 +572,7 @@ async function startApply(): Promise<void> {
     await renderInventory();
   } catch (error) {
     app.querySelector<HTMLDivElement>(".action-error")!.innerHTML = errorPanel(error);
+    if (button) markBusy(button, false, "应用");
     setBusy(false);
   }
 }
@@ -559,19 +588,15 @@ function renderApplyPreview(): void {
 
   app.innerHTML = `
     <header class="bar">
-      <button type="button" class="nav back icon" data-cancel-apply title="返回清单（不写盘）" aria-label="返回清单">
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
-          stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M9.5 3.5 5 8l4.5 4.5M5 8h6.5" />
-        </svg>
-      </button>
+      <button type="button" class="nav back icon" data-cancel-apply title="返回清单（不写盘）" aria-label="返回清单"
+      >${glyph("back", 15)}</button>
       <span class="chips">
         <span class="chip">新建 <b>${summary.create}</b></span>
         <span class="chip">覆盖 <b>${summary.overwrite}</b></span>
         <span class="chip">跳过 <b>${summary.skip}</b></span>
       </span>
 ${OPEN_DIR_BUTTON}
-      <button class="nav" data-settings title="设置">设置</button>
+${SETTINGS_BUTTON}
     </header>
     <main class="inventory apply-preview">
       <p class="apply-hint">${
@@ -619,14 +644,15 @@ function applyItemHtml(item: ApplyItem): string {
   // 跳过项不写一句话，只在路径前面放个图标，说明留给悬停。
   const hint = item.skip_reason ? SKIP_HINT[item.skip_reason] : null;
   // 非跳过项也留出这一格，左侧边界才对齐。
-  const icon = hint
-    ? `<span class="apply-skip-icon" role="img" title="${escapeHtml(hint.label)}"
-         aria-label="${escapeHtml(hint.label)}">${hint.icon}</span>`
+  const marker = hint
+    ? `<span class="apply-skip-icon status-${item.skip_reason}" role="img"
+         title="${escapeHtml(hint.label)}"
+         aria-label="${escapeHtml(hint.label)}">${glyph(hint.icon, 14)}</span>`
     : `<span class="apply-skip-icon" aria-hidden="true"></span>`;
   return `
     <li class="apply-item apply-${item.action}">
       <div class="apply-head">
-        ${icon}
+        ${marker}
         <code title="${escapeHtml(item.target)}">${escapeHtml(applyPath(item))}</code>
         <span class="apply-tag apply-tag-${item.action}">${ACTION_LABEL[item.action]}</span>
       </div>
@@ -689,30 +715,15 @@ async function renderInventory(): Promise<void> {
       ${pendingHint(status)}
       <div class="toolbar">
         <button type="button" class="add-files" title="添加文件" aria-label="添加文件">
-          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none"
-            stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
-            <path d="M8 3.2v9.6M3.2 8h9.6" />
-          </svg>
-          添加文件
+          ${glyph("plus", 14)}添加文件
         </button>
         <button type="button" class="batch-remove" data-batch-remove hidden disabled
-          title="移除选中的文件（不删 $HOME 原文件）" aria-label="移除选中的文件">
-          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none"
-            stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
-            <path d="M6 2.5h4M3 4.5h10M4.6 4.5l.6 8a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.6-8M6.6 7v4M9.4 7v4" />
-          </svg>
-        </button>
-        <button type="button" data-pull title="拉取" aria-label="拉取">↓</button>
-        <button type="button" data-push title="推送" aria-label="推送">↑</button>
-        <button type="button" data-apply title="应用：把源目录的内容写到 $HOME" aria-label="应用">
-          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
-            stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M2.4 8a5.6 5.6 0 0 1 9.4-4.1" />
-            <path d="M12.4 1.6v2.9H9.5" />
-            <path d="M13.6 8a5.6 5.6 0 0 1-9.4 4.1" />
-            <path d="M3.6 14.4v-2.9h2.9" />
-          </svg>
-        </button>
+          title="移除选中的文件（不删 $HOME 原文件）" aria-label="移除选中的文件"
+        >${glyph("trash", 14)}</button>
+        <button type="button" data-pull title="拉取" aria-label="拉取">${glyph("download", 14)}</button>
+        <button type="button" data-push title="推送" aria-label="推送">${glyph("upload", 14)}</button>
+        <button type="button" data-apply title="应用：把源目录的内容写到 $HOME" aria-label="应用"
+        >${glyph("sync", 14)}</button>
       </div>
       <div class="action-error">${pushReportHtml}</div>
       <main class="inventory">
@@ -819,7 +830,8 @@ async function pickFiles(): Promise<void> {
 function renderError(error: unknown): void {
   app.innerHTML = `
     ${errorPanel(error)}
-    <div class="actions">${OPEN_DIR_BUTTON}<button class="nav" data-settings title="设置">设置</button></div>`;
+    <div class="actions">${OPEN_DIR_BUTTON}<button class="nav" data-settings title="设置"
+      >${glyph("sliders", 15)}设置</button></div>`;
   bindSettingsEntry();
 }
 
@@ -858,12 +870,8 @@ async function renderSettings(): Promise<void> {
 
   app.innerHTML = `
     <header class="bar">
-      <button type="button" class="nav back icon" data-back title="返回清单" aria-label="返回清单">
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
-          stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M9.5 3.5 5 8l4.5 4.5M5 8h6.5" />
-        </svg>
-      </button>
+      <button type="button" class="nav back icon" data-back title="返回清单" aria-label="返回清单"
+      >${glyph("back", 15)}</button>
       <span class="chips"><span class="chip">设置</span></span>
     </header>
     <main class="settings">
@@ -1051,7 +1059,8 @@ function renderOnboarding(sourceDir: string): void {
         <button type="submit" title="把远端仓库 clone 到源目录">clone</button>
       </form>
       <div class="clone-error"></div>
-      <div class="actions">${OPEN_DIR_BUTTON}<button class="nav" data-settings title="设置">设置</button></div>
+      <div class="actions">${OPEN_DIR_BUTTON}<button class="nav" data-settings title="设置"
+        >${glyph("sliders", 15)}设置</button></div>
     </main>`;
 
   const form = app.querySelector<HTMLFormElement>(".clone-form")!;

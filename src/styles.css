@@ -73,8 +73,28 @@ pre {
 
 /* 键盘可达性：只在键盘导航时出现，鼠标点击不留框。 */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
   outline-offset: 2px;
+}
+
+/* 全 app 图标：16 方格、1.5 笔画、圆头圆角，颜色一律 currentColor。 */
+.glyph {
+  display: block;
+}
+
+svg {
+  flex: none;
+}
+
+/* 图标按钮转圈：按钮尺寸不彰驾（不会撑破固定宽度）。 */
+.busy .glyph {
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .muted {
@@ -103,12 +123,20 @@ pre {
 }
 
 .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 2px 8px;
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  background: var(--surface);
+}
+
+.chip .glyph {
+  opacity: 0.65;
 }
 
 .chip b {
@@ -117,15 +145,20 @@ pre {
 }
 
 .nav {
-  padding: 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 11px;
   border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
+  border-radius: 7px;
+  background: var(--surface);
   color: var(--muted);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
-  transition: color 120ms ease, border-color 120ms ease;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
 .nav:hover {
@@ -135,20 +168,15 @@ pre {
 
 /* 图标按钮：方形、无文案，靠 title / aria-label 说明。 */
 .nav.icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   width: 28px;
-  height: 26px;
   padding: 0;
 }
 
+/* 返回按钮：语义上是导航，左右多给点留白，好点好按；不锁宽度。 */
 .nav.back {
-  margin-left: 0;
-}
-
-.nav + .nav {
-  margin-left: 0;
+  width: auto;
+  padding: 0 12px;
+  flex: none;
 }
 
 /* ── 状态提示行 ───────────────────────────────────────── */
@@ -156,10 +184,17 @@ pre {
 .pending-hint {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 2px 18px;
   margin: 10px 16px 0;
   color: var(--accent);
   font-size: 12px;
+}
+
+.pending-hint .glyph {
+  margin-right: 5px;
+  vertical-align: -2px;
+  display: inline;
 }
 
 /* ── 工具栏 ───────────────────────────────────────────── */
@@ -176,11 +211,11 @@ pre {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
+  width: 32px;
   height: 28px;
   padding: 0;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   background: var(--surface);
   color: var(--muted);
   font: inherit;
@@ -200,7 +235,6 @@ pre {
 }
 
 /* 唯一的主按钮：添加文件。整页只有这一处是实心的。 */
-/* 唯一的主按钮：添加文件。整页只有这一处用图标那条渐变。 */
 .toolbar .add-files {
   width: auto;
   gap: 6px;
@@ -210,6 +244,7 @@ pre {
   background: var(--accent);
   color: var(--on-accent);
   font-size: 12px;
+  font-weight: 600;
 }
 
 /* 注意 :enabled 和 button 元素都算权重，所以这里必须写全，
@@ -223,6 +258,7 @@ pre {
 /* 批量移除是破坏性动作，常态就用警示色。 */
 .toolbar .batch-remove {
   color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
 }
 
 .toolbar .batch-remove:hover:enabled {
@@ -268,7 +304,7 @@ h2 {
   margin: 0 0 10px;
   padding: 7px 10px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   background: var(--surface);
   color: inherit;
   font: inherit;
@@ -305,9 +341,14 @@ h2 {
 }
 
 /* 图例里的符号直接借用状态色，方便和上面的图标对上号。 */
-.legend-icon {
-  margin-right: 3px;
-  font-style: normal;
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.legend-item .glyph {
+  display: block;
 }
 
 /* 空清单：用虚线框表示「这里本该有东西」，文案负责指路。 */
@@ -336,7 +377,7 @@ h2 {
 .row {
   position: relative;
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr);
+  grid-template-columns: 44px minmax(0, 1fr);
   border-top: 1px solid var(--line);
 }
 
@@ -408,10 +449,11 @@ h2 {
   height: 15px;
   margin: 0;
   appearance: none;
-  border: 1px solid color-mix(in srgb, var(--fg) 24%, transparent);
+  border: 1.5px solid color-mix(in srgb, var(--fg) 26%, transparent);
   border-radius: 4px;
   background: var(--surface);
   cursor: pointer;
+  transition: border-color 100ms ease, background 100ms ease;
 }
 
 .row-check:checked {
@@ -435,11 +477,6 @@ h2 {
   justify-content: center;
   width: 22px;
   height: 22px;
-  font-size: 12px;
-}
-
-.status-icon {
-  line-height: 1;
 }
 
 .status-Pending,
@@ -557,7 +594,7 @@ h2 {
 
 .diff-line {
   display: block;
-  padding: 0 14px 0 34px;
+  padding: 0 14px 2px 34px;
   white-space: pre;
 }
 
@@ -702,10 +739,23 @@ h2 {
 /* 跳过项：图标占位保证左边界与上面一致。 */
 .apply-skip-icon {
   flex: none;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 1.2em;
   color: var(--muted);
-  text-align: center;
+}
+
+.apply-skip-icon.status-InSync {
+  color: var(--add);
+}
+
+.apply-skip-icon.status-Uncommitted {
+  color: var(--accent);
+}
+
+.apply-skip-icon.status-Conflict {
+  color: var(--danger);
 }
 
 .apply-item.apply-Skip code {
@@ -752,9 +802,12 @@ h2 {
 }
 
 .apply-actions button {
-  padding: 7px 14px;
+  height: 30px;
+  min-width: 72px;
+  justify-content: center;
+  padding: 0 14px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   background: var(--surface);
   color: var(--fg);
   font: inherit;
@@ -867,9 +920,12 @@ h2 {
 
 .clone-form button,
 .actions button {
-  padding: 7px 14px;
+  height: 30px;
+  min-width: 72px;
+  justify-content: center;
+  padding: 0 14px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   background: var(--surface);
   color: var(--fg);
   font: inherit;
@@ -879,6 +935,7 @@ h2 {
 }
 
 .clone-form button {
+  min-width: 0;
   border-color: transparent;
   background: var(--accent);
   color: var(--on-accent);
@@ -1016,14 +1073,18 @@ h2 {
 }
 
 .modal-actions button {
-  padding: 6px 13px;
+  height: 30px;
+  min-width: 64px;
+  justify-content: center;
+  padding: 0 14px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 7px;
   background: transparent;
   color: var(--fg);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
 }
 
 .modal-actions .modal-ok {
