@@ -68,6 +68,12 @@ fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreEr
     state.core.clone(&remote)
 }
 
+/// 拉取：`fetch` + `merge --ff-only`，只更新源目录，不动任何目标文件。
+#[tauri::command]
+fn pull(state: State<'_, AppState>) -> Result<(), CoreError> {
+    state.core.pull()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(state_from_environment())
@@ -77,7 +83,8 @@ pub fn run() {
             diff,
             has_repo,
             source_dir,
-            clone_remote
+            clone_remote,
+            pull
         ])
         .run(tauri::generate_context!())
         .expect("config-sync 启动失败");

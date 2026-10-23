@@ -70,6 +70,43 @@ impl Core {
         Ok(())
     }
 
+    /// 拉取：`fetch` 之后只允许 `merge --ff-only`。
+    ///
+    /// 只更新源目录里的仓库，**绝不写任何目标文件**；拉完清单里相关行会变成待应用。
+    /// 任何会生成 merge commit 的路径都不存在：不能快进就直接拒绝（附带 git 原始 stderr），
+    /// 源目录保持原样。
+    pub fn pull(&self) -> Result<(), CoreError> {
+        let remote_url = git::run(&self.source_dir, &["remote", "get-url", "origin"])
+            .map_err(|e| CoreError {
+                message: "源目录没有配置远端，无法拉取".to_string(),
+                ..e
+            })?;
+
+        let upstream = git::run(
+            &self.source_dir,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        .map_err(|e| CoreError {
+            message: "当前分支没有上游分支，无法拉取；先推送一次建立跟踪".to_string(),
+            ..e
+        })?;
+
+        git::run(&self.source_dir, &["fetch", "origin"]).map_err(|e| CoreError {
+            message: format!("拉取失败：无法从远端 {remote_url} 取回最新提交"),
+            ..e
+        })?;
+
+        git::run(&self.source_dir, &["merge", "--ff-only", &upstream]).map_err(|e| CoreError {
+            message: format!(
+                "拉取被拒：无法快进到 {upstream}（本机有远端没有的提交，或工作区改动挡住了合并），\
+                 需要手动处理；源目录保持原样，没有产生 merge commit"
+            ),
+            ..e
+        })?;
+
+        Ok(())
+    }
+
     /// 受管文件的完整列表。完全没有受管文件时返回空集合（不是错误）。
     pub fn inventory(&self) -> Result<Vec<InventoryEntry>, CoreError> {
         let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);
