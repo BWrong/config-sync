@@ -10,6 +10,7 @@ mod error;
 mod git;
 mod inventory;
 mod paths;
+mod push;
 mod state;
 
 pub use add::{AddOutcome, AddResult};
@@ -17,6 +18,7 @@ pub use config::Config;
 pub use editor::Attempt;
 pub use error::{CoreError, ErrorKind};
 pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
+pub use push::PushOutcome;
 
 use std::path::{Path, PathBuf};
 
