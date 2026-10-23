@@ -4,6 +4,7 @@
 //! `#[tauri::command]` 只做转发，逻辑都在这里。
 
 mod config;
+mod editor;
 mod error;
 mod git;
 mod inventory;
@@ -11,6 +12,7 @@ mod paths;
 mod state;
 
 pub use config::Config;
+pub use editor::Attempt;
 pub use error::{CoreError, ErrorKind};
 pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
 
@@ -19,7 +21,6 @@ use std::path::{Path, PathBuf};
 pub struct Core {
     home: PathBuf,
     source_dir: PathBuf,
-    #[allow(dead_code)] // 后续票据（设置、编辑）读它；本票不需要。
     config: Config,
 }
 
@@ -174,6 +175,40 @@ impl Core {
             status,
             text: unified_diff(&old_label, &new_label, &old, &new),
         })
+    }
+
+    /// 打开一行的源文件（受管副本，绝不是 `$HOME` 里的目标文件）要用的尝试序列；不执行进程。
+    ///
+    /// 源文件不在磁盘上（清单过期或被删）时直接报错，不把空路径交给编辑器。
+    pub fn edit_plan(&self, target: &Path) -> Result<Vec<Attempt>, CoreError> {
+        let rel = target.strip_prefix(&self.home).map_err(|_| {
+            CoreError::io(format!(
+                "{} 不在 {} 下，没有对应的受管文件",
+                target.display(),
+                self.home.display()
+            ))
+        })?;
+        let source = self.source_dir.join(paths::MIRROR_ROOT).join(rel);
+        if !source.is_file() {
+            return Err(CoreError::io(format!(
+                "源文件 {} 不存在（清单可能已过期），不打开空路径；请重新读取清单",
+                source.display()
+            )));
+        }
+        editor::plan(&self.config.editor_command, &source)
+    }
+
+    /// 用 `editor_command`（或系统 `open`）打开源文件，拉起即返回，不等编辑器退出；
+    /// 保存后的清单刷新靠外壳的 fs watch。
+    pub fn edit(&self, target: &Path) -> Result<(), CoreError> {
+        let mut last = None;
+        for attempt in self.edit_plan(target)? {
+            match attempt.run() {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| CoreError::io("没有可用的打开方式")))
     }
 
     /// 目标文件与源文件的关系；源文件是受管文件本身，读不到是真错误。
