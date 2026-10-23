@@ -1,40 +1,46 @@
 # config-sync
 
-把 `$HOME` 下零散的配置文件托管在一个 git 仓库里（默认 `~/.config-sync`），并在多台机器之间搬运。
+把 `$HOME` 下零散的配置文件托管在一个 git 仓库里（默认 `~/.local/share/config-sync`），并在多台机器之间搬运。
 界面是一张**清单**：每个受管文件一行，显示源↔目标路径与状态。
 
 技术栈与行为规则见 [DESIGN.md](./DESIGN.md)，术语见 [GLOSSARY.md](./GLOSSARY.md)，
-镜像布局的理由见 [docs/adr/0001-mirror-directory-layout.md](./docs/adr/0001-mirror-directory-layout.md)。
+镜像布局的理由见 [docs/adr/0001-mirror-directory-layout.md](./docs/adr/0001-mirror-directory-layout.md)，
+出 Windows 版要动的地方见 [docs/windows.md](./docs/windows.md)。
 
 ## 目录
 
 ```
-crates/core/          Rust Core（库）：清单、git 子进程、路径推导、clone。唯一测试 seam
-  src/                lib.rs / config.rs / error.rs / git.rs / inventory.rs / paths.rs
+crates/core/          Rust Core（库）：清单、git 子进程、路径推导、六态判定、增删改应用推送拉取。唯一测试 seam
+  src/                lib.rs（Core 门面）+ add / apply / config / editor / error / git /
+                      inventory / onboarding / paths / push / remove / resolve / state
   tests/fixtures/     真 git 测试夹具（临时 home + 临时源目录 + 临时裸远端）
-  tests/inventory.rs  Core 的行为测试
-  tests/clone.rs      clone 的行为测试
+  tests/*.rs          按功能一块：add / apply / clone / diff / edit / inventory /
+                      onboarding / pull / push / remove / resolve / status
 src-tauri/            Tauri 2 外壳：#[tauri::command] 只做转发
   src/settings.rs     config.toml 的读写与 `~` 展开
+  src/watch.rs        源目录 fs watch（300ms 防抖）→ 前端重读清单
+  src/onboarding.rs   首次向导的完成标记
 src/                  前端（Vite + TypeScript，无 UI 框架）
 ```
 
 ## 配置
 
-`~/Library/Application Support/config-sync/config.toml`，**不进 git**；首次启动自动写入默认值：
+`~/.config/config-sync/config.toml`，**不进 git**；首次启动自动写入默认值：
 
 ```toml
-source_dir = "~/.config-sync"
+source_dir = "~/.local/share/config-sync"
 editor_command = ""        # 空 = 用系统关联 app；支持 `{}` 占位符
 branch = "main"
 ```
+
+远端地址不存在这里：它属于源目录仓库的 git 配置（`remote.origin.url`），在设置界面里直接改，保存时走 `git remote set-url`（没有 origin 就 `remote add`）。
 
 首次启动（源目录里还没有仓库）会要求输入远端地址并 clone；clone 完停在清单，不写任何目标文件。
 
 ## 跑测试
 
 ```sh
-cargo test                    # 只跑 Core（workspace 的 default-members）
+cargo test                    # Core + 外壳，整个 workspace
 cargo test -p config-sync-app # 外壳里的 config.toml 读写
 cargo check --workspace       # Core + 外壳一起检查
 ```
@@ -58,7 +64,7 @@ npm run build                 # tsc --noEmit + vite build → dist/
 ## 打包 macOS .app
 
 ```sh
-npm run tauri build           # → target/release/bundle/macos/config-sync.app
+npm run tauri build           # → target/release/bundle/macos/ConfigSync.app
 ```
 
 只装了 Command Line Tools（没有完整 Xcode）也能出包；打包出的 `.app` 双击即可启动。

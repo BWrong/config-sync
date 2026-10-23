@@ -86,3 +86,27 @@ fn remote_url_reports_origin_and_keeps_gits_own_words_when_there_is_no_repo() {
     assert_eq!(err.kind, ErrorKind::Git);
     assert!(!err.stderr.unwrap_or_default().trim().is_empty(), "git 的原话要带回来");
 }
+
+#[test]
+fn setting_the_remote_replaces_or_adds_origin() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+
+    // 已经有 origin：换掉地址，分支和提交不受影响。
+    core.set_remote("file:///tmp/dotfiles-a.git").expect("替换 origin 应成功");
+    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-a.git");
+
+    core.set_remote("file:///tmp/dotfiles-b.git").expect("再次替换 origin 应成功");
+    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-b.git");
+
+    // 没有 origin 时用 add，不是 set-url。
+    f.git(&["remote", "remove", "origin"]);
+    assert!(core.remote_url().is_err(), "去掉 origin 后读不到地址");
+    core.set_remote("file:///tmp/dotfiles-c.git").expect("给没有 origin 的仓库补地址应成功");
+    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-c.git");
+
+    // 空地址直接拒绝，且不改动已有 origin。
+    let rejected = core.set_remote("   ").expect_err("空地址应被拒绝");
+    assert_eq!(rejected.kind, ErrorKind::Io);
+    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-c.git");
+}

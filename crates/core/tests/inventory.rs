@@ -42,8 +42,9 @@ fn inventory_mirrors_home_subtree_and_compares_content() {
                 source: missing_target,
                 target: f.home.join(".config/nvim/init.lua"),
                 status: Status::TargetMissing,
+                deleted: false,
             },
-            InventoryEntry { source, target, status: Status::InSync },
+            InventoryEntry { source, target, status: Status::InSync, deleted: false },
         ]
     );
 
@@ -80,4 +81,25 @@ fn repo_status_follows_real_git_state_and_the_bare_remote() {
     f.git(&["fetch", "origin"]);
     let status = core.repo_status().unwrap();
     assert_eq!((status.ahead, status.behind, status.dirty), (0, 1, 0));
+}
+
+#[test]
+fn a_deleted_mirror_file_stays_listed_as_pending_commit() {
+    let (f, core) = core();
+    let target = f.write_home(".zshrc", "export A=1\n");
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+
+    core.remove(&[target.clone()]).unwrap();
+
+    // 源文件没了，但 git 里那条删除还没提交：清单要能看见它，否则待推送的删除无从下手。
+    let entries = core.inventory().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].target, target);
+    assert_eq!(entries[0].status, Status::PendingCommit);
+    assert!(entries[0].deleted);
+
+    // 展开这一行：HEAD 里的内容对空内容，正好是这个删除本身。
+    let diff = core.diff(&target).unwrap();
+    assert!(diff.text.contains("-export A=1"), "{}", diff.text);
 }

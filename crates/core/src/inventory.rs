@@ -10,6 +10,8 @@ pub struct InventoryEntry {
     /// 目标文件的绝对路径（`home` 下的镜像位置）。
     pub target: PathBuf,
     pub status: Status,
+    /// 源目录里这个副本已经被删掉，只剩 git 里那条未提交的删除（等推送记录）。
+    pub deleted: bool,
 }
 
 /// 一行此刻的状态，全部由「源目录 git 事实 × 目标文件比较」推导，见 `state::derive`。

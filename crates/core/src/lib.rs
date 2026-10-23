@@ -13,11 +13,15 @@ mod inventory;
 mod onboarding;
 mod paths;
 mod push;
+pub mod remove;
 pub mod resolve;
 mod state;
 
 pub use add::{AddOutcome, AddResult};
-pub use apply::{ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary};
+pub use remove::{RemoveOutcome, RemoveResult};
+pub use apply::{
+    ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary, SkipReason,
+};
 pub use config::Config;
 pub use editor::Attempt;
 pub use error::{CoreError, ErrorKind};
@@ -26,7 +30,8 @@ pub use onboarding::Candidate;
 pub use push::PushOutcome;
 pub use resolve::Side;
 
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
 pub struct Core {
     home: PathBuf,
@@ -122,24 +127,60 @@ impl Core {
         git::run(&self.source_dir, &["remote", "get-url", "origin"])
     }
 
+    /// 写入或替换 origin 的地址；不动分支、提交和工作区。
+    pub fn set_remote(&self, url: &str) -> Result<(), CoreError> {
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(CoreError::io("请填写远端仓库地址"));
+        }
+        let remotes = git::run(&self.source_dir, &["remote"])?;
+        let verb = if remotes.lines().any(|line| line.trim() == "origin") {
+            "set-url"
+        } else {
+            "add"
+        };
+        git::run(&self.source_dir, &["remote", verb, "origin", url])?;
+        Ok(())
+    }
+
     /// 受管文件的完整列表。完全没有受管文件时返回空集合（不是错误）。
     pub fn inventory(&self) -> Result<Vec<InventoryEntry>, CoreError> {
         let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);
         let facts = state::GitFacts::read(&self.source_dir)?;
         let mut entries = Vec::new();
 
-        let (rels, skipped_symlinks) = paths::managed_relative_paths(&mirror_root)?;
+        let (mut rels, skipped_symlinks) = paths::managed_relative_paths(&mirror_root)?;
         if skipped_symlinks > 0 {
             // C2：符号链接被跳过 → 提示而非无声丢失；清单仍返回（用户可自行处理）。
             eprintln!(
                 "config-sync: 跳过 {skipped_symlinks} 个符号链接（v1 不支持符号链接语义）"
             );
         }
+        // 删掉的文件在磁盘上已经没有了，但 git 里那条删除还等着推送：不列出来的话，
+        // 清单上根本看不见「待提交」的删除。
+        let mut deleted = HashSet::new();
+        for path in facts.dirty_paths() {
+            let Ok(rel) = path.strip_prefix(paths::MIRROR_ROOT) else { continue };
+            // 磁盘上真没有才算删除；符号链接在这里也不收（C2 的跳过口径一致）。
+            if std::fs::symlink_metadata(mirror_root.join(rel)).is_ok() {
+                continue;
+            }
+            if rels.iter().any(|known| known == rel) {
+                continue;
+            }
+            rels.push(rel.to_path_buf());
+            deleted.insert(rel.to_path_buf());
+        }
+        rels.sort();
+
         for rel in rels {
             let source = mirror_root.join(&rel);
             let target = self.home.join(&rel);
-            let status = state::derive(self.disk(rel.as_path())?, &repo_path(&rel), &facts);
-            entries.push(InventoryEntry { source, target, status });
+            let gone = deleted.contains(&rel);
+            // 已经删掉的行没有源文件可比，磁盘侧按「无可比对象」算；状态由 git 事实定。
+            let disk = if gone { state::Disk::Missing } else { self.disk(rel.as_path())? };
+            let status = state::derive(disk, &repo_path(&rel), &facts);
+            entries.push(InventoryEntry { source, target, status, deleted: gone });
         }
 
         Ok(entries)
@@ -164,7 +205,9 @@ impl Core {
         let repo_path = repo_path(rel);
         let repo = repo_path.display().to_string();
         let facts = state::GitFacts::read(&self.source_dir)?;
-        let status = state::derive(self.disk(rel)?, &repo_path, &facts);
+        // 源文件已经被删（待提交的删除）时没有可比的一侧，磁盘侧按「无可比对象」算。
+        let disk = if source.is_file() { self.disk(rel)? } else { state::Disk::Missing };
+        let status = state::derive(disk, &repo_path, &facts);
 
         let (old_label, old, new_label, new) = match status {
             Status::PendingCommit | Status::Conflict => (
@@ -229,6 +272,20 @@ impl Core {
     }
 
     /// 目标文件与源文件的关系；源文件是受管文件本身，读不到是真错误。
+    /// 把 `$HOME` 下的路径换算成镜像内相对路径；`$HOME` 之外（或带 `..` 这类穿透成分）返回 `None`。
+    pub(crate) fn mirror_relative_path(&self, path: &Path) -> Option<PathBuf> {
+        // 粘贴进来的 `~/…` 按注入的 $HOME 展开（不读环境变量）。
+        let expanded = match path.strip_prefix("~") {
+            Ok(rest) => self.home.join(rest),
+            Err(_) => path.to_path_buf(),
+        };
+        if let Some(rel) = inside(&expanded, &self.home) {
+            return Some(rel);
+        }
+        // 选择器与终端常给出带符号链接的路径（macOS 上 /tmp、/var 都是软链）：按真实路径再试一次。
+        inside(&expanded.canonicalize().ok()?, &self.home.canonicalize().ok()?)
+    }
+
     fn disk(&self, rel: &Path) -> Result<state::Disk, CoreError> {
         let target = self.home.join(rel);
         let target_bytes = match std::fs::read(&target) {
@@ -271,6 +328,16 @@ impl Core {
 /// 源目录里一条受管文件相对仓库根的路径（`home/<rel>`）；git 的输出都以它为键。
 fn repo_path(rel: &Path) -> PathBuf {
     Path::new(paths::MIRROR_ROOT).join(rel)
+}
+
+/// `path` 相对 `home` 的纯普通路径；不在 `home` 下或带 `..`/`.` 这类穿透成分时返回 `None`。
+fn inside(path: &Path, home: &Path) -> Option<PathBuf> {
+    let rel = path.strip_prefix(home).ok()?;
+    // `..` 会让 join 出来的源路径穿出 home/，一律不收。
+    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    Some(rel.to_path_buf())
 }
 
 /// 读文件成文本；不存在（目标缺失、新文件没有 HEAD 版本）按空内容。

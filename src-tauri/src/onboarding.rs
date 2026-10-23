@@ -1,6 +1,6 @@
 //! 首次使用向导的「已完成」标记。
 //!
-//! 标记落在 app 配置目录（`~/Library/Application Support/config-sync/`），不进 git 仓库：
+//! 标记落在 app 配置目录（`~/.config/config-sync/`），不进 git 仓库：
 //! 向导只该出现一次，之后要加文件走清单页的添加入口。勾选添加与直接跳过都算走过。
 
 use std::path::{Path, PathBuf};
@@ -41,8 +41,8 @@ mod tests {
 
         let marker = marker_path(home.path());
         assert!(marker.starts_with(crate::settings::app_dir(home.path())));
-        assert!(marker.to_string_lossy().contains("Application Support/config-sync"));
-        assert!(!marker.starts_with(home.path().join(".config-sync")), "标记不进源目录");
+        assert!(marker.to_string_lossy().contains(".config/config-sync"));
+        assert!(!marker.starts_with(home.path().join(".local/share/config-sync")), "标记不进源目录");
     }
 
     #[test]
