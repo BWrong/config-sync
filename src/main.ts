@@ -32,6 +32,15 @@ interface RepoStatus {
   dirty: number;
 }
 
+/** 与 Core 的 `PushOutcome` 一一对应。 */
+interface PushOutcome {
+  /** false = 没有需要推送的改动。 */
+  committed: boolean;
+  files: number;
+  message: string;
+  remote_url: string;
+}
+
 interface CoreError {
   kind: "Git" | "Io";
   message: string;
@@ -76,6 +85,9 @@ const app = document.querySelector<HTMLDivElement>("#app")!;
 
 /** 上一次添加的结果（或报错）。放进 renderInventory 的模板里，重渲染不会丢。 */
 let addReportHtml = "";
+
+/** 上一次推送的结果（或硬拦/失败报错），同上。 */
+let pushReportHtml = "";
 
 function statusBar(status: RepoStatus): string {
   return `
@@ -181,6 +193,7 @@ function errorPanel(error: unknown): string {
 async function pull(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>("[data-pull]")!;
   const slot = app.querySelector<HTMLDivElement>(".action-error")!;
+  pushReportHtml = "";
   button.disabled = true;
   button.textContent = "正在拉取…";
   try {
@@ -194,6 +207,26 @@ async function pull(): Promise<void> {
   }
 }
 
+/** 顶部全局动作「推送」：硬拦 → 自动提交 → push。
+ *  命中硬拦或 push 失败时 errorPanel 里是 Core 的人话（含点名规则与文件、git 原始 stderr）。 */
+async function pushChanges(): Promise<void> {
+  const button = app.querySelector<HTMLButtonElement>("[data-push]")!;
+  button.disabled = true;
+  button.textContent = "正在推送…";
+  try {
+    const outcome = await invoke<PushOutcome>("commit_and_push");
+    pushReportHtml = outcome.committed
+      ? `<p class="add-summary">已推送 ${outcome.files} 个文件到 <code>${escapeHtml(
+          outcome.remote_url,
+        )}</code>：${escapeHtml(outcome.message)}</p>`
+      : `<p class="add-summary">没有需要推送的改动。</p>`;
+  } catch (error) {
+    pushReportHtml = errorPanel(error);
+  }
+  // 无论成败都重读：成功后 ahead 归零、清单转「一致」；失败时状态条也要反映已提交的现状。
+  await renderInventory();
+}
+
 async function renderInventory(): Promise<void> {
   try {
     const [entries, status] = await Promise.all([
@@ -204,8 +237,9 @@ async function renderInventory(): Promise<void> {
       ${statusBar(status)}
       <div class="toolbar">
         <button type="button" data-pull>拉取</button>
+        <button type="button" data-push>推送</button>
       </div>
-      <div class="action-error"></div>
+      <div class="action-error">${pushReportHtml}</div>
       <main class="inventory">
         <div class="add-bar">
           <button type="button" class="add-files">添加文件…</button>
@@ -238,6 +272,9 @@ async function renderInventory(): Promise<void> {
       }
     });
     app.querySelector<HTMLButtonElement>("[data-pull]")?.addEventListener("click", () => void pull());
+    app.querySelector<HTMLButtonElement>("[data-push]")?.addEventListener("click", () =>
+      void pushChanges(),
+    );
     bindSettingsEntry();
   } catch (error) {
     renderError(error);

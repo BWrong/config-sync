@@ -53,6 +53,11 @@ impl GitFacts {
 
         Ok(GitFacts { dirty, unmerged, remote_changed })
     }
+
+    /// 未提交改动涉及的仓库内路径（推送前的硬拦扫这些文件）。
+    pub(crate) fn dirty_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.dirty.iter()
+    }
 }
 
 /// 目标文件与源文件的关系（纯磁盘事实）。

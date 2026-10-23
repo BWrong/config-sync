@@ -9,7 +9,7 @@ mod watch;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use config_sync_core::{AddOutcome, Core, CoreError, ErrorKind, FileDiff, InventoryEntry, RepoStatus};
+use config_sync_core::{AddOutcome, Core, CoreError, ErrorKind, FileDiff, InventoryEntry, PushOutcome, RepoStatus};
 use serde::Serialize;
 use settings::Settings;
 use tauri::{AppHandle, Manager, State};
@@ -175,6 +175,12 @@ fn pull(state: State<'_, AppState>) -> Result<(), CoreError> {
     state.runtime().core.pull()
 }
 
+/// 推送：硬拦 → `git add -A` → 自动提交 → `git push`，全在 Core 的一个方法里。
+#[tauri::command]
+fn commit_and_push(state: State<'_, AppState>) -> Result<PushOutcome, CoreError> {
+    state.runtime().core.commit_and_push()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -193,6 +199,7 @@ pub fn run() {
             clone_remote,
             add,
             pull,
+            commit_and_push,
             settings_view,
             save_settings
         ])
