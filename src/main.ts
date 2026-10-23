@@ -7,6 +7,7 @@ import "./styles.css";
 type Status =
   | "Conflict"
   | "PendingCommit"
+  | "PendingPushDelete"
   | "PendingPull"
   | "TargetMissing"
   | "InSync"
@@ -16,7 +17,7 @@ interface InventoryEntry {
   source: string;
   target: string;
   status: Status;
-  /** 源目录里这个副本已被删除，只剩 git 里那条未提交的删除（等推送记录）。 */
+  /** 源目录里这个副本已不在了：未提交的删除，或已提交未推送的删除。 */
   deleted: boolean;
 }
 
@@ -133,6 +134,7 @@ interface Candidate {
 const STATUS_LABEL: Record<Status, string> = {
   Conflict: "冲突",
   PendingCommit: "待提交",
+  PendingPushDelete: "待推送删除",
   PendingPull: "待拉取",
   TargetMissing: "目标缺失",
   InSync: "一致",
@@ -143,6 +145,7 @@ const STATUS_LABEL: Record<Status, string> = {
 const STATUS_ICON: Record<Status, string> = {
   Conflict: "⚠",
   PendingCommit: "●",
+  PendingPushDelete: "✕",
   PendingPull: "↓",
   TargetMissing: "○",
   InSync: "✓",
@@ -151,7 +154,10 @@ const STATUS_ICON: Record<Status, string> = {
 
 /** 图例：只看形状猜不出含义，清单下面常驻一条对照。 */
 const STATUS_LEGEND = (Object.keys(STATUS_LABEL) as Status[])
-  .map((status) => `<span>${STATUS_ICON[status]} ${STATUS_LABEL[status]}</span>`)
+  .map(
+    (status) =>
+      `<span><i class="legend-icon status-${status}">${STATUS_ICON[status]}</i> ${STATUS_LABEL[status]}</span>`,
+  )
   .join("");
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -172,6 +178,10 @@ let applyReportHtml = "";
 /** 源目录绝对路径，boot 时取一次：清单里每行都重复的长前缀靠它省掉。 */
 let sourceDir = "";
 
+/** 过滤词与上一次拿到清单：只过滤已有数据，不重新问后端。 */
+let query = "";
+let lastEntries: InventoryEntry[] = [];
+
 /** 源目录里的副本 → 镜像内相对路径；源目录未知时 `null`。 */
 function mirrorRel(source: string): string | null {
   const mirror = `${sourceDir.replace(/\/+$/, "")}/home/`;
@@ -191,10 +201,19 @@ function splitPath(path: string): { dir: string; name: string } {
   return cut === -1 ? { dir: "", name: path } : { dir: path.slice(0, cut + 1), name: path.slice(cut + 1) };
 }
 
+/** 顶栏的「打开目录」按钮：放在「设置」左边，两页共用一份标记。 */
+const OPEN_DIR_BUTTON = `
+      <button class="nav icon" data-open-dir title="打开源目录" aria-label="打开源目录">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none"
+          stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 11.8V4.6a1 1 0 0 1 1-1h3.1l1.4 1.7h5.5a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z" />
+        </svg>
+      </button>`;
+
 /** 任一源操作（拉取/推送/应用/冲突解决）进行中：禁用其它源操作按钮，避免 git 序列交错。 */
 function setBusy(value: boolean): void {
   app.querySelectorAll<HTMLButtonElement>(
-    "[data-pull],[data-push],[data-apply],[data-add],.resolve-choose",
+    "[data-pull],[data-push],[data-apply],[data-add],[data-batch-remove],.resolve-choose",
   ).forEach((b) => { b.disabled = value; });
 }
 
@@ -206,6 +225,7 @@ function statusBar(status: RepoStatus): string {
         <span class="chip">↑${status.ahead} ↓${status.behind}</span>
         <span class="chip">未提交 <b>${status.dirty}</b></span>
       </span>
+${OPEN_DIR_BUTTON}
       <button class="nav" data-settings title="设置">设置</button>
     </header>`;
 }
@@ -225,6 +245,34 @@ function pendingHint(status: RepoStatus): string {
   return parts.length ? `<p class="pending-hint">${parts.join("")}</p>` : "";
 }
 
+/** 按路径过滤：源与目标两侧都算，大小写不敏感。 */
+function visibleEntries(entries: InventoryEntry[]): InventoryEntry[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return entries;
+  return entries.filter((entry) =>
+    `${mirrorRel(entry.source) ?? entry.source} ${entry.target}`.toLowerCase().includes(needle),
+  );
+}
+
+/** 清单区（列表 + 图例）：过滤时只换这一块，输入框不丢焦点。 */
+function listHtml(entries: InventoryEntry[]): string {
+  if (entries.length === 0) {
+    return `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`;
+  }
+  const visible = visibleEntries(entries);
+  if (visible.length === 0) {
+    return `<p class="empty">没有匹配的文件<small>过滤的是 home/… 与 ~/… 两列路径。</small></p>`;
+  }
+  return `<ul class="rows">${rows(visible)}</ul><p class="legend">${STATUS_LEGEND}</p>`;
+}
+
+/** 勾选中的行（批量移除用）。 */
+function selectedTargets(): string[] {
+  return Array.from(app.querySelectorAll<HTMLInputElement>(".row-check:checked"), (box) => {
+    return box.dataset.target!;
+  });
+}
+
 function rows(entries: InventoryEntry[]): string {
   return entries
     .map((entry) => {
@@ -237,6 +285,8 @@ function rows(entries: InventoryEntry[]): string {
       return `
       <li class="row" data-target="${escapeHtml(entry.target)}"
         data-rel="${escapeHtml(rel ?? "")}">
+        <input type="checkbox" class="row-check" data-target="${escapeHtml(entry.target)}"
+          title="选择这一行" aria-label="选择这一行" ${entry.deleted ? "disabled" : ""} />
         <button type="button" class="row-head" aria-expanded="false" title="展开或收起差异">
           <span class="status status-${entry.status}" role="img"
             title="${STATUS_LABEL[entry.status]}" aria-label="${STATUS_LABEL[entry.status]}">
@@ -264,13 +314,6 @@ function rows(entries: InventoryEntry[]): string {
             <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none"
               stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 13l1.1-3.1 6-6a1.5 1.5 0 0 1 2.1 2.1l-6 6L3 13zM9.5 4.6l1.9 1.9" />
-            </svg>
-          </button>
-          <button type="button" class="row-action" data-delete title="从源目录移除（不删 $HOME 原文件）"
-            aria-label="移除">
-            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none"
-              stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
-              <path d="M6 2.5h4M3 4.5h10M4.6 4.5l.6 8a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.6-8M6.6 7v4M9.4 7v4" />
             </svg>
           </button>
         </span>`}
@@ -330,21 +373,19 @@ function confirmAction(message: string, okLabel: string, danger = false): Promis
   });
 }
 
-/** 「移除」：把源目录里的副本删掉，$HOME 下的原文件不动。
- *  删除在 git 里是未提交的删除，「推送」时才真正提交。 */
-async function removeRow(row: HTMLLIElement, button: HTMLButtonElement): Promise<void> {
-  const target = row.dataset.target!;
-  const short = shortTarget(target, row.dataset.rel || null);
+/** 「移除」：把源目录里勾选的副本删掉，$HOME 下的原文件不动；删除作为待提交改动留在 git 里。 */
+async function removeSelected(button: HTMLButtonElement): Promise<void> {
+  const targets = selectedTargets();
+  if (targets.length === 0) return;
   const ok = await confirmAction(
-    `从源目录移除 ${short}？\n\n$HOME 下的原文件不受影响，之后可以重新添加。`,
+    `从源目录移除选中的 ${targets.length} 个文件？\n\n$HOME 下的原文件不受影响，之后可以重新添加。`,
     "移除",
     true,
   );
   if (!ok) return;
   button.disabled = true;
   try {
-    const outcomes = await invoke<RemoveOutcome[]>("remove", { targets: [target] });
-    addReportHtml = removeReport(outcomes);
+    addReportHtml = removeReport(await invoke<RemoveOutcome[]>("remove", { targets }));
   } catch (error) {
     addReportHtml = errorPanel(error);
   }
@@ -529,6 +570,7 @@ function renderApplyPreview(): void {
         <span class="chip">覆盖 <b>${summary.overwrite}</b></span>
         <span class="chip">跳过 <b>${summary.skip}</b></span>
       </span>
+${OPEN_DIR_BUTTON}
       <button class="nav" data-settings title="设置">设置</button>
     </header>
     <main class="inventory apply-preview">
@@ -653,6 +695,13 @@ async function renderInventory(): Promise<void> {
           </svg>
           添加文件
         </button>
+        <button type="button" class="batch-remove" data-batch-remove hidden disabled
+          title="移除选中的文件（不删 $HOME 原文件）" aria-label="移除选中的文件">
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none"
+            stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+            <path d="M6 2.5h4M3 4.5h10M4.6 4.5l.6 8a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.6-8M6.6 7v4M9.4 7v4" />
+          </svg>
+        </button>
         <button type="button" data-pull title="拉取" aria-label="拉取">↓</button>
         <button type="button" data-push title="推送" aria-label="推送">↑</button>
         <button type="button" data-apply title="应用：把源目录的内容写到 $HOME" aria-label="应用">
@@ -669,24 +718,21 @@ async function renderInventory(): Promise<void> {
       <main class="inventory">
         <div class="add-report">${addReportHtml}</div>
         <div class="apply-report">${applyReportHtml}</div>
-        ${
-          entries.length === 0
-            ? `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`
-            : `<ul class="rows">${rows(entries)}</ul>
-              <p class="legend">${STATUS_LEGEND}</p>`
-        }
+        ${entries.length === 0 ? "" : `<input class="search" type="search" placeholder="按路径过滤…"
+          value="${escapeHtml(query)}" aria-label="按路径过滤" spellcheck="false" />`}
+        <div class="list">${listHtml(entries)}</div>
       </main>`;
 
-    app.querySelector<HTMLUListElement>(".rows")?.addEventListener("click", (event) => {
+    lastEntries = entries;
+
+    const main = app.querySelector<HTMLElement>("main.inventory")!;
+    main.addEventListener("click", (event) => {
       const target = event.target as HTMLElement;
       const edit = target.closest<HTMLButtonElement>("[data-edit]");
-      const remove = target.closest<HTMLButtonElement>("[data-delete]");
       const row = target.closest<HTMLLIElement>(".row");
       if (!row) return;
       if (edit) {
         void editRow(row, edit);
-      } else if (remove) {
-        void removeRow(row, remove);
       } else if (target.closest(".row-head")) {
         void toggleDiff(row);
       }
@@ -699,6 +745,25 @@ async function renderInventory(): Promise<void> {
     app.querySelectorAll<HTMLButtonElement>(".resolve-choose").forEach((button) => {
       const row = button.closest<HTMLLIElement>(".row");
       if (row) button.addEventListener("click", () => void resolveRow(row, button));
+    });
+
+    // 勾选状态决定批量移除按钮是否出现：列表被过滤重绘后勾选会清空，按钮也跟着隐藏。
+    const batch = app.querySelector<HTMLButtonElement>("[data-batch-remove]");
+    const syncBatch = () => {
+      if (!batch) return;
+      const count = selectedTargets().length;
+      batch.hidden = count === 0;
+      batch.disabled = count === 0;
+    };
+    main.addEventListener("change", (event) => {
+      if ((event.target as HTMLElement).classList.contains("row-check")) syncBatch();
+    });
+    batch?.addEventListener("click", () => void removeSelected(batch));
+    app.querySelector<HTMLInputElement>(".search")?.addEventListener("input", (event) => {
+      query = (event.target as HTMLInputElement).value;
+      const list = app.querySelector<HTMLElement>(".list");
+      if (list) list.innerHTML = listHtml(lastEntries);
+      syncBatch();
     });
     bindSettingsEntry();
   } catch (error) {
@@ -750,10 +815,11 @@ async function pickFiles(): Promise<void> {
   }
 }
 
-/** 错误面板 + 一个回到设置的入口：源目录指错时人不用重启应用。 */function renderError(error: unknown): void {
+/** 错误面板 + 一个回到设置的入口：源目录指错时人不用重启应用。 */
+function renderError(error: unknown): void {
   app.innerHTML = `
     ${errorPanel(error)}
-    <div class="actions"><button class="nav" data-settings title="设置">设置</button></div>`;
+    <div class="actions">${OPEN_DIR_BUTTON}<button class="nav" data-settings title="设置">设置</button></div>`;
   bindSettingsEntry();
 }
 
@@ -761,6 +827,23 @@ function bindSettingsEntry(): void {
   app.querySelectorAll<HTMLButtonElement>("[data-settings]").forEach((button) => {
     button.addEventListener("click", () => void renderSettings());
   });
+  app.querySelectorAll<HTMLButtonElement>("[data-open-dir]").forEach((button) => {
+    button.addEventListener("click", () => void openSourceDir());
+  });
+}
+
+/** 「打开目录」：在 Finder 里打开源目录，方便直接看 `home/` 里都有什么。 */
+async function openSourceDir(): Promise<void> {
+  try {
+    await invoke("open_source_dir");
+  } catch (error) {
+    const slot = app.querySelector<HTMLDivElement>(".action-error");
+    if (slot) {
+      slot.innerHTML = errorPanel(error);
+    } else {
+      renderError(error);
+    }
+  }
 }
 
 /** 设置面板：源目录 / 远端 / 编辑器命令 / 分支。保存只落盘与写 git 配置，不提交、不写 $HOME。 */
@@ -968,7 +1051,7 @@ function renderOnboarding(sourceDir: string): void {
         <button type="submit" title="把远端仓库 clone 到源目录">clone</button>
       </form>
       <div class="clone-error"></div>
-      <div class="actions"><button class="nav" data-settings title="设置">设置</button></div>
+      <div class="actions">${OPEN_DIR_BUTTON}<button class="nav" data-settings title="设置">设置</button></div>
     </main>`;
 
   const form = app.querySelector<HTMLFormElement>(".clone-form")!;

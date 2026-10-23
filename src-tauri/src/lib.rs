@@ -125,6 +125,12 @@ fn source_dir(state: State<'_, AppState>) -> String {
     state.runtime().source_dir.display().to_string()
 }
 
+/// 在 Finder 里打开源目录（顶栏的「打开目录」按钮）。
+#[tauri::command]
+fn open_source_dir(state: State<'_, AppState>) -> Result<(), CoreError> {
+    state.runtime().core.open_source_dir()
+}
+
 #[tauri::command]
 fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreError> {
     state.runtime().core.clone(&remote)
@@ -273,6 +279,7 @@ pub fn run() {
             edit,
             has_repo,
             source_dir,
+            open_source_dir,
             clone_remote,
             set_remote,
             add,

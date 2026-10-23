@@ -1,24 +1,56 @@
+/* ConfigSync — 视觉系统
+ *
+ * 颜色取自 app 图标：近白的冷色板（图标底）、断裂的圆环从青蓝走到宝蓝。
+ * 于是界面用同一块冷白纸，正文近黑带一点蓝，重音就是图标那个蓝，只落在主按钮
+ * 和状态图标上；列表是这块纸上的发丝线表格，路径与数字一律等宽。
+ */
+
 :root {
   color-scheme: light dark;
-  --bg: #fbfaf8;
-  --fg: #1c1b19;
-  --muted: #6f6a63;
-  --line: #e2ded7;
-  --accent: #8a5a2b;
-  --danger: #a2372a;
-  --add: #2f6b3a;
-  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+
+  /* 图标底 / 纸面与墨色 */
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --fg: #10161f;
+  --muted: #5c6878;
+  --line: #dfe4ec;
+  --line-strong: #c3ccd8;
+
+  /* 重音取图标圆环的宝蓝端 */
+  --accent: #0a61e6;
+  --on-accent: #ffffff;
+  --accent-soft: #e8effc;
+  --danger: #b3372a;
+  --danger-soft: #fcebe8;
+  --add: #1c7a4b;
+  --add-soft: #e7f3ec;
+  --warn: #8f6415;
+
+  --radius: 8px;
+  --shadow: 0 18px 44px -22px rgb(16 22 31 / 40%);
+
+  font: 13px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #17181a;
-    --fg: #eceae6;
-    --muted: #97928a;
-    --line: #2c2e31;
-    --accent: #d8a15f;
-    --danger: #e0796b;
-    --add: #7fbf8a;
+    --bg: #0f1319;
+    --surface: #161b22;
+    --fg: #e7ecf2;
+    --muted: #8b97a6;
+    --line: #262d37;
+    --line-strong: #39424f;
+
+    --accent: #58a6ff;
+    --on-accent: #0f1319;
+    --accent-soft: #17233a;
+    --danger: #e08b7d;
+    --danger-soft: #2b1d1a;
+    --add: #6bbd8c;
+    --add-soft: #14251b;
+    --warn: #d8a95c;
+
+    --shadow: 0 18px 44px -22px rgb(0 0 0 / 70%);
   }
 }
 
@@ -30,6 +62,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
+  -webkit-font-smoothing: antialiased;
 }
 
 code,
@@ -38,43 +71,102 @@ pre {
   font-size: 12px;
 }
 
+/* 键盘可达性：只在键盘导航时出现，鼠标点击不留框。 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* ── 顶栏 ─────────────────────────────────────────────── */
+
 .bar {
   position: sticky;
   top: 0;
   z-index: 3;
-  background: var(--bg);
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 10px 16px;
+  gap: 12px;
+  padding: 9px 16px;
   border-bottom: 1px solid var(--line);
-  -webkit-user-select: none;
-  user-select: none;
+  background: var(--bg);
 }
 
 .chips {
   display: flex;
-  gap: 8px;
-  color: var(--muted);
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-right: auto;
 }
 
 .chip {
   padding: 2px 8px;
   border: 1px solid var(--line);
   border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .chip b {
   color: var(--fg);
-  font-weight: 500;
+  font-weight: 600;
 }
 
-.inventory {
-  padding: 16px;
+.nav {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
 }
+
+.nav:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 图标按钮：方形、无文案，靠 title / aria-label 说明。 */
+.nav.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  padding: 0;
+}
+
+.nav.back {
+  margin-left: 0;
+}
+
+.nav + .nav {
+  margin-left: 0;
+}
+
+/* ── 状态提示行 ───────────────────────────────────────── */
+
+.pending-hint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 18px;
+  margin: 10px 16px 0;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+/* ── 工具栏 ───────────────────────────────────────────── */
 
 .toolbar {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 6px;
   padding: 10px 16px 0;
@@ -85,31 +177,65 @@ pre {
   align-items: center;
   justify-content: center;
   width: 30px;
-  height: 26px;
+  height: 28px;
   padding: 0;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: transparent;
-  color: var(--accent);
+  background: var(--surface);
+  color: var(--muted);
   font: inherit;
   line-height: 1;
   cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
-/* 「添加文件」带文字，宽度自适应；独立停在左边，三个全局动作靠右。 */
-.toolbar .add-files {
-  width: auto;
-  gap: 5px;
-  margin-right: auto;
-  padding: 0 11px 0 9px;
+.toolbar button:hover:enabled {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .toolbar button:disabled {
-  color: var(--muted);
+  opacity: 0.45;
   cursor: default;
 }
 
-/* 工具栏下面的一条消息（推送结果 / 动作报错）：与工具栏、清单同一条左边界。 */
+/* 唯一的主按钮：添加文件。整页只有这一处是实心的。 */
+/* 唯一的主按钮：添加文件。整页只有这一处用图标那条渐变。 */
+.toolbar .add-files {
+  width: auto;
+  gap: 6px;
+  margin-right: auto;
+  padding: 0 12px 0 10px;
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 12px;
+}
+
+/* 注意 :enabled 和 button 元素都算权重，所以这里必须写全，
+   否则会被上面的 .toolbar button:hover:enabled 盖成「蓝底蓝字」。 */
+.toolbar .add-files:hover:enabled {
+  border-color: transparent;
+  color: var(--on-accent);
+  filter: brightness(1.05);
+}
+
+/* 批量移除是破坏性动作，常态就用警示色。 */
+.toolbar .batch-remove {
+  color: var(--danger);
+}
+
+.toolbar .batch-remove:hover:enabled {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* 作者样式的 display:inline-flex 会盖掉 UA 的 [hidden]，得显式抹掉。 */
+.toolbar button[hidden] {
+  display: none;
+}
+
+/* 工具栏下面的一条消息（推送结果 / 动作报错）。 */
 .action-error:not(:empty) {
   padding: 10px 16px 0;
   font-size: 12px;
@@ -123,18 +249,40 @@ pre {
   overflow-wrap: anywhere;
 }
 
-.empty {
-  margin: 64px auto;
-  max-width: 20rem;
-  color: var(--muted);
-  text-align: center;
-  font-size: 15px;
+/* ── 清单容器 ─────────────────────────────────────────── */
+
+.inventory {
+  padding: 16px;
 }
 
-.empty small {
-  display: block;
-  margin-top: 6px;
+h2 {
+  margin: 0 0 4px;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+/* 按路径过滤清单：只影响显示，不重新问后端。 */
+.search {
+  width: 100%;
+  margin: 0 0 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
   font-size: 12px;
+}
+
+.search::placeholder {
+  color: var(--muted);
+}
+
+.search:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .rows {
@@ -142,21 +290,53 @@ pre {
   padding: 0;
   list-style: none;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
+  background: var(--surface);
   overflow: hidden;
 }
 
 .legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 14px;
+  gap: 3px 16px;
   margin: 10px 2px 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 
+/* 图例里的符号直接借用状态色，方便和上面的图标对上号。 */
+.legend-icon {
+  margin-right: 3px;
+  font-style: normal;
+}
+
+/* 空清单：用虚线框表示「这里本该有东西」，文案负责指路。 */
+.empty {
+  margin: 0;
+  padding: 44px 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--muted);
+  text-align: center;
+  font-size: 13px;
+}
+
+.empty small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+/* ── 清单行 ───────────────────────────────────────────── */
+
+/* 两列网格：第一列只放勾选框，高度由行头撑开，所以勾选框自然垂直居中； */
+/* 差异区横跨两列，往下排。 */
 .row {
   position: relative;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
   border-top: 1px solid var(--line);
 }
 
@@ -164,12 +344,16 @@ pre {
   border-top: 0;
 }
 
+.row:hover {
+  background: color-mix(in srgb, var(--accent-soft) 45%, transparent);
+}
+
 .row-head {
   display: flex;
   align-items: center;
   gap: 12px;
   width: 100%;
-  padding: 10px 96px 10px 12px;
+  padding: 10px 52px 10px 0;
   border: 0;
   background: transparent;
   color: inherit;
@@ -178,60 +362,102 @@ pre {
   cursor: pointer;
 }
 
-.row-head:hover,
-.row.open .row-head {
-  background: color-mix(in srgb, var(--fg) 4%, transparent);
-}
-
-.row-head:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
+/* 两面镜子：源与目标各占一段，中间一个 ↔；两边按内容让位，
+   窗口窄下来才省略，不会为了对齐中轴把源路径切掉。 */
 .paths {
   display: flex;
-  flex: 1;
-  gap: 8px;
   align-items: baseline;
+  gap: 10px;
+  flex: 1;
   min-width: 0;
 }
 
-/* 左边是 $HOME 下的真身，右边是源目录里的副本；目录压暗，文件名才是眼睛要找的东西。 */
-.paths .dir {
-  color: var(--muted);
-}
-
-.paths .alt {
-  flex: 0 1 auto;
-  color: var(--muted);
-}
-
 .paths code {
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.arrow {
+.paths code.alt {
+  color: var(--fg);
+  opacity: 0.62;
+}
+
+.paths .dir {
   color: var(--muted);
 }
 
+.paths .arrow {
+  flex: none;
+  color: var(--line-strong);
+  font-size: 11px;
+}
+
+.gone {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+/* 勾选框：钉在行首，勾中时用主色实心 + 白勾。 */
+.row-check {
+  align-self: center;
+  justify-self: center;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  appearance: none;
+  border: 1px solid color-mix(in srgb, var(--fg) 24%, transparent);
+  border-radius: 4px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.row-check:checked {
+  border-color: var(--accent);
+  background: var(--accent)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23fafbf8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.6 8.4l3 3 5.8-6.4'/%3E%3C/svg%3E")
+    center / 12px no-repeat;
+}
+
+.row-check:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* 状态：色 + 形 + 底三重编码，扫一列就知道哪种多。 */
+/* 状态只有字形和颜色，不铺底：行有 hover 底色时也不会互相打架。 */
 .status {
   flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.4em;
-  color: var(--muted);
+  width: 22px;
+  height: 22px;
+  font-size: 12px;
 }
 
-/* 颜色之外再给一个形状：色弱的人靠图标也能分清六种状态。 */
 .status-icon {
-  font-size: 0.85em;
   line-height: 1;
 }
 
-/* 行上的操作叠在行头右侧，不参与行头的点击区域。 */
+.status-Pending,
+.status-TargetMissing,
+.status-PendingCommit,
+.status-PendingPushDelete,
+.status-PendingPull {
+  color: var(--accent);
+}
+
+.status-Conflict {
+  color: var(--danger);
+}
+
+.status-InSync {
+  color: var(--muted);
+}
+
 .row-actions {
   position: absolute;
   top: 4px;
@@ -254,6 +480,7 @@ pre {
   font: inherit;
   line-height: 1;
   cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
 }
 
 .row-action:hover {
@@ -261,52 +488,86 @@ pre {
   color: var(--accent);
 }
 
-.row-action[data-delete]:hover {
-  color: var(--danger);
-}
-
 .row-action:disabled {
   color: var(--muted);
   cursor: default;
 }
 
-.status-Pending,
-.status-TargetMissing,
-.status-PendingCommit,
-.status-PendingPull {
+/* 冲突处理：两个并列的小按钮，压在行尾（编辑按钮左边）。 */
+.resolve-actions {
+  position: absolute;
+  top: 50%;
+  right: 50px;
+  display: flex;
+  gap: 5px;
+  transform: translateY(-50%);
+}
+
+/* 有冲突按钮的行，正文得让出那块位置。 */
+.row:has(.resolve-actions) .row-head {
+  padding-right: 178px;
+}
+
+.resolve-choose {
+  padding: 3px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+
+.resolve-choose:hover {
+  border-color: var(--accent);
   color: var(--accent);
 }
 
-.status-Conflict {
+.resolve-choose[data-side="theirs"]:hover {
+  border-color: var(--danger);
   color: var(--danger);
 }
 
+/* ── 差异 ─────────────────────────────────────────────── */
+
 .diff {
   display: none;
+  grid-column: 1 / -1;
 }
 
 .row.open .diff {
   display: block;
-  border-top: 1px solid var(--line);
+}
+
+.open .row-head {
+  background: color-mix(in srgb, var(--accent-soft) 55%, transparent);
 }
 
 .diff-text {
   margin: 0;
-  padding: 8px 12px;
-  max-height: 320px;
-  overflow: auto;
-  white-space: pre;
+  padding: 10px 0 12px;
+  border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg) 55%, var(--surface));
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .diff-line {
   display: block;
+  padding: 0 14px 0 34px;
+  white-space: pre;
 }
 
 .diff-add {
+  background: var(--add-soft);
   color: var(--add);
 }
 
 .diff-del {
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
@@ -314,264 +575,95 @@ pre {
   color: var(--accent);
 }
 
-.diff-meta {
+.diff-meta,
+.diff-ctx {
   color: var(--muted);
 }
 
 .diff-hint {
   margin: 0;
-  padding: 8px 12px;
-  color: var(--muted);
-}
-
-.error {
-  margin: 24px;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  color: var(--fg);
-}
-
-.error pre {
-  overflow: auto;
-  color: var(--muted);
-  white-space: pre-wrap;
-}
-
-.onboarding {
-  margin: 64px auto;
-  max-width: 28rem;
-  padding: 0 16px;
-}
-
-.onboarding h1 {
-  margin: 0 0 8px;
-  font-size: 16px;
-  font-weight: 600;
-}
-
-.hint {
-  color: var(--muted);
-}
-
-.clone-form {
-  display: flex;
-  gap: 8px;
-  margin-top: 16px;
-}
-
-.clone-form input {
-  flex: 1;
-  min-width: 0;
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--fg);
-  font: inherit;
-}
-
-.clone-form button {
-  padding: 7px 14px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--accent);
-  font: inherit;
-  cursor: pointer;
-}
-
-/* 一组 nav 按钮只让最后一个占掉剩余空间，否则每个 auto 外边距都会分走一段。 */
-.nav + .nav {
-  margin-left: 0;
-}
-
-/* 「返回」钉在最左，不抢剩余空间（剩余空间都留给最右的那个按钮）。 */
-.nav.back {
-  margin-left: 0;
-}
-
-/* 图标按钮：方一点，和工具栏那组对齐。 */
-.nav.icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 24px;
-  padding: 0;
-}
-
-.clone-form button:disabled {
-  color: var(--muted);
-  cursor: default;
-}
-
-.onboarding .error {
-  margin: 16px 0 0;
-}
-
-.nav {
-  margin-left: auto;
-  padding: 4px 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--accent);
-  font: inherit;
-  cursor: pointer;
-}
-
-.actions {
-  display: flex;
-  gap: 8px;
-  margin: 0 16px 16px;
-}
-
-.actions button {
-  margin-left: 0;
-  padding: 7px 14px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--accent);
-  font: inherit;
-  cursor: pointer;
-}
-
-.actions button:disabled {
-  color: var(--muted);
-  cursor: default;
-}
-
-.settings {
-  margin: 24px auto;
-  max-width: 46rem;
-  padding: 0 16px;
-}
-
-.settings .error {
-  margin: 0 0 16px;
-}
-
-.settings-form {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.settings-form label {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.settings-form small {
-  color: var(--muted);
-}
-
-.settings-form input {
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--fg);
-  font: inherit;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-}
-
-.settings-form .actions {
-  margin: 6px 0 0;
-}
-
-.settings-form .error {
-  margin: 0;
-}
-
-.muted {
-  color: var(--muted);
-}
-
-.onboarding .actions {
-  margin: 16px 0 0;
-}
-
-.wizard {
-  max-width: 34rem;
-}
-
-.candidates {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin: 16px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.candidates label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
-  cursor: pointer;
-}
-
-.candidates .presence {
-  margin-left: auto;
+  padding: 12px 16px 14px 34px;
+  border-top: 1px solid var(--line);
   color: var(--muted);
   font-size: 12px;
 }
 
-.candidates .missing label,
-.candidates .missing code {
-  color: var(--muted);
-  cursor: default;
+/* ── 报错块 ───────────────────────────────────────────── */
+
+.error {
+  margin: 10px 0;
+  padding: 9px 11px;
+  border: 1px solid var(--danger);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: var(--danger-soft);
+  color: var(--fg);
+  font-size: 12px;
 }
 
-.wizard-error:not(:empty) {
-  margin-top: 12px;
+.error p {
+  margin: 0;
 }
 
-.add-report:not(:empty) {
+.error pre {
+  margin: 6px 0 0;
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+
+/* ── 添加 / 移除结果 ──────────────────────────────────── */
+
+.add-report:not(:empty),
+.apply-report:not(:empty) {
   margin-bottom: 12px;
 }
 
-.add-summary {
-  margin: 0 0 0;
+.add-summary,
+.apply-summary {
+  margin: 0;
+  font-size: 12px;
   color: var(--muted);
 }
 
-.add-notes {
+.add-notes,
+.apply-notes {
   margin: 6px 0 0;
-  padding-left: 18px;
+  padding: 0 0 0 16px;
   color: var(--muted);
+  font-size: 12px;
 }
 
-.add-notes code {
-  color: var(--fg);
-}
+/* ── 应用预览 ─────────────────────────────────────────── */
 
 .apply-hint {
   margin: 0 0 12px;
   color: var(--muted);
+  font-size: 12px;
 }
 
 .apply-items {
-  list-style: none;
   margin: 0;
   padding: 0;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
 }
 
 .apply-item {
+  padding: 9px 12px;
   border-top: 1px solid var(--line);
-  padding: 10px 12px;
+}
+
+.apply-item:first-child {
+  border-top: 0;
 }
 
 .apply-head {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
 }
 
 .apply-head code {
@@ -581,7 +673,7 @@ pre {
   white-space: nowrap;
 }
 
-/* 动作标签：只给文字留位置（清单里的 .status 是图标专用，宽度只有一个字符）。 */
+/* 动作标签：胶囊，11px，跳过用中灰。 */
 .apply-tag {
   flex: none;
   padding: 1px 7px;
@@ -591,101 +683,306 @@ pre {
   font-size: 11px;
 }
 
-.apply-tag-Create,
+.apply-tag-Create {
+  border-color: color-mix(in srgb, var(--add) 40%, transparent);
+  color: var(--add);
+}
+
 .apply-tag-Overwrite {
-  border-color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--accent);
-}
-
-/* 跳过的项折起来：默认只留一行，展开才看逐条原因。 */
-.apply-skipped {
-  margin-top: 14px;
-  color: var(--muted);
-}
-
-.apply-skipped summary {
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.apply-skipped .apply-item {
-  padding: 8px 2px;
-}
-
-.apply-actions button {
-  padding: 5px 14px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--fg);
-  font: inherit;
-  cursor: pointer;
-}
-
-.apply-actions .confirm-apply {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.apply-actions button:disabled {
-  color: var(--muted);
-  border-color: var(--line);
-  cursor: default;
 }
 
 .apply-reason {
-  margin: 4px 0 0;
+  margin: 3px 0 0;
   color: var(--muted);
+  font-size: 12px;
 }
 
-/* 跳过项的图标：一句话换成符号，说明放 title。 */
+/* 跳过项：图标占位保证左边界与上面一致。 */
 .apply-skip-icon {
   flex: none;
+  display: inline-block;
   width: 1.2em;
   color: var(--muted);
   text-align: center;
 }
 
-.apply-Skip .apply-head code {
+.apply-item.apply-Skip code {
   color: var(--muted);
+}
+
+.apply-skipped {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.apply-skipped > summary {
+  padding: 8px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.apply-skipped .apply-items {
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
 }
 
 .apply-diff {
   margin: 8px 0 0;
-  padding: 8px 12px;
-  max-height: 320px;
-  overflow: auto;
-  border: 1px solid var(--line);
+  padding: 8px 10px;
   border-radius: 6px;
-  font-size: 12px;
+  background: var(--bg);
+  overflow-x: auto;
+}
+
+.apply-diff .diff-line {
+  padding: 0 2px;
 }
 
 .apply-actions {
   display: flex;
   gap: 8px;
+  margin-top: 16px;
+}
+
+.apply-actions button {
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+
+.apply-actions .confirm-apply {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.apply-actions button:hover:enabled {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.apply-actions .confirm-apply:hover:enabled {
+  border-color: transparent;
+  color: var(--on-accent);
+  filter: brightness(1.05);
+}
+
+.apply-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ── 设置 / 向导 / 首次克隆 ───────────────────────────── */
+
+/* 表单页居中一栏，别贴着窗口左边。窗口窄了就是满宽。 */
+.settings,
+.wizard,
+.onboarding {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 20px 28px;
+}
+
+.wizard h1,
+.onboarding h1 {
+  margin: 0 0 8px;
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.hint {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 表单：标签在左上一行，输入占满，说明落在下面。 */
+.settings-form,
+.wizard-form,
+.clone-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.settings-form > label,
+.wizard-form > label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.settings-form input,
+.wizard-form input,
+.clone-form input {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.settings-form input:focus-visible,
+.wizard-form input:focus-visible,
+.clone-form input:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.settings-form small,
+.wizard-form small {
+  color: var(--muted);
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.clone-form {
+  flex-direction: row;
+}
+
+.clone-form input {
+  flex: 1;
+}
+
+.clone-form button,
+.actions button {
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+
+.clone-form button {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.clone-form button:hover:enabled {
+  filter: brightness(1.05);
+}
+
+.clone-form button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* 保存是这一页的主按钮，其余按钮保持安静。 */
+.settings-form .actions button[type="submit"],
+.wizard-form .actions button[type="submit"] {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.settings-form .actions button[type="submit"]:hover:enabled,
+.wizard-form .actions button[type="submit"]:hover:enabled {
+  border-color: transparent;
+  color: var(--on-accent);
+  filter: brightness(1.05);
+}
+
+.actions button:hover:enabled {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.settings-error:not(:empty),
+.wizard-error:not(:empty),
+.clone-error:not(:empty) {
   margin-top: 12px;
 }
 
-.apply-report:not(:empty) {
-  margin-bottom: 12px;
-}
-
-.apply-summary {
+/* 向导候选：存在才可勾，不存在的整行压暗并禁用。 */
+.candidates {
   margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.candidates li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.candidates li:first-child {
+  border-top: 0;
+}
+
+.candidates label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  cursor: pointer;
+}
+
+.candidates li.missing {
+  opacity: 0.5;
+}
+
+.candidates input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.candidates code {
+  flex: 1;
+}
+
+.presence {
   color: var(--muted);
+  font-size: 11px;
 }
 
-.apply-notes {
-  margin: 6px 0 0;
-  padding-left: 18px;
-  color: var(--muted);
-}
+/* ── 确认框 ───────────────────────────────────────────── */
 
-.apply-notes code {
-  color: var(--fg);
-}
-
-/* 应用内确认框：盖住整页，点遮罩或 Esc 等于取消。 */
 .modal {
   position: fixed;
   inset: 0;
@@ -693,23 +990,23 @@ pre {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
-  background: rgba(0, 0, 0, 0.35);
+  background: rgb(24 33 29 / 30%);
+  backdrop-filter: blur(1.5px);
 }
 
 .modal-box {
-  width: 100%;
-  max-width: 340px;
-  padding: 16px;
+  width: min(30rem, calc(100% - 48px));
+  padding: 18px 18px 14px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: var(--bg);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2);
+  background: var(--surface);
+  box-shadow: var(--shadow);
 }
 
 .modal-text {
-  margin: 0 0 14px;
+  margin: 0 0 16px;
   white-space: pre-line;
+  font-size: 13px;
 }
 
 .modal-actions {
@@ -719,36 +1016,35 @@ pre {
 }
 
 .modal-actions button {
-  padding: 5px 12px;
+  padding: 6px 13px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: transparent;
   color: var(--fg);
   font: inherit;
+  font-size: 12px;
   cursor: pointer;
 }
 
-.modal-ok {
-  border-color: var(--accent);
-  color: var(--accent);
+.modal-actions .modal-ok {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
-.modal-ok.danger {
-  border-color: var(--danger);
-  color: var(--danger);
+.modal-actions .modal-ok.danger {
+  background: var(--danger);
 }
 
-/* 本机与远端不一致时的一句话提示：告诉用户该推送还是该拉取。 */
-.pending-hint {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 14px;
-  margin: 10px 16px 0;
-  color: var(--add);
-  font-size: 12px;
+/* 深色下主色是浅蓝，勾得用深色才看得见。 */
+@media (prefers-color-scheme: dark) {
+  .row-check:checked {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%230f1319' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.6 8.4l3 3 5.8-6.4'/%3E%3C/svg%3E");
+  }
 }
 
-.paths code.gone {
-  color: var(--muted);
-  text-decoration: line-through;
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
 }
