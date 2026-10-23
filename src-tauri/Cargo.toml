@@ -14,4 +14,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 config-sync-core = { path = "../crates/core" }
+serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

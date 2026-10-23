@@ -9,18 +9,33 @@
 ## 目录
 
 ```
-crates/core/          Rust Core（库）：清单、git 子进程、路径推导。唯一测试 seam
+crates/core/          Rust Core（库）：清单、git 子进程、路径推导、clone。唯一测试 seam
   src/                lib.rs / config.rs / error.rs / git.rs / inventory.rs / paths.rs
   tests/fixtures/     真 git 测试夹具（临时 home + 临时源目录 + 临时裸远端）
   tests/inventory.rs  Core 的行为测试
+  tests/clone.rs      clone 的行为测试
 src-tauri/            Tauri 2 外壳：#[tauri::command] 只做转发
+  src/settings.rs     config.toml 的读写与 `~` 展开
 src/                  前端（Vite + TypeScript，无 UI 框架）
 ```
+
+## 配置
+
+`~/Library/Application Support/config-sync/config.toml`，**不进 git**；首次启动自动写入默认值：
+
+```toml
+source_dir = "~/.config-sync"
+editor_command = ""        # 空 = 用系统关联 app；支持 `{}` 占位符
+branch = "main"
+```
+
+首次启动（源目录里还没有仓库）会要求输入远端地址并 clone；clone 完停在清单，不写任何目标文件。
 
 ## 跑测试
 
 ```sh
 cargo test                    # 只跑 Core（workspace 的 default-members）
+cargo test -p config-sync-app # 外壳里的 config.toml 读写
 cargo check --workspace       # Core + 外壳一起检查
 ```
 
@@ -55,4 +70,6 @@ npm run tauri build           # → target/release/bundle/macos/config-sync.app
 - **Core 是唯一 seam**：逻辑全在 `crates/core`，`#[tauri::command]` 只有三行转发。
 - **Core 不读环境**：`Core::new(home, source_dir, config)` 注入一切；`$HOME` 由外壳读。
 - **git 只走子进程**：`crates/core/src/git.rs` 是唯一入口，argv 数组 + 显式 `-C <源目录>`。
+- **磁盘配置留在外壳**：`config.toml`（含 `source_dir`）只在 `src-tauri/src/settings.rs` 出现；
+  注入 Core 的仍是 `Config { branch, editor_command }` 与解析后的 `source_dir`。
 - **界面文案**用「清单 / 应用 / 推送 / 拉取 / 冲突」，不出现「同步」。
