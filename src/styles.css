@@ -146,3 +146,55 @@ pre {
   color: var(--muted);
   white-space: pre-wrap;
 }
+
+.onboarding {
+  margin: 64px auto;
+  max-width: 28rem;
+  padding: 0 16px;
+}
+
+.onboarding h1 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.hint {
+  color: var(--muted);
+}
+
+.clone-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.clone-form input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+}
+
+.clone-form button {
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.clone-form button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.onboarding .error {
+  margin: 16px 0 0;
+}

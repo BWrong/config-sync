@@ -28,6 +28,47 @@ impl Core {
         Core { home: home.into(), source_dir: source_dir.into(), config }
     }
 
+    /// 源目录里是否已经有一个 git 仓库。
+    ///
+    /// 首次启动时外壳用它决定是进地址输入还是直接进清单。
+    pub fn has_repo(&self) -> bool {
+        git::run(&self.source_dir, &["rev-parse", "--git-dir"]).is_ok()
+    }
+
+    /// 把远端 clone 到源目录。
+    ///
+    /// 只建源目录里的文件，绝不写任何目标文件：clone 完停在清单，由用户决定何时应用。
+    /// 源目录非空时拒绝（避免把仓库 clone 进已有的东西里，也不需要覆盖确认）。
+    pub fn clone(&self, remote_url: &str) -> Result<(), CoreError> {
+        let remote = remote_url.trim();
+        if remote.is_empty() {
+            return Err(CoreError::io("请填写远端仓库地址"));
+        }
+
+        if self.source_dir.exists() {
+            let mut entries = std::fs::read_dir(&self.source_dir).map_err(|e| {
+                CoreError::io(format!("读取 {} 失败：{e}", self.source_dir.display()))
+            })?;
+            if entries.next().is_some() {
+                return Err(CoreError::io(format!(
+                    "源目录 {} 不是空的，不能 clone 到里面；请换个源目录，或先清空它",
+                    self.source_dir.display()
+                )));
+            }
+        } else {
+            std::fs::create_dir_all(&self.source_dir).map_err(|e| {
+                CoreError::io(format!("创建源目录 {} 失败：{e}", self.source_dir.display()))
+            })?;
+        }
+
+        // `-C` 已经切进源目录，目标路径用 `.`。
+        git::run(&self.source_dir, &["clone", remote, "."]).map_err(|e| CoreError {
+            message: format!("从 {remote} clone 到 {} 失败", self.source_dir.display()),
+            ..e
+        })?;
+        Ok(())
+    }
+
     /// 受管文件的完整列表。完全没有受管文件时返回空集合（不是错误）。
     pub fn inventory(&self) -> Result<Vec<InventoryEntry>, CoreError> {
         let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);

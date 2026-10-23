@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
 
-/** 与 Core 的 `InInventoryEntry.status` 一一对应；中文文案只活在前端。 */
+/** 与 Core 的 `InventoryEntry.status` 一一对应；中文文案只活在前端。 */
 type Status = "InSync" | "TargetMissing" | "Pending";
 
 interface InventoryEntry {
@@ -65,7 +65,7 @@ function errorPanel(error: unknown): string {
   return `<div class="error"><p>${escapeHtml(e.message ?? String(error))}</p>${detail}</div>`;
 }
 
-async function render(): Promise<void> {
+async function renderInventory(): Promise<void> {
   try {
     const [entries, status] = await Promise.all([
       invoke<InventoryEntry[]>("inventory"),
@@ -85,6 +85,75 @@ async function render(): Promise<void> {
   }
 }
 
+/** 首次启动或源目录还不是仓库：先要地址，clone 完停在清单。 */
+function renderOnboarding(sourceDir: string): void {
+  app.innerHTML = `
+    <main class="onboarding">
+      <h1>输入远端仓库地址</h1>
+      <p class="hint">
+        远端会 clone 到 <code>${escapeHtml(sourceDir)}</code>，clone 完停在清单，
+        不会改动你 <code>$HOME</code> 下的任何文件。
+      </p>
+      <form class="clone-form">
+        <input
+          type="text"
+          name="remote"
+          placeholder="git@github.com:you/dotfiles.git"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button type="submit">clone</button>
+      </form>
+      <div class="clone-error"></div>
+    </main>`;
+
+  const form = app.querySelector<HTMLFormElement>(".clone-form")!;
+  const input = form.querySelector<HTMLInputElement>("input")!;
+  const button = form.querySelector<HTMLButtonElement>("button")!;
+  const slot = app.querySelector<HTMLDivElement>(".clone-error")!;
+  input.focus();
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const remote = input.value.trim();
+    if (!remote) {
+      slot.innerHTML = errorPanel({ message: "请填写远端仓库地址" });
+      input.focus();
+      return;
+    }
+
+    slot.innerHTML = "";
+    button.disabled = true;
+    button.textContent = "正在 clone…";
+    try {
+      await invoke("clone_remote", { remote });
+      await renderInventory();
+    } catch (error) {
+      // git 的原始 stderr 原样留在 errorPanel 里，改地址可以重试。
+      slot.innerHTML = errorPanel(error);
+      button.disabled = false;
+      button.textContent = "clone";
+      input.focus();
+    }
+  });
+}
+
+async function boot(): Promise<void> {
+  try {
+    const [hasRepo, sourceDir] = await Promise.all([
+      invoke<boolean>("has_repo"),
+      invoke<string>("source_dir"),
+    ]);
+    if (!hasRepo) {
+      renderOnboarding(sourceDir);
+      return;
+    }
+    await renderInventory();
+  } catch (error) {
+    app.innerHTML = `${errorPanel(error)}`;
+  }
+}
+
 function escapeHtml(text: string): string {
   return text.replace(
     /[&<>"']/g,
@@ -93,4 +162,4 @@ function escapeHtml(text: string): string {
 }
 
 app.innerHTML = `<p class="empty">正在读取清单…</p>`;
-void render();
+void boot();

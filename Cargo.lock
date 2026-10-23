@@ -343,8 +343,11 @@ name = "config-sync-app"
 version = "0.1.0"
 dependencies = [
  "config-sync-core",
+ "serde",
  "tauri",
  "tauri-build",
+ "tempfile",
+ "toml 0.8.2",
 ]
 
 [[package]]
