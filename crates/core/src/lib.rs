@@ -4,6 +4,7 @@
 //! `#[tauri::command]` 只做转发，逻辑都在这里。
 
 mod add;
+mod apply;
 mod config;
 mod editor;
 mod error;
@@ -13,6 +14,7 @@ mod paths;
 mod state;
 
 pub use add::{AddOutcome, AddResult};
+pub use apply::{ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary};
 pub use config::Config;
 pub use editor::Attempt;
 pub use error::{CoreError, ErrorKind};
