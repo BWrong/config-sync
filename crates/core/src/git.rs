@@ -24,3 +24,17 @@ pub(crate) fn run(source_dir: &Path, args: &[&str]) -> Result<String, CoreError>
         ))
     }
 }
+
+/// 上游的领先/落后计数，返回 `(behind, ahead)`。
+///
+/// `git rev-list --left-right --count @{u}...HEAD` 的输出是 `<behind>\t<ahead>`；
+/// 没有上游时按 `(0, 0)`（首个远端由拉取那张票建立）。
+pub(crate) fn ahead_behind(source_dir: &Path) -> (u32, u32) {
+    match run(source_dir, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
+        Ok(counts) => {
+            let mut parts = counts.split_whitespace().map(|n| n.parse::<u32>().unwrap_or(0));
+            (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+        }
+        Err(_) => (0, 0),
+    }
+}

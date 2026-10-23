@@ -117,6 +117,40 @@ impl Fixture {
     pub fn push(&self) {
         self.git(&["push", "-u", "origin", "main"]);
     }
+
+    /// 远端仓库的第二份工作副本（懒建，用来让远端领先）。
+    pub fn other(&self) -> PathBuf {
+        let dir = self.path("other");
+        if !dir.exists() {
+            self.git_at(self.tmp_root(), &["clone", &self.remote_url(), "other"]);
+            self.git_at(&dir, &["config", "user.email", "test@config-sync.invalid"]);
+            self.git_at(&dir, &["config", "user.name", "config-sync test"]);
+        }
+        dir
+    }
+
+    /// 让远端在 `rel_path` 上多一个提交，源目录只 `fetch`（不合并）。
+    /// 前提：源目录已经把 `main` 推上去过。
+    pub fn advance_remote(&self, rel_path: &str, content: &str) {
+        let other = self.other();
+        write(&other.join(rel_path), content);
+        self.git_at(&other, &["add", "-A"]);
+        self.git_at(&other, &["commit", "-m", "config-sync: 1 files"]);
+        self.git_at(&other, &["push", "origin", "main"]);
+        self.git(&["fetch", "origin"]);
+    }
+
+    /// 在源目录里跑真 git，容忍非零退出（制造真冲突的 merge 用），返回是否成功。
+    pub fn git_try(&self, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.source_dir)
+            .args(args)
+            .output()
+            .expect("启动系统 git")
+            .status
+            .success()
+    }
 }
 
 fn path(p: &Path) -> &str {

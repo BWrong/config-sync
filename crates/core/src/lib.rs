@@ -8,12 +8,13 @@ mod error;
 mod git;
 mod inventory;
 mod paths;
+mod state;
 
 pub use config::Config;
 pub use error::{CoreError, ErrorKind};
-pub use inventory::{InventoryEntry, RepoStatus, Status};
+pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct Core {
     home: PathBuf,
@@ -72,27 +73,84 @@ impl Core {
     /// 受管文件的完整列表。完全没有受管文件时返回空集合（不是错误）。
     pub fn inventory(&self) -> Result<Vec<InventoryEntry>, CoreError> {
         let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);
+        let facts = state::GitFacts::read(&self.source_dir)?;
         let mut entries = Vec::new();
 
         for rel in paths::managed_relative_paths(&mirror_root)? {
             let source = mirror_root.join(&rel);
             let target = self.home.join(&rel);
-            let status = match std::fs::read(&target) {
-                Ok(target_bytes) => {
-                    let source_bytes = std::fs::read(&source).map_err(|e| {
-                        CoreError::io(format!("读取 {} 失败：{e}", source.display()))
-                    })?;
-                    if source_bytes == target_bytes { Status::InSync } else { Status::Pending }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Status::TargetMissing,
-                Err(e) => {
-                    return Err(CoreError::io(format!("读取 {} 失败：{e}", target.display())))
-                }
-            };
+            let status = state::derive(self.disk(rel.as_path())?, &repo_path(&rel), &facts);
             entries.push(InventoryEntry { source, target, status });
         }
 
         Ok(entries)
+    }
+
+    /// 一行的 unified diff。比较哪两侧由该行当前状态决定：
+    ///
+    /// | 状态 | 旧侧 | 新侧 |
+    /// |---|---|---|
+    /// | 待提交 / 冲突 | `HEAD:<路径>` 已提交的内容 | 源文件当前内容 |
+    /// | 待拉取 | `HEAD:<路径>` | `@{u}:<路径>`（拉取会带进来的改动） |
+    /// | 其余 | 目标文件 | 源文件（应用会写成这样） |
+    pub fn diff(&self, target: &Path) -> Result<FileDiff, CoreError> {
+        let rel = target.strip_prefix(&self.home).map_err(|_| {
+            CoreError::io(format!(
+                "{} 不在 {} 下，没有对应的受管文件",
+                target.display(),
+                self.home.display()
+            ))
+        })?;
+        let source = self.source_dir.join(paths::MIRROR_ROOT).join(rel);
+        let repo_path = repo_path(rel);
+        let repo = repo_path.display().to_string();
+        let facts = state::GitFacts::read(&self.source_dir)?;
+        let status = state::derive(self.disk(rel)?, &repo_path, &facts);
+
+        let (old_label, old, new_label, new) = match status {
+            Status::PendingCommit | Status::Conflict => (
+                format!("HEAD:{repo}"),
+                revision_text(&self.source_dir, "HEAD", &repo_path),
+                source.display().to_string(),
+                read_text(&source),
+            ),
+            Status::PendingPull => (
+                format!("HEAD:{repo}"),
+                revision_text(&self.source_dir, "HEAD", &repo_path),
+                format!("@{{u}}:{repo}"),
+                revision_text(&self.source_dir, "@{u}", &repo_path),
+            ),
+            _ => (
+                target.display().to_string(),
+                read_text(target),
+                source.display().to_string(),
+                read_text(&source),
+            ),
+        };
+
+        Ok(FileDiff {
+            target: target.to_path_buf(),
+            status,
+            text: unified_diff(&old_label, &new_label, &old, &new),
+        })
+    }
+
+    /// 目标文件与源文件的关系；源文件是受管文件本身，读不到是真错误。
+    fn disk(&self, rel: &Path) -> Result<state::Disk, CoreError> {
+        let target = self.home.join(rel);
+        let target_bytes = match std::fs::read(&target) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(state::Disk::Missing),
+            Err(e) => {
+                return Err(CoreError::io(format!("读取 {} 失败：{e}", target.display())))
+            }
+        };
+
+        let source = self.source_dir.join(paths::MIRROR_ROOT).join(rel);
+        let source_bytes = std::fs::read(&source)
+            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
+
+        Ok(if source_bytes == target_bytes { state::Disk::Same } else { state::Disk::Differs })
     }
 
     /// 顶部状态条：分支、ahead/behind、未提交改动数。
@@ -111,23 +169,35 @@ impl Core {
             .filter(|line| !line.trim().is_empty())
             .count() as u32;
 
-        // 没有上游时 ahead/behind 无意义，按 0 处理（首个远端由后续票据建立）。
-        let (behind, ahead) = match git::run(
-            &self.source_dir,
-            &["rev-list", "--left-right", "--count", "@{u}...HEAD"],
-        ) {
-            Ok(counts) => parse_ahead_behind(&counts),
-            Err(_) => (0, 0),
-        };
+        let (behind, ahead) = git::ahead_behind(&self.source_dir);
 
         Ok(RepoStatus { branch, ahead, behind, dirty })
     }
 }
 
-/// `git rev-list --left-right --count @{u}...HEAD` 的输出是 `<behind>\t<ahead>`。
-fn parse_ahead_behind(counts: &str) -> (u32, u32) {
-    let mut parts = counts.split_whitespace().map(|n| n.parse::<u32>().unwrap_or(0));
-    let behind = parts.next().unwrap_or(0);
-    let ahead = parts.next().unwrap_or(0);
-    (behind, ahead)
+/// 源目录里一条受管文件相对仓库根的路径（`home/<rel>`）；git 的输出都以它为键。
+fn repo_path(rel: &Path) -> PathBuf {
+    Path::new(paths::MIRROR_ROOT).join(rel)
+}
+
+/// 读文件成文本；不存在（目标缺失、新文件没有 HEAD 版本）按空内容。
+fn read_text(path: &Path) -> String {
+    std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default()
+}
+
+/// `git show <rev>:<路径>`；该版本里没有这个文件时按空内容（新增/删除的一侧）。
+fn revision_text(source_dir: &Path, rev: &str, repo_path: &Path) -> String {
+    git::run(source_dir, &["show", &format!("{rev}:{}", repo_path.display())]).unwrap_or_default()
+}
+
+/// 两侧相同就是空串（前端显示「没有差异」），否则是带 `---/+++` 头的 unified diff。
+fn unified_diff(old_label: &str, new_label: &str, old: &str, new: &str) -> String {
+    if old == new {
+        return String::new();
+    }
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(old_label, new_label)
+        .to_string()
 }

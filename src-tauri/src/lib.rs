@@ -7,7 +7,7 @@ mod settings;
 
 use std::path::{Path, PathBuf};
 
-use config_sync_core::{Core, CoreError, InventoryEntry, RepoStatus};
+use config_sync_core::{Core, CoreError, FileDiff, InventoryEntry, RepoStatus};
 use settings::Settings;
 use tauri::State;
 
@@ -46,6 +46,12 @@ fn repo_status(state: State<'_, AppState>) -> Result<RepoStatus, CoreError> {
     state.core.repo_status()
 }
 
+/// 点开一行时的 unified diff；比较哪两侧由 Core 按该行状态决定。
+#[tauri::command]
+fn diff(state: State<'_, AppState>, target: String) -> Result<FileDiff, CoreError> {
+    state.core.diff(Path::new(&target))
+}
+
 /// 源目录里是否已经有仓库：false 时前端进「输入远端地址」。
 #[tauri::command]
 fn has_repo(state: State<'_, AppState>) -> bool {
@@ -68,6 +74,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             inventory,
             repo_status,
+            diff,
             has_repo,
             source_dir,
             clone_remote
