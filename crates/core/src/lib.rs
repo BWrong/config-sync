@@ -13,7 +13,7 @@ mod inventory;
 mod onboarding;
 mod paths;
 mod push;
-mod resolve;
+pub mod resolve;
 mod state;
 
 pub use add::{AddOutcome, AddResult};

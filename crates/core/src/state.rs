@@ -86,6 +86,8 @@ pub(crate) fn derive(disk: Disk, repo_path: &Path, facts: &GitFacts) -> Status {
     let dirty = facts.dirty.contains(repo_path);
     let remote = facts.remote_changed.contains(repo_path);
 
+    // 冲突 = 「真未合并」或「本地改了同一路径 ∧ 远端也改了它」。判断作纯粹磁盘事实：
+    // dirty 与 remote 各自独立，哪个为真就归哪个, 冲突只占二者交集。
     if facts.unmerged.contains(repo_path) || (dirty && remote) {
         Status::Conflict
     } else if dirty {
