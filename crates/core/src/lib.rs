@@ -3,6 +3,7 @@
 //! 构造时注入所有环境事实（home、source_dir、config），内部不读环境变量、不读 `$HOME`。
 //! `#[tauri::command]` 只做转发，逻辑都在这里。
 
+mod add;
 mod config;
 mod error;
 mod git;
@@ -10,6 +11,7 @@ mod inventory;
 mod paths;
 mod state;
 
+pub use add::{AddOutcome, AddResult};
 pub use config::Config;
 pub use error::{CoreError, ErrorKind};
 pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
