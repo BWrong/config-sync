@@ -10,7 +10,7 @@
 ## 目录
 
 ```
-crates/core/          Rust Core（库）：清单、git 子进程、路径推导、六态判定、增删改应用推送拉取。唯一测试 seam
+crates/core/          Rust Core（库）：清单、git 子进程、路径推导、七态判定、增删改应用推送拉取。唯一测试 seam
   src/                lib.rs（Core 门面）+ add / apply / config / editor / error / git /
                       inventory / onboarding / paths / push / remove / resolve / state
   tests/fixtures/     真 git 测试夹具（临时 home + 临时源目录 + 临时裸远端）

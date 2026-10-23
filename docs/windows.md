@@ -72,7 +72,7 @@
 
 ## 已经不用改的
 
-Tauri 2 本身跨平台；`crates/core/src/git.rs` 走 argv 数组、不拼 shell（没有引号地狱）；镜像布局用 `PathBuf` 而非字符串拼接；六态判定、diff、resolve、remove 全是纯路径逻辑；代码里没有直接调用 `PermissionsExt` / `libc` / `std::os::unix`。
+Tauri 2 本身跨平台；`crates/core/src/git.rs` 走 argv 数组、不拼 shell（没有引号地狱）；镜像布局用 `PathBuf` 而非字符串拼接；七态判定、diff、resolve、remove 全是纯路径逻辑；代码里没有直接调用 `PermissionsExt` / `libc` / `std::os::unix`。
 
 ## 顺序与预估
 
