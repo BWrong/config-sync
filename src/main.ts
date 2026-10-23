@@ -60,6 +60,42 @@ interface AddOutcome {
   result: AddResult;
 }
 
+/** 与 Core 的 `ApplyAction` 一一对应；中文文案只活在前端。 */
+type ApplyAction = "Create" | "Overwrite" | "Skip";
+
+interface ApplyItem {
+  /** 会被写到的目标路径。 */
+  target: string;
+  action: ApplyAction;
+  reason: string;
+  /** 应用会带来的改动（目标 → 源），空串 = 没有差异。 */
+  diff: string;
+}
+
+interface ApplyPlan {
+  items: ApplyItem[];
+}
+
+interface ApplySummary {
+  create: number;
+  overwrite: number;
+  skip: number;
+}
+
+/** `plan_apply` 回来的一整份计划 + 摘要；确认时把同一份 `plan` 原样送回去执行。 */
+interface ApplyPreview {
+  plan: ApplyPlan;
+  summary: ApplySummary;
+}
+
+/** 与 Core 的 `ApplyResult` 一一对应：`Failed` 带人话原因。 */
+type ApplyResult = "Written" | { Failed: { message: string } };
+
+interface ApplyOutcome {
+  target: string;
+  result: ApplyResult;
+}
+
 interface Settings {
   source_dir: string;
   editor_command: string;
@@ -88,6 +124,13 @@ let addReportHtml = "";
 
 /** 上一次推送的结果（或硬拦/失败报错），同上。 */
 let pushReportHtml = "";
+
+/** 待确认的应用计划；非 null 时界面显示预览页，确认后执行的就是这一份。 */
+let applyPlan: ApplyPlan | null = null;
+let applySummary: ApplySummary | null = null;
+
+/** 上一次应用的结果（或报错），同样放进清单模板里。 */
+let applyReportHtml = "";
 
 function statusBar(status: RepoStatus): string {
   return `
@@ -207,8 +250,6 @@ async function pull(): Promise<void> {
   }
 }
 
-/** 顶部全局动作「推送」：硬拦 → 自动提交 → push。
- *  命中硬拦或 push 失败时 errorPanel 里是 Core 的人话（含点名规则与文件、git 原始 stderr）。 */
 async function pushChanges(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>("[data-push]")!;
   button.disabled = true;
@@ -227,8 +268,123 @@ async function pushChanges(): Promise<void> {
   await renderInventory();
 }
 
+const ACTION_LABEL: Record<ApplyAction, string> = { Create: "新建", Overwrite: "覆盖", Skip: "跳过" };
+
+/** 「应用」第一步：向 Core 要一份完整计划，只预览，一个字节都不写。 */
+async function startApply(): Promise<void> {
+  const button = app.querySelector<HTMLButtonElement>("[data-apply]");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在计算…";
+  }
+  try {
+    const preview = await invoke<ApplyPreview>("plan_apply", { targets: null });
+    applyPlan = preview.plan;
+    applySummary = preview.summary;
+    applyReportHtml = "";
+    await renderInventory();
+  } catch (error) {
+    app.querySelector<HTMLDivElement>(".action-error")!.innerHTML = errorPanel(error);
+    if (button) {
+      button.disabled = false;
+      button.textContent = "应用";
+    }
+  }
+}
+
+/** 预览页：每个受管文件一条，带动作、原因与 diff；确认后写盘。 */
+function renderApplyPreview(): void {
+  const items = applyPlan!.items;
+  const summary = applySummary!;
+  const writes = summary.create + summary.overwrite;
+  app.innerHTML = `
+    <header class="bar">
+      <span class="brand">config-sync</span>
+      <span class="chips">
+        <span class="chip">新建 <b>${summary.create}</b></span>
+        <span class="chip">覆盖 <b>${summary.overwrite}</b></span>
+        <span class="chip">跳过 <b>${summary.skip}</b></span>
+      </span>
+      <button class="nav" data-settings>设置</button>
+    </header>
+    <main class="inventory apply-preview">
+      <h2>应用预览</h2>
+      <p class="apply-hint">确认后会把下面 ${writes} 个文件写到 $HOME；跳过的项不动。</p>
+      <div class="action-error"></div>
+      ${
+        items.length === 0
+          ? `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`
+          : `<ul class="apply-items">${items.map(applyItemHtml).join("")}</ul>`
+      }
+      <div class="apply-actions">
+        <button type="button" class="confirm-apply" ${writes === 0 ? "disabled" : ""}>确认应用</button>
+        <button type="button" class="cancel-apply">取消</button>
+      </div>
+    </main>`;
+
+  app.querySelector<HTMLButtonElement>(".confirm-apply")?.addEventListener("click", () => void confirmApply());
+  app.querySelector<HTMLButtonElement>(".cancel-apply")?.addEventListener("click", () => void cancelApply());
+  bindSettingsEntry();
+}
+
+function applyItemHtml(item: ApplyItem): string {
+  const diff = item.diff ? `<pre class="apply-diff">${diffLines(item.diff)}</pre>` : "";
+  return `
+    <li class="apply-item apply-${item.action}">
+      <div class="apply-head">
+        <code>${escapeHtml(item.target)}</code>
+        <span class="status">${ACTION_LABEL[item.action]}</span>
+      </div>
+      <p class="apply-reason">${escapeHtml(item.reason)}</p>
+      ${diff}
+    </li>`;
+}
+
+/** 「应用」第二步：把预览里那一份计划原样送回去执行，不重新计算动作。 */
+async function confirmApply(): Promise<void> {
+  if (!applyPlan) return;
+  const button = app.querySelector<HTMLButtonElement>(".confirm-apply")!;
+  button.disabled = true;
+  button.textContent = "正在写…";
+  try {
+    applyReportHtml = applyReport(await invoke<ApplyOutcome[]>("execute_apply", { plan: applyPlan }));
+  } catch (error) {
+    applyReportHtml = errorPanel(error);
+  }
+  applyPlan = null;
+  applySummary = null;
+  await renderInventory();
+}
+
+async function cancelApply(): Promise<void> {
+  applyPlan = null;
+  applySummary = null;
+  await renderInventory();
+}
+
+/** 应用结果的汇总：写成功的计数 + 没写成的逐条原因。 */
+function applyReport(outcomes: ApplyOutcome[]): string {
+  const written = outcomes.filter((outcome) => outcome.result === "Written").length;
+  const failed = outcomes.length - written;
+  const notes = outcomes.flatMap((outcome) => {
+    const result = outcome.result;
+    if (result === "Written") return [];
+    return [
+      `<li><code>${escapeHtml(outcome.target)}</code> 没有写：${escapeHtml(
+        result.Failed.message,
+      )}</li>`,
+    ];
+  });
+  return `<p class="apply-summary">已写 ${written} 个文件${failed ? ` · ${failed} 个没有写` : ""}</p>${notes.length ? `<ul class="apply-notes">${notes.join("")}</ul>` : ""}`;
+}
+
 async function renderInventory(): Promise<void> {
   try {
+    // 有未确认的计划时，整个页面就是预览页：这一屏不写盘。
+    if (applyPlan) {
+      renderApplyPreview();
+      return;
+    }
     const [entries, status] = await Promise.all([
       invoke<InventoryEntry[]>("inventory"),
       invoke<RepoStatus>("repo_status"),
@@ -238,6 +394,7 @@ async function renderInventory(): Promise<void> {
       <div class="toolbar">
         <button type="button" data-pull>拉取</button>
         <button type="button" data-push>推送</button>
+        <button type="button" data-apply>应用</button>
       </div>
       <div class="action-error">${pushReportHtml}</div>
       <main class="inventory">
@@ -253,6 +410,7 @@ async function renderInventory(): Promise<void> {
           </details>
         </div>
         <div class="add-report">${addReportHtml}</div>
+        <div class="apply-report">${applyReportHtml}</div>
         ${
           entries.length === 0
             ? `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`
@@ -275,6 +433,7 @@ async function renderInventory(): Promise<void> {
     app.querySelector<HTMLButtonElement>("[data-push]")?.addEventListener("click", () =>
       void pushChanges(),
     );
+    app.querySelector<HTMLButtonElement>("[data-apply]")?.addEventListener("click", () => void startApply());
     bindSettingsEntry();
   } catch (error) {
     renderError(error);

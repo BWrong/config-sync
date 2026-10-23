@@ -9,7 +9,10 @@ mod watch;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use config_sync_core::{AddOutcome, Core, CoreError, ErrorKind, FileDiff, InventoryEntry, PushOutcome, RepoStatus};
+use config_sync_core::{
+    AddOutcome, ApplyOutcome, ApplyPlan, ApplySummary, Core, CoreError, ErrorKind, FileDiff,
+    InventoryEntry, PushOutcome, RepoStatus,
+};
 use serde::Serialize;
 use settings::Settings;
 use tauri::{AppHandle, Manager, State};
@@ -133,6 +136,33 @@ fn add(state: State<'_, AppState>, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome
 }
 
 #[derive(Serialize)]
+struct ApplyPreview {
+    plan: ApplyPlan,
+    /// 新建 / 覆盖 / 跳过各几项，界面直接显示这一行摘要。
+    summary: ApplySummary,
+}
+
+/// 「应用」第一步：出一份完整计划（每项动作 + 原因 + diff），一个字节都不写。
+#[tauri::command]
+fn plan_apply(
+    state: State<'_, AppState>,
+    targets: Option<Vec<PathBuf>>,
+) -> Result<ApplyPreview, CoreError> {
+    let plan = state.runtime().core.plan_apply(targets.as_deref())?;
+    let summary = plan.summary();
+    Ok(ApplyPreview { plan, summary })
+}
+
+/// 「应用」第二步：执行预览里那一份计划，不重新判断动作。
+#[tauri::command]
+fn execute_apply(
+    state: State<'_, AppState>,
+    plan: ApplyPlan,
+) -> Result<Vec<ApplyOutcome>, CoreError> {
+    state.runtime().core.execute_apply(&plan)
+}
+
+#[derive(Serialize)]
 struct SettingsView {
     settings: Settings,
     /// 启动时读 `config.toml` 失败的原因（人话），没坏时为 null。
@@ -198,6 +228,8 @@ pub fn run() {
             source_dir,
             clone_remote,
             add,
+            plan_apply,
+            execute_apply,
             pull,
             commit_and_push,
             settings_view,
