@@ -108,6 +108,12 @@ interface SettingsView {
   remote_url: string | null;
 }
 
+/** 向导里的一行候选；`path` 是 `~/…` 形式，勾选后直接交给 `add`。 */
+interface Candidate {
+  path: string;
+  exists: boolean;
+}
+
 const STATUS_LABEL: Record<Status, string> = {
   Conflict: "冲突",
   PendingCommit: "待提交",
@@ -597,6 +603,95 @@ async function renderSettings(): Promise<void> {
   });
 }
 
+/** 首次使用向导：固定的候选勾选，勾中的一次批量添加。只出现一次，跳过也算走过。
+ *  私钥与历史记录不在候选里；文案说明要先自己加密。 */
+async function renderWizard(): Promise<void> {
+  let candidates: Candidate[];
+  try {
+    candidates = await invoke<Candidate[]>("onboarding_candidates");
+  } catch (error) {
+    renderError(error);
+    return;
+  }
+
+  const items = candidates
+    .map(
+      (candidate) => `
+      <li class="${candidate.exists ? "" : "missing"}">
+        <label>
+          <input type="checkbox" name="candidate" value="${escapeHtml(candidate.path)}"
+            ${candidate.exists ? "" : "disabled"} />
+          <code>${escapeHtml(candidate.path)}</code>
+          <span class="presence">${candidate.exists ? "存在" : "不存在"}</span>
+        </label>
+      </li>`,
+    )
+    .join("");
+
+  app.innerHTML = `
+    <main class="onboarding wizard">
+      <h1>挑几个配置文件托管</h1>
+      <p class="hint">
+        勾选的文件会被复制进源目录的 git 仓库，成为受管文件；这一步不写你 <code>$HOME</code> 里的任何文件。
+        这个列表只在首次使用时出现一次，以后要加别的文件走清单页的「添加文件…」。
+      </p>
+      <p class="hint">
+        私钥需要先用 <code>age</code> 自己加密后再添加（加密在 v0.3 提供）；
+        向导不会推荐历史记录、私钥或凭据类文件。
+      </p>
+      <form class="wizard-form">
+        <ul class="candidates">${items}</ul>
+        <div class="actions">
+          <button type="submit">添加选中的文件</button>
+          <button type="button" class="nav" data-skip>跳过</button>
+        </div>
+        <div class="wizard-error"></div>
+      </form>
+    </main>`;
+
+  const form = app.querySelector<HTMLFormElement>(".wizard-form")!;
+  const slot = app.querySelector<HTMLDivElement>(".wizard-error")!;
+  const submit = form.querySelector<HTMLButtonElement>("button[type=submit]")!;
+  const skip = app.querySelector<HTMLButtonElement>("[data-skip]")!;
+
+  const finish = async (paths: string[]): Promise<void> => {
+    slot.innerHTML = "";
+    submit.disabled = true;
+    skip.disabled = true;
+    if (paths.length > 0) {
+      try {
+        addReportHtml = addReport(await invoke<AddOutcome[]>("add", { paths }));
+      } catch (error) {
+        // 添加失败：停在向导上可以重试，清单还没被碰过。
+        slot.innerHTML = errorPanel(error);
+        submit.disabled = false;
+        skip.disabled = false;
+        return;
+      }
+    }
+    try {
+      await invoke("finish_onboarding");
+    } catch (error) {
+      // 标记没写住只是下次启动再问一次，不该把人挡在清单外面。
+      addReportHtml = errorPanel(error);
+    }
+    await boot();
+  };
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const paths = Array.from(
+      form.querySelectorAll<HTMLInputElement>('input[name="candidate"]:checked'),
+    ).map((input) => input.value);
+    if (paths.length === 0) {
+      slot.innerHTML = `<p class="add-summary">先勾选至少一个文件，或点「跳过」。</p>`;
+      return;
+    }
+    void finish(paths);
+  });
+  skip.addEventListener("click", () => void finish([]));
+}
+
 /** 首次启动或源目录还不是仓库：先要地址，clone 完停在清单。 */
 function renderOnboarding(sourceDir: string): void {
   app.innerHTML = `
@@ -641,7 +736,7 @@ function renderOnboarding(sourceDir: string): void {
     button.textContent = "正在 clone…";
     try {
       await invoke("clone_remote", { remote });
-      await renderInventory();
+      await boot();
     } catch (error) {
       // git 的原始 stderr 原样留在 errorPanel 里，改地址可以重试。
       slot.innerHTML = errorPanel(error);
@@ -652,21 +747,35 @@ function renderOnboarding(sourceDir: string): void {
   });
 }
 
+/** 清单页的刷新来源：fs watch 事件 + 从终端切回来。只绑一次（clone / 向导之后会再次 boot）。 */
+let listening = false;
+async function startListening(): Promise<void> {
+  if (listening) return;
+  listening = true;
+  // 编辑器保存、外部改动源目录都会推一条；没有刷新按钮。
+  await listen("inventory-changed", () => void renderInventory());
+  // 源目录之外的 git 改动（在终端里 commit）没有监视事件，从终端切回来时补一次。
+  window.addEventListener("focus", () => void renderInventory());
+}
+
 async function boot(): Promise<void> {
   try {
-    const [hasRepo, sourceDir] = await Promise.all([
+    const [hasRepo, sourceDir, wizardDone] = await Promise.all([
       invoke<boolean>("has_repo"),
       invoke<string>("source_dir"),
+      invoke<boolean>("onboarding_done"),
     ]);
     if (!hasRepo) {
       renderOnboarding(sourceDir);
       return;
     }
+    // 向导只出现一次：标记落在 app 配置目录里，跳过也会落。
+    if (!wizardDone) {
+      await renderWizard();
+      return;
+    }
     await renderInventory();
-    // 编辑器保存、外部改动源目录都会推一条；没有刷新按钮。
-    await listen("inventory-changed", () => void renderInventory());
-    // 源目录之外的 git 改动（在终端里 commit）没有监视事件，从终端切回来时补一次。
-    window.addEventListener("focus", () => void renderInventory());
+    await startListening();
   } catch (error) {
     renderError(error);
   }

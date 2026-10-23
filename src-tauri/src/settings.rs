@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 /// 默认源目录；`~` 在 `resolved_source_dir` 里展开。
 pub const DEFAULT_SOURCE_DIR: &str = "~/.config-sync";
 
+/// app 自身的配置目录：`config.toml` 与向导标记都放这里，都不进 git。
+pub fn app_dir(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/config-sync")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub source_dir: String,
