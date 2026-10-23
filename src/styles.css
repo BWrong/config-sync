@@ -473,3 +473,69 @@ pre {
 .add-notes code {
   color: var(--fg);
 }
+
+.apply-hint {
+  margin: 0 0 12px;
+  color: var(--muted);
+}
+
+.apply-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.apply-item {
+  border-top: 1px solid var(--line);
+  padding: 10px 12px;
+}
+
+.apply-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.apply-reason {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.apply-Skip .apply-head code {
+  color: var(--muted);
+}
+
+.apply-diff {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.apply-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.apply-report:not(:empty) {
+  margin-bottom: 12px;
+}
+
+.apply-summary {
+  margin: 0;
+  color: var(--muted);
+}
+
+.apply-notes {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.apply-notes code {
+  color: var(--fg);
+}
