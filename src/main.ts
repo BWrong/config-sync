@@ -23,6 +23,18 @@ interface CoreError {
   stderr: string | null;
 }
 
+interface Settings {
+  source_dir: string;
+  editor_command: string;
+  branch: string;
+}
+
+interface SettingsView {
+  settings: Settings;
+  config_error: string | null;
+  remote_url: string | null;
+}
+
 const STATUS_LABEL: Record<Status, string> = {
   InSync: "一致",
   TargetMissing: "目标缺失",
@@ -40,6 +52,7 @@ function statusBar(status: RepoStatus): string {
         <span class="chip">↑${status.ahead} ↓${status.behind}</span>
         <span class="chip">未提交 <b>${status.dirty}</b></span>
       </span>
+      <button class="nav" data-settings>设置</button>
     </header>`;
 }
 
@@ -80,9 +93,109 @@ async function renderInventory(): Promise<void> {
             : `<ul class="rows">${rows(entries)}</ul>`
         }
       </main>`;
+    bindSettingsEntry();
   } catch (error) {
-    app.innerHTML = `${errorPanel(error)}`;
+    renderError(error);
   }
+}
+
+/** 错误面板 + 一个回到设置的入口：源目录指错时人不用重启应用。 */
+function renderError(error: unknown): void {
+  app.innerHTML = `
+    ${errorPanel(error)}
+    <div class="actions"><button class="nav" data-settings>设置</button></div>`;
+  bindSettingsEntry();
+}
+
+function bindSettingsEntry(): void {
+  app.querySelectorAll<HTMLButtonElement>("[data-settings]").forEach((button) => {
+    button.addEventListener("click", () => void renderSettings());
+  });
+}
+
+/** 设置面板：三字段 + 当前远端地址。保存只落盘，随后按新源目录重读清单。 */
+async function renderSettings(): Promise<void> {
+  let view: SettingsView;
+  try {
+    view = await invoke<SettingsView>("settings_view");
+  } catch (error) {
+    renderError(error);
+    return;
+  }
+
+  const remote = view.remote_url
+    ? `<code>${escapeHtml(view.remote_url)}</code>`
+    : `<span class="muted">源目录还不是 git 仓库，或没有配置 origin</span>`;
+  app.innerHTML = `
+    <header class="bar">
+      <span class="brand">config-sync</span>
+      <span class="chips"><span class="chip">设置</span></span>
+      <button class="nav" data-back>返回清单</button>
+    </header>
+    <main class="settings">
+      ${
+        view.config_error
+          ? errorPanel({ message: `启动时读取设置失败，这次用默认值启动：${view.config_error}` })
+          : ""
+      }
+      <form class="settings-form">
+        <label>源目录
+          <input name="source_dir" value="${escapeHtml(view.settings.source_dir)}"
+            autocomplete="off" spellcheck="false" />
+          <small>受管文件副本所在的 git 仓库，支持 <code>~</code> 开头。换它不会移动或删除旧目录里的任何文件。</small>
+        </label>
+        <label>编辑器命令
+          <input name="editor_command" value="${escapeHtml(view.settings.editor_command)}"
+            placeholder="code -w {}" autocomplete="off" spellcheck="false" />
+          <small>留空表示用系统默认方式打开；非空时必须含 <code>{}</code> 作为文件路径占位。</small>
+        </label>
+        <label>分支
+          <input name="branch" value="${escapeHtml(view.settings.branch)}"
+            autocomplete="off" spellcheck="false" />
+        </label>
+        <p class="hint">当前远端：${remote}</p>
+        <div class="actions">
+          <button type="submit">保存</button>
+          <button type="button" class="nav" data-back>取消</button>
+        </div>
+        <div class="settings-error"></div>
+      </form>
+    </main>`;
+
+  const form = app.querySelector<HTMLFormElement>(".settings-form")!;
+  const slot = app.querySelector<HTMLDivElement>(".settings-error")!;
+  const submit = form.querySelector<HTMLButtonElement>("button[type=submit]")!;
+  const field = (name: string) => form.querySelector<HTMLInputElement>(`input[name="${name}"]`)!;
+
+  app.querySelectorAll<HTMLButtonElement>("[data-back]").forEach((button) => {
+    button.addEventListener("click", () => void renderInventory());
+  });
+  field("source_dir").focus();
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const settings: Settings = {
+      source_dir: field("source_dir").value,
+      editor_command: field("editor_command").value,
+      branch: field("branch").value,
+    };
+
+    slot.innerHTML = "";
+    submit.disabled = true;
+    submit.textContent = "正在保存…";
+    try {
+      await invoke("save_settings", { settings });
+    } catch (error) {
+      // 校验或落盘失败：停在表单上，人话 + 原始 stderr 都在 errorPanel 里。
+      slot.innerHTML = errorPanel(error);
+      submit.disabled = false;
+      submit.textContent = "保存";
+      return;
+    }
+
+    // 配置已落盘：按新源目录重读清单；新目录不是仓库时，错误面板里就是 git 的原话。
+    await renderInventory();
+  });
 }
 
 /** 首次启动或源目录还不是仓库：先要地址，clone 完停在清单。 */
@@ -105,6 +218,7 @@ function renderOnboarding(sourceDir: string): void {
         <button type="submit">clone</button>
       </form>
       <div class="clone-error"></div>
+      <div class="actions"><button class="nav" data-settings>设置</button></div>
     </main>`;
 
   const form = app.querySelector<HTMLFormElement>(".clone-form")!;
@@ -112,6 +226,7 @@ function renderOnboarding(sourceDir: string): void {
   const button = form.querySelector<HTMLButtonElement>("button")!;
   const slot = app.querySelector<HTMLDivElement>(".clone-error")!;
   input.focus();
+  bindSettingsEntry();
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -150,7 +265,7 @@ async function boot(): Promise<void> {
     }
     await renderInventory();
   } catch (error) {
-    app.innerHTML = `${errorPanel(error)}`;
+    renderError(error);
   }
 }
 

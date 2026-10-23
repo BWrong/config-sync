@@ -198,3 +198,88 @@ pre {
 .onboarding .error {
   margin: 16px 0 0;
 }
+
+.nav {
+  margin-left: auto;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin: 0 16px 16px;
+}
+
+.actions button {
+  margin-left: 0;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.actions button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.settings {
+  margin: 24px auto;
+  max-width: 34rem;
+  padding: 0 16px;
+}
+
+.settings .error {
+  margin: 0 0 16px;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.settings-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.settings-form small {
+  color: var(--muted);
+}
+
+.settings-form input {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.settings-form .actions {
+  margin: 6px 0 0;
+}
+
+.settings-form .error {
+  margin: 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.onboarding .actions {
+  margin: 16px 0 0;
+}

@@ -6,14 +6,61 @@
 mod settings;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
-use config_sync_core::{Core, CoreError, InventoryEntry, RepoStatus};
+use config_sync_core::{Core, CoreError, ErrorKind, InventoryEntry, RepoStatus};
+use serde::Serialize;
 use settings::Settings;
 use tauri::State;
 
-pub struct AppState {
-    core: Core,
+/// 改设置后要整体重建的东西：Core 与解析后的源目录都从 `settings` 推导。
+struct Runtime {
+    settings: Settings,
     source_dir: PathBuf,
+    core: Core,
+    /// 启动时 `config.toml` 读坏的原因；保存成功后重建即清掉。
+    config_error: Option<String>,
+}
+
+impl Runtime {
+    fn new(home: &Path, settings: Settings, config_error: Option<String>) -> Self {
+        let source_dir = settings.resolved_source_dir(home);
+        Runtime {
+            core: Core::new(home, &source_dir, settings.core_config()),
+            source_dir,
+            settings,
+            config_error,
+        }
+    }
+}
+
+pub struct AppState {
+    home: PathBuf,
+    runtime: Mutex<Runtime>,
+}
+
+impl AppState {
+    /// 读设置、解析源目录、构造 Core。
+    ///
+    /// `config.toml` 坏了不阻塞启动：退回默认设置，把错误留在 `Runtime` 里给设置面板显示
+    /// （文件保持原样，不被覆盖）。
+    fn from_environment() -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME 未设置，无法定位 $HOME");
+        let (settings, config_error) = match Settings::load_or_create(&config_path(&home)) {
+            Ok(settings) => (settings, None),
+            Err(e) => {
+                eprintln!("config-sync: {e}；本次用默认设置启动");
+                (Settings::default(), Some(e))
+            }
+        };
+        AppState { runtime: Mutex::new(Runtime::new(&home, settings, config_error)), home }
+    }
+
+    fn runtime(&self) -> MutexGuard<'_, Runtime> {
+        self.runtime.lock().expect("设置状态被毒化")
+    }
 }
 
 /// `~/Library/Application Support/config-sync/config.toml`。
@@ -21,56 +68,74 @@ fn config_path(home: &Path) -> PathBuf {
     home.join("Library/Application Support/config-sync/config.toml")
 }
 
-/// 读设置、解析源目录、构造 Core。
-///
-/// `config.toml` 坏了不阻塞启动：退回默认设置，并把手写错误打到 stderr（文件保持原样）。
-fn state_from_environment() -> AppState {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("HOME 未设置，无法定位 $HOME");
-    let settings = Settings::load_or_create(&config_path(&home)).unwrap_or_else(|e| {
-        eprintln!("config-sync: {e}；本次用默认设置启动");
-        Settings::default()
-    });
-    let source_dir = settings.resolved_source_dir(&home);
-    AppState { core: Core::new(&home, &source_dir, settings.core_config()), source_dir }
-}
-
 #[tauri::command]
 fn inventory(state: State<'_, AppState>) -> Result<Vec<InventoryEntry>, CoreError> {
-    state.core.inventory()
+    state.runtime().core.inventory()
 }
 
 #[tauri::command]
 fn repo_status(state: State<'_, AppState>) -> Result<RepoStatus, CoreError> {
-    state.core.repo_status()
+    state.runtime().core.repo_status()
 }
 
 /// 源目录里是否已经有仓库：false 时前端进「输入远端地址」。
 #[tauri::command]
 fn has_repo(state: State<'_, AppState>) -> bool {
-    state.core.has_repo()
+    state.runtime().core.has_repo()
 }
 
 #[tauri::command]
 fn source_dir(state: State<'_, AppState>) -> String {
-    state.source_dir.display().to_string()
+    state.runtime().source_dir.display().to_string()
 }
 
 #[tauri::command]
 fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreError> {
-    state.core.clone(&remote)
+    state.runtime().core.clone(&remote)
+}
+
+#[derive(Serialize)]
+struct SettingsView {
+    settings: Settings,
+    /// 启动时读 `config.toml` 失败的原因（人话），没坏时为 null。
+    config_error: Option<String>,
+    /// 源目录里 `origin` 的地址；还不是仓库或没配 origin 时为 null。
+    remote_url: Option<String>,
+}
+
+/// 设置面板要显示的全部内容：三字段 + 当前远端地址 + 配置读坏的原因。
+#[tauri::command]
+fn settings_view(state: State<'_, AppState>) -> SettingsView {
+    let runtime = state.runtime();
+    SettingsView {
+        settings: runtime.settings.clone(),
+        config_error: runtime.config_error.clone(),
+        remote_url: runtime.core.remote_url().ok(),
+    }
+}
+
+/// 校验 → 落盘 → 用新设置重建 Core。只写 `config.toml`，不做任何 git 操作。
+#[tauri::command]
+fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<(), CoreError> {
+    let io = |message: String| CoreError { kind: ErrorKind::Io, message, stderr: None };
+    let settings = settings.trimmed();
+    settings.validate(&state.home).map_err(io)?;
+    settings.save(&config_path(&state.home)).map_err(io)?;
+    *state.runtime() = Runtime::new(&state.home, settings, None);
+    Ok(())
 }
 
 pub fn run() {
     tauri::Builder::default()
-        .manage(state_from_environment())
+        .manage(AppState::from_environment())
         .invoke_handler(tauri::generate_handler![
             inventory,
             repo_status,
             has_repo,
             source_dir,
-            clone_remote
+            clone_remote,
+            settings_view,
+            save_settings
         ])
         .run(tauri::generate_context!())
         .expect("config-sync 启动失败");
