@@ -100,12 +100,11 @@ impl Core {
             Ok(rest) => self.home.join(rest),
             Err(_) => path.to_path_buf(),
         };
-        let rel = expanded.strip_prefix(&self.home).ok()?;
-        // `..` 会让 join 出来的源路径穿出 home/，一律不收。
-        if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-            return None;
+        if let Some(rel) = inside(&expanded, &self.home) {
+            return Some(rel);
         }
-        Some(rel.to_path_buf())
+        // 选择器与终端常给出带符号链接的路径（macOS 上 /tmp、/var 都是软链）：按真实路径再试一次。
+        inside(&expanded.canonicalize().ok()?, &self.home.canonicalize().ok()?)
     }
 
     /// 单个文件的复制；源文件已存在时只报告，绝不覆盖。
@@ -136,6 +135,16 @@ impl Core {
         out.push(AddOutcome { target, result: AddResult::Added });
         Ok(())
     }
+}
+
+/// `path` 相对 `home` 的纯普通路径；不在 `home` 下或带 `..`/`.` 这类穿透成分时返回 `None`。
+fn inside(path: &Path, home: &Path) -> Option<PathBuf> {
+    let rel = path.strip_prefix(home).ok()?;
+    // `..` 会让 join 出来的源路径穿出 home/，一律不收。
+    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    Some(rel.to_path_buf())
 }
 
 /// 递归收集普通文件。符号链接按指向的内容算（不递归进符号链接目录，避免环），

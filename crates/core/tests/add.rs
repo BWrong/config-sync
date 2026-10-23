@@ -183,3 +183,21 @@ fn a_batch_reports_every_path_and_duplicates_collapse_to_one_inventory_row() {
     );
     assert_eq!(core.inventory().unwrap().len(), 2);
 }
+
+#[test]
+fn a_path_that_reaches_home_through_a_symlink_is_still_accepted() {
+    let (f, core) = core();
+    f.write_home(".gitconfig", "[user]\n\tname = Bywrong\n");
+    // 选择器与终端常给出带符号链接的路径（macOS 上 /tmp、/var 都是软链）。
+    let link = f.tmp_root().join("home-link");
+    std::os::unix::fs::symlink(f.path("home"), &link).expect("建软链");
+
+    let outcomes = core.add(&[link.join(".gitconfig")]).unwrap();
+
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].result, AddResult::Added, "{outcomes:?}");
+    assert_eq!(
+        std::fs::read_to_string(f.source_dir.join("home/.gitconfig")).unwrap(),
+        "[user]\n\tname = Bywrong\n"
+    );
+}
