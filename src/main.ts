@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 
 /** 与 Core 的 `InventoryEntry.status` 一一对应；中文文案只活在前端。 */
@@ -85,10 +86,28 @@ function rows(entries: InventoryEntry[]): string {
           </span>
           <span class="status status-${entry.status}">${STATUS_LABEL[entry.status]}</span>
         </button>
+        <button type="button" class="row-edit" data-edit title="打开源目录里的副本">编辑</button>
         <div class="diff"></div>
       </li>`,
     )
     .join("");
+}
+
+/** 「编辑」：用系统打开方式（或设置里的编辑器命令）打开源目录里的副本。
+ *  拉起即返回，保存后的状态变化由 fs watch 推过来，这里不轮询。 */
+async function editRow(row: HTMLLIElement, button: HTMLButtonElement): Promise<void> {
+  const slot = row.querySelector<HTMLDivElement>(".diff")!;
+  button.disabled = true;
+  try {
+    await invoke("edit", { target: row.dataset.target });
+  } catch (error) {
+    // 编辑器命令配错、源文件已被删：把原因摆在这一行里，别让人以为点了没反应。
+    row.classList.add("open");
+    slot.dataset.loaded = "false";
+    slot.innerHTML = errorPanel(error);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 /** 点行展开该文件的 diff；diff 由 Core 生成，这里只按行着色。 */
@@ -158,9 +177,15 @@ async function renderInventory(): Promise<void> {
       </main>`;
 
     app.querySelector<HTMLUListElement>(".rows")?.addEventListener("click", (event) => {
-      const head = (event.target as HTMLElement).closest(".row-head");
-      const row = head?.closest<HTMLLIElement>(".row");
-      if (row) void toggleDiff(row);
+      const target = event.target as HTMLElement;
+      const edit = target.closest<HTMLButtonElement>("[data-edit]");
+      const row = target.closest<HTMLLIElement>(".row");
+      if (!row) return;
+      if (edit) {
+        void editRow(row, edit);
+      } else if (target.closest(".row-head")) {
+        void toggleDiff(row);
+      }
     });
     bindSettingsEntry();
   } catch (error) {
@@ -333,7 +358,9 @@ async function boot(): Promise<void> {
       return;
     }
     await renderInventory();
-    // 没有刷新按钮（fs watch 在 v0.3）：从终端切回来时重新推导一遍。
+    // 编辑器保存、外部改动源目录都会推一条；没有刷新按钮。
+    await listen("inventory-changed", () => void renderInventory());
+    // 源目录之外的 git 改动（在终端里 commit）没有监视事件，从终端切回来时补一次。
     window.addEventListener("focus", () => void renderInventory());
   } catch (error) {
     renderError(error);

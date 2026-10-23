@@ -98,6 +98,7 @@ pre {
 }
 
 .row {
+  position: relative;
   border-top: 1px solid var(--line);
 }
 
@@ -111,7 +112,7 @@ pre {
   justify-content: space-between;
   gap: 16px;
   width: 100%;
-  padding: 9px 12px;
+  padding: 9px 64px 9px 12px;
   border: 0;
   background: transparent;
   color: inherit;
@@ -150,6 +151,25 @@ pre {
 .status {
   flex: none;
   color: var(--muted);
+}
+
+/* 行上的「编辑」：叠在行头右侧，不参与行头的点击区域。 */
+.row-edit {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.row-edit:disabled {
+  color: var(--muted);
+  cursor: default;
 }
 
 .status-Pending,
