@@ -4,6 +4,7 @@
 //! 环境事实（`$HOME`、`config.toml`）由外壳读取后注入 Core，Core 自己绝不读。
 
 mod settings;
+mod watch;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -11,7 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 use config_sync_core::{AddOutcome, Core, CoreError, ErrorKind, FileDiff, InventoryEntry, RepoStatus};
 use serde::Serialize;
 use settings::Settings;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 /// 改设置后要整体重建的东西：Core 与解析后的源目录都从 `settings` 推导。
 struct Runtime {
@@ -37,6 +38,8 @@ impl Runtime {
 pub struct AppState {
     home: PathBuf,
     runtime: Mutex<Runtime>,
+    /// 源目录 `home/` 的监视器；drop 即停止。换源目录时在 `watch` 里整体重建。
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
 impl AppState {
@@ -55,11 +58,28 @@ impl AppState {
                 (Settings::default(), Some(e))
             }
         };
-        AppState { runtime: Mutex::new(Runtime::new(&home, settings, config_error)), home }
+        AppState {
+            runtime: Mutex::new(Runtime::new(&home, settings, config_error)),
+            watcher: Mutex::new(None),
+            home,
+        }
     }
 
     fn runtime(&self) -> MutexGuard<'_, Runtime> {
         self.runtime.lock().expect("设置状态被毒化")
+    }
+
+    /// 按当前源目录（重新）建立文件监视；监视不起来不阻塞启动，只是不能自动刷新。
+    fn watch(&self, app: &AppHandle) {
+        let source_dir = self.runtime().source_dir.clone();
+        let watcher = match watch::start(app.clone(), &source_dir) {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                eprintln!("config-sync: {e}；清单不会随编辑器保存自动刷新");
+                None
+            }
+        };
+        *self.watcher.lock().expect("监视状态被毒化") = watcher;
     }
 }
 
@@ -88,6 +108,12 @@ fn diff(state: State<'_, AppState>, target: String) -> Result<FileDiff, CoreErro
 #[tauri::command]
 fn has_repo(state: State<'_, AppState>) -> bool {
     state.runtime().core.has_repo()
+}
+
+/// 「编辑」一行：打开源目录里的副本，拉起即返回；保存后的刷新靠 fs watch。
+#[tauri::command]
+fn edit(state: State<'_, AppState>, target: String) -> Result<(), CoreError> {
+    state.runtime().core.edit(Path::new(&target))
 }
 
 #[tauri::command]
@@ -128,27 +154,45 @@ fn settings_view(state: State<'_, AppState>) -> SettingsView {
 
 /// 校验 → 落盘 → 用新设置重建 Core。只写 `config.toml`，不做任何 git 操作。
 #[tauri::command]
-fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<(), CoreError> {
+fn save_settings(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    settings: Settings,
+) -> Result<(), CoreError> {
     let io = |message: String| CoreError { kind: ErrorKind::Io, message, stderr: None };
     let settings = settings.trimmed();
     settings.validate(&state.home).map_err(io)?;
     settings.save(&config_path(&state.home)).map_err(io)?;
     *state.runtime() = Runtime::new(&state.home, settings, None);
+    // 源目录可能换了个地方，监视器跟着换。
+    state.watch(&app);
     Ok(())
+}
+
+/// 拉取：`fetch` + `merge --ff-only`，只更新源目录，不动任何目标文件。
+#[tauri::command]
+fn pull(state: State<'_, AppState>) -> Result<(), CoreError> {
+    state.runtime().core.pull()
 }
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::from_environment())
+        .setup(|app| {
+            app.state::<AppState>().watch(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             inventory,
             repo_status,
             diff,
+            edit,
             has_repo,
             source_dir,
             clone_remote,
             add,
+            pull,
             settings_view,
             save_settings
         ])

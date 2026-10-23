@@ -5,6 +5,7 @@
 
 mod add;
 mod config;
+mod editor;
 mod error;
 mod git;
 mod inventory;
@@ -13,6 +14,7 @@ mod state;
 
 pub use add::{AddOutcome, AddResult};
 pub use config::Config;
+pub use editor::Attempt;
 pub use error::{CoreError, ErrorKind};
 pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
 
@@ -21,7 +23,6 @@ use std::path::{Path, PathBuf};
 pub struct Core {
     home: PathBuf,
     source_dir: PathBuf,
-    #[allow(dead_code)] // 后续票据（设置、编辑）读它；本票不需要。
     config: Config,
 }
 
@@ -69,6 +70,42 @@ impl Core {
             message: format!("从 {remote} clone 到 {} 失败", self.source_dir.display()),
             ..e
         })?;
+        Ok(())
+    }
+
+    /// 拉取：`fetch` 之后只允许 `merge --ff-only`。
+    ///
+    /// 只更新源目录里的仓库，**绝不写任何目标文件**；拉完清单里相关行会变成待应用。
+    /// 任何会生成 merge commit 的路径都不存在：不能快进就直接拒绝（附带 git 原始 stderr），
+    /// 源目录保持原样。
+    pub fn pull(&self) -> Result<(), CoreError> {
+        let remote_url = self.remote_url().map_err(|e| CoreError {
+            message: "源目录没有配置远端，无法拉取".to_string(),
+            ..e
+        })?;
+
+        let upstream = git::run(
+            &self.source_dir,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        .map_err(|e| CoreError {
+            message: "当前分支没有上游分支，无法拉取；先推送一次建立跟踪".to_string(),
+            ..e
+        })?;
+
+        git::run(&self.source_dir, &["fetch", "origin"]).map_err(|e| CoreError {
+            message: format!("拉取失败：无法从远端 {remote_url} 取回最新提交"),
+            ..e
+        })?;
+
+        git::run(&self.source_dir, &["merge", "--ff-only", &upstream]).map_err(|e| CoreError {
+            message: format!(
+                "拉取被拒：无法快进到 {upstream}（本机有远端没有的提交，或工作区改动挡住了合并），\
+                 需要手动处理；源目录保持原样，没有产生 merge commit"
+            ),
+            ..e
+        })?;
+
         Ok(())
     }
 
@@ -140,6 +177,40 @@ impl Core {
             status,
             text: unified_diff(&old_label, &new_label, &old, &new),
         })
+    }
+
+    /// 打开一行的源文件（受管副本，绝不是 `$HOME` 里的目标文件）要用的尝试序列；不执行进程。
+    ///
+    /// 源文件不在磁盘上（清单过期或被删）时直接报错，不把空路径交给编辑器。
+    pub fn edit_plan(&self, target: &Path) -> Result<Vec<Attempt>, CoreError> {
+        let rel = target.strip_prefix(&self.home).map_err(|_| {
+            CoreError::io(format!(
+                "{} 不在 {} 下，没有对应的受管文件",
+                target.display(),
+                self.home.display()
+            ))
+        })?;
+        let source = self.source_dir.join(paths::MIRROR_ROOT).join(rel);
+        if !source.is_file() {
+            return Err(CoreError::io(format!(
+                "源文件 {} 不存在（清单可能已过期），不打开空路径；请重新读取清单",
+                source.display()
+            )));
+        }
+        editor::plan(&self.config.editor_command, &source)
+    }
+
+    /// 用 `editor_command`（或系统 `open`）打开源文件，拉起即返回，不等编辑器退出；
+    /// 保存后的清单刷新靠外壳的 fs watch。
+    pub fn edit(&self, target: &Path) -> Result<(), CoreError> {
+        let mut last = None;
+        for attempt in self.edit_plan(target)? {
+            match attempt.run() {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| CoreError::io("没有可用的打开方式")))
     }
 
     /// 目标文件与源文件的关系；源文件是受管文件本身，读不到是真错误。
