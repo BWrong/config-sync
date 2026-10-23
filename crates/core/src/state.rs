@@ -58,6 +58,11 @@ impl GitFacts {
     pub(crate) fn dirty_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.dirty.iter()
     }
+
+    /// 这条仓库内路径是否处于真未合并（`UU`/`AA`/`DD`）状态。
+    pub(crate) fn is_unmerged(&self, repo_path: &Path) -> bool {
+        self.unmerged.contains(repo_path)
+    }
 }
 
 /// 目标文件与源文件的关系（纯磁盘事实）。

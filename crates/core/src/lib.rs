@@ -13,6 +13,7 @@ mod inventory;
 mod onboarding;
 mod paths;
 mod push;
+mod resolve;
 mod state;
 
 pub use add::{AddOutcome, AddResult};
@@ -23,6 +24,7 @@ pub use error::{CoreError, ErrorKind};
 pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
 pub use onboarding::Candidate;
 pub use push::PushOutcome;
+pub use resolve::Side;
 
 use std::path::{Path, PathBuf};
 
