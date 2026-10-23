@@ -76,11 +76,10 @@ impl Core {
     /// 任何会生成 merge commit 的路径都不存在：不能快进就直接拒绝（附带 git 原始 stderr），
     /// 源目录保持原样。
     pub fn pull(&self) -> Result<(), CoreError> {
-        let remote_url = git::run(&self.source_dir, &["remote", "get-url", "origin"])
-            .map_err(|e| CoreError {
-                message: "源目录没有配置远端，无法拉取".to_string(),
-                ..e
-            })?;
+        let remote_url = self.remote_url().map_err(|e| CoreError {
+            message: "源目录没有配置远端，无法拉取".to_string(),
+            ..e
+        })?;
 
         let upstream = git::run(
             &self.source_dir,
@@ -105,6 +104,11 @@ impl Core {
         })?;
 
         Ok(())
+    }
+
+    /// 源目录里 `origin` 的地址；设置面板用它显示"当前对着哪个远端"。
+    pub fn remote_url(&self) -> Result<String, CoreError> {
+        git::run(&self.source_dir, &["remote", "get-url", "origin"])
     }
 
     /// 受管文件的完整列表。完全没有受管文件时返回空集合（不是错误）。
