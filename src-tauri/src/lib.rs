@@ -12,7 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use config_sync_core::{
     AddOutcome, ApplyOutcome, ApplyPlan, ApplySummary, Candidate, Core, CoreError, ErrorKind,
-    FileDiff, InventoryEntry, PushOutcome, RepoStatus,
+    FileDiff, InventoryEntry, PushOutcome, RemoveOutcome, RepoStatus,
 };
 use serde::Serialize;
 use settings::Settings;
@@ -87,7 +87,7 @@ impl AppState {
     }
 }
 
-/// `~/Library/Application Support/config-sync/config.toml`。
+/// `~/.config/config-sync/config.toml`。
 fn config_path(home: &Path) -> PathBuf {
     settings::app_dir(home).join("config.toml")
 }
@@ -130,10 +130,22 @@ fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreEr
     state.runtime().core.clone(&remote)
 }
 
+/// 写入或替换源目录仓库的 origin 地址。只动 git 配置，不提交、不写 $HOME。
+#[tauri::command]
+fn set_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreError> {
+    state.runtime().core.set_remote(&remote)
+}
+
 /// 把路径（文件或整棵子树）收进源目录；每条路径各自成败，逐条返回。
 #[tauri::command]
 fn add(state: State<'_, AppState>, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome>, CoreError> {
     state.runtime().core.add(&paths)
+}
+
+/// 把路径（文件或整棵子树）从源目录移除；只动源目录里的副本，不碰 `$HOME` 原文件。
+#[tauri::command]
+fn remove(state: State<'_, AppState>, targets: Vec<PathBuf>) -> Result<Vec<RemoveOutcome>, CoreError> {
+    state.runtime().core.remove(&targets)
 }
 
 /// 首次使用向导的候选：固定的一组常见配置文件 + 本机是否存在；勾选后交给 `add`。
@@ -262,7 +274,9 @@ pub fn run() {
             has_repo,
             source_dir,
             clone_remote,
+            set_remote,
             add,
+            remove,
             plan_apply,
             execute_apply,
             onboarding_candidates,

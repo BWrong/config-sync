@@ -1,6 +1,6 @@
 //! `config.toml` 的读写。
 //!
-//! 文件固定在 `~/Library/Application Support/config-sync/config.toml`，不进 git。
+//! 文件固定在 `~/.config/config-sync/config.toml`，不进 git。
 //! 磁盘结构留在外壳：Core 只收到 `Config { branch, editor_command }` 与解析后的 `source_dir`，
 //! 所以 `source_dir` 只在这里出现一次，Core 不读 env、不读 `$HOME`。
 
@@ -10,11 +10,11 @@ use config_sync_core::Config;
 use serde::{Deserialize, Serialize};
 
 /// 默认源目录；`~` 在 `resolved_source_dir` 里展开。
-pub const DEFAULT_SOURCE_DIR: &str = "~/.config-sync";
+pub const DEFAULT_SOURCE_DIR: &str = "~/.local/share/config-sync";
 
 /// app 自身的配置目录：`config.toml` 与向导标记都放这里，都不进 git。
 pub fn app_dir(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/config-sync")
+    home.join(".config/config-sync")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +133,7 @@ mod tests {
 
     fn temp_config_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("创建临时目录");
-        let path = dir.path().join("Application Support/config-sync/config.toml");
+        let path = dir.path().join(".config/config-sync/config.toml");
         (dir, path)
     }
 
@@ -145,7 +145,7 @@ mod tests {
         let loaded = Settings::load_or_create(&path).expect("首次启动应成功");
 
         assert_eq!(loaded, Settings::default());
-        assert_eq!(loaded.source_dir, "~/.config-sync");
+        assert_eq!(loaded.source_dir, "~/.local/share/config-sync");
         assert!(path.exists(), "首次启动要把默认 config.toml 落盘");
         assert_eq!(Settings::load_or_create(&path).expect("读回"), Settings::default());
     }
@@ -175,7 +175,7 @@ mod tests {
     fn tilde_expands_against_home_and_absolute_paths_stay_put() {
         let home = Path::new("/Users/someone");
         for (raw, expected) in [
-            ("~/.config-sync", "/Users/someone/.config-sync"),
+            ("~/.local/share/config-sync", "/Users/someone/.local/share/config-sync"),
             ("~", "/Users/someone"),
             ("~/dotfiles/config", "/Users/someone/dotfiles/config"),
             ("/opt/config-sync", "/opt/config-sync"),

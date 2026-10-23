@@ -39,6 +39,10 @@ pre {
 }
 
 .bar {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg);
   display: flex;
   align-items: center;
   gap: 16px;
@@ -46,11 +50,6 @@ pre {
   border-bottom: 1px solid var(--line);
   -webkit-user-select: none;
   user-select: none;
-}
-
-.brand {
-  font-weight: 600;
-  letter-spacing: 0.01em;
 }
 
 .chips {
@@ -77,17 +76,32 @@ pre {
 .toolbar {
   display: flex;
   justify-content: flex-end;
+  gap: 6px;
   padding: 10px 16px 0;
 }
 
 .toolbar button {
-  padding: 5px 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 26px;
+  padding: 0;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: transparent;
   color: var(--accent);
   font: inherit;
+  line-height: 1;
   cursor: pointer;
+}
+
+/* 「添加文件」带文字，宽度自适应；独立停在左边，三个全局动作靠右。 */
+.toolbar .add-files {
+  width: auto;
+  gap: 5px;
+  margin-right: auto;
+  padding: 0 11px 0 9px;
 }
 
 .toolbar button:disabled {
@@ -95,8 +109,18 @@ pre {
   cursor: default;
 }
 
+/* 工具栏下面的一条消息（推送结果 / 动作报错）：与工具栏、清单同一条左边界。 */
+.action-error:not(:empty) {
+  padding: 10px 16px 0;
+  font-size: 12px;
+}
+
 .action-error .error {
-  margin: 12px 16px 0;
+  margin: 0;
+}
+
+.action-error code {
+  overflow-wrap: anywhere;
 }
 
 .empty {
@@ -122,6 +146,15 @@ pre {
   overflow: hidden;
 }
 
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  margin: 10px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .row {
   position: relative;
   border-top: 1px solid var(--line);
@@ -134,10 +167,9 @@ pre {
 .row-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
   width: 100%;
-  padding: 9px 64px 9px 12px;
+  padding: 10px 96px 10px 12px;
   border: 0;
   background: transparent;
   color: inherit;
@@ -158,9 +190,20 @@ pre {
 
 .paths {
   display: flex;
+  flex: 1;
   gap: 8px;
   align-items: baseline;
   min-width: 0;
+}
+
+/* 左边是 $HOME 下的真身，右边是源目录里的副本；目录压暗，文件名才是眼睛要找的东西。 */
+.paths .dir {
+  color: var(--muted);
+}
+
+.paths .alt {
+  flex: 0 1 auto;
+  color: var(--muted);
 }
 
 .paths code {
@@ -175,24 +218,54 @@ pre {
 
 .status {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4em;
   color: var(--muted);
 }
 
-/* 行上的「编辑」：叠在行头右侧，不参与行头的点击区域。 */
-.row-edit {
+/* 颜色之外再给一个形状：色弱的人靠图标也能分清六种状态。 */
+.status-icon {
+  font-size: 0.85em;
+  line-height: 1;
+}
+
+/* 行上的操作叠在行头右侧，不参与行头的点击区域。 */
+.row-actions {
   position: absolute;
-  top: 6px;
-  right: 10px;
-  padding: 3px 9px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
+  top: 4px;
+  right: 8px;
+  display: flex;
+  gap: 5px;
+}
+
+.row-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
   background: transparent;
-  color: var(--accent);
+  color: var(--muted);
   font: inherit;
+  line-height: 1;
   cursor: pointer;
 }
 
-.row-edit:disabled {
+.row-action:hover {
+  border-color: var(--line);
+  color: var(--accent);
+}
+
+.row-action[data-delete]:hover {
+  color: var(--danger);
+}
+
+.row-action:disabled {
   color: var(--muted);
   cursor: default;
 }
@@ -308,6 +381,26 @@ pre {
   cursor: pointer;
 }
 
+/* 一组 nav 按钮只让最后一个占掉剩余空间，否则每个 auto 外边距都会分走一段。 */
+.nav + .nav {
+  margin-left: 0;
+}
+
+/* 「返回」钉在最左，不抢剩余空间（剩余空间都留给最右的那个按钮）。 */
+.nav.back {
+  margin-left: 0;
+}
+
+/* 图标按钮：方一点，和工具栏那组对齐。 */
+.nav.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+}
+
 .clone-form button:disabled {
   color: var(--muted);
   cursor: default;
@@ -352,7 +445,7 @@ pre {
 
 .settings {
   margin: 24px auto;
-  max-width: 34rem;
+  max-width: 46rem;
   padding: 0 16px;
 }
 
@@ -439,59 +532,6 @@ pre {
   margin-top: 12px;
 }
 
-.add-bar {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.add-bar button,
-.add-paste summary {
-  padding: 4px 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--accent);
-  font: inherit;
-  cursor: pointer;
-  -webkit-user-select: none;
-  user-select: none;
-}
-
-.add-paste[open] {
-  flex: 1;
-  margin-bottom: 8px;
-}
-
-.add-paste[open] summary {
-  width: max-content;
-  margin-bottom: 8px;
-}
-
-.add-paths {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
-  max-width: 46rem;
-}
-
-.add-paths textarea {
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--fg);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px;
-  resize: vertical;
-}
-
-.add-paths button {
-  align-self: flex-start;
-}
-
 .add-report:not(:empty) {
   margin-bottom: 12px;
 }
@@ -529,13 +569,81 @@ pre {
 
 .apply-head {
   display: flex;
+  align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+}
+
+.apply-head code {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 动作标签：只给文字留位置（清单里的 .status 是图标专用，宽度只有一个字符）。 */
+.apply-tag {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.apply-tag-Create,
+.apply-tag-Overwrite {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 跳过的项折起来：默认只留一行，展开才看逐条原因。 */
+.apply-skipped {
+  margin-top: 14px;
+  color: var(--muted);
+}
+
+.apply-skipped summary {
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.apply-skipped .apply-item {
+  padding: 8px 2px;
+}
+
+.apply-actions button {
+  padding: 5px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.apply-actions .confirm-apply {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.apply-actions button:disabled {
+  color: var(--muted);
+  border-color: var(--line);
+  cursor: default;
 }
 
 .apply-reason {
   margin: 4px 0 0;
   color: var(--muted);
+}
+
+/* 跳过项的图标：一句话换成符号，说明放 title。 */
+.apply-skip-icon {
+  flex: none;
+  width: 1.2em;
+  color: var(--muted);
+  text-align: center;
 }
 
 .apply-Skip .apply-head code {
@@ -575,4 +683,72 @@ pre {
 
 .apply-notes code {
   color: var(--fg);
+}
+
+/* 应用内确认框：盖住整页，点遮罩或 Esc 等于取消。 */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.modal-box {
+  width: 100%;
+  max-width: 340px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2);
+}
+
+.modal-text {
+  margin: 0 0 14px;
+  white-space: pre-line;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.modal-actions button {
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.modal-ok {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.modal-ok.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* 本机与远端不一致时的一句话提示：告诉用户该推送还是该拉取。 */
+.pending-hint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  margin: 10px 16px 0;
+  color: var(--add);
+  font-size: 12px;
+}
+
+.paths code.gone {
+  color: var(--muted);
+  text-decoration: line-through;
 }

@@ -42,14 +42,31 @@ pub struct ApplySummary {
 pub struct ApplyItem {
     /// 会被写到的真实路径（`$HOME` 下）。
     pub target: PathBuf,
+    /// 源目录里的副本：界面拿它换算 `~/…` 这种短路径。
+    pub source: PathBuf,
     pub action: ApplyAction,
     /// 这个动作的原因，直接给界面显示；跳过项也一定有。
     pub reason: String,
     /// 应用会带来的改动（目标 → 源），unified diff；没有改动时是空串。
     pub diff: String,
+    /// 跳过项的归类：界面用图标表达，不逐条念句子。非跳过项为 `None`。
+    pub skip_reason: Option<SkipReason>,
     /// 出计划时源文件内容的指纹（十六进制）：写盘前比对，源文件在这期间变过就不写。
     /// 用字符串是因为它要经 JSON 到界面再回来，u64 会丢精度。
     pub digest: String,
+}
+
+/// 跳过一项的原因归类（`reason` 里是给人看的那句话）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkipReason {
+    /// 目标与源内容已一致，不用写。
+    InSync,
+    /// 源目录里没有这个副本（删掉了或还没添加），目标绝不被覆盖。
+    SourceMissing,
+    /// 源目录里还有未提交的改动：先推送，再应用。
+    Uncommitted,
+    /// 源目录与远端都改了同一路径：先解决冲突。
+    Conflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +151,7 @@ impl Core {
         if !source.is_file() {
             return Ok(ApplyItem {
                 target,
+                source: source.clone(),
                 action: ApplyAction::Skip,
                 reason: format!(
                     "源目录里没有这个文件（{}），目标已存在也不会被覆盖",
@@ -141,36 +159,46 @@ impl Core {
                 ),
                 diff: String::new(),
                 digest: String::new(),
+                skip_reason: Some(SkipReason::SourceMissing),
             });
         }
 
         let repo_path = Path::new(paths::MIRROR_ROOT).join(rel);
         let disk = self.disk(rel)?;
-        let (action, reason) = match state::derive(disk, &repo_path, facts) {
+        let (action, reason, skip_reason) = match state::derive(disk, &repo_path, facts) {
             // 源侧内容还没定下来：先让用户处理提交 / 冲突，应用不动目标文件。
             Status::PendingCommit => (
                 ApplyAction::Skip,
                 "源目录里这个文件还有未提交的改动；先推送，再应用".to_string(),
+                Some(SkipReason::Uncommitted),
             ),
             Status::Conflict => (
                 ApplyAction::Skip,
                 "这个文件在源目录与远端都有改动（冲突）；先解决冲突，再应用".to_string(),
+                Some(SkipReason::Conflict),
             ),
             _ => match disk {
-                state::Disk::Same => (ApplyAction::Skip, "内容已一致，不用写".to_string()),
+                state::Disk::Same => (
+                    ApplyAction::Skip,
+                    "内容已一致，不用写".to_string(),
+                    Some(SkipReason::InSync),
+                ),
                 state::Disk::Missing => {
-                    (ApplyAction::Create, "目标文件不存在，会新建".to_string())
+                    (ApplyAction::Create, "目标文件不存在，会新建".to_string(), None)
                 }
                 state::Disk::Differs => (
                     ApplyAction::Overwrite,
                     "目标文件存在且内容不同，会覆盖（保留它原来的权限）".to_string(),
+                    None,
                 ),
             },
         };
 
         let bytes = std::fs::read(&source)
             .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
+        let item_source = source.clone();
         Ok(ApplyItem {
+            source: item_source,
             diff: unified_diff(
                 &target.display().to_string(),
                 &source.display().to_string(),
@@ -181,6 +209,7 @@ impl Core {
             target,
             action,
             reason,
+            skip_reason,
         })
     }
 

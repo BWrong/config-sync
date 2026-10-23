@@ -16,6 +16,8 @@ interface InventoryEntry {
   source: string;
   target: string;
   status: Status;
+  /** 源目录里这个副本已被删除，只剩 git 里那条未提交的删除（等推送记录）。 */
+  deleted: boolean;
 }
 
 interface FileDiff {
@@ -60,16 +62,30 @@ interface AddOutcome {
   result: AddResult;
 }
 
+/** 与 Core 的 `RemoveResult` 一一对应。 */
+type RemoveResult = "Removed" | "NotManaged" | { Rejected: { reason: string } };
+
+interface RemoveOutcome {
+  target: string;
+  result: RemoveResult;
+}
+
 /** 与 Core 的 `ApplyAction` 一一对应；中文文案只活在前端。 */
 type ApplyAction = "Create" | "Overwrite" | "Skip";
+
+type SkipReason = "InSync" | "SourceMissing" | "Uncommitted" | "Conflict";
 
 interface ApplyItem {
   /** 会被写到的目标路径。 */
   target: string;
+  /** 源目录里的副本路径，用来换算 `~/…` 短路径。 */
+  source: string;
   action: ApplyAction;
   reason: string;
   /** 应用会带来的改动（目标 → 源），空串 = 没有差异。 */
   diff: string;
+  /** 跳过项的归类：界面用图标表达。非跳过项是 null。 */
+  skip_reason: SkipReason | null;
 }
 
 interface ApplyPlan {
@@ -123,6 +139,21 @@ const STATUS_LABEL: Record<Status, string> = {
   Pending: "待应用",
 };
 
+/** 状态图标：颜色之外再给一个形状，色弱也能分清。 */
+const STATUS_ICON: Record<Status, string> = {
+  Conflict: "⚠",
+  PendingCommit: "●",
+  PendingPull: "↓",
+  TargetMissing: "○",
+  InSync: "✓",
+  Pending: "→",
+};
+
+/** 图例：只看形状猜不出含义，清单下面常驻一条对照。 */
+const STATUS_LEGEND = (Object.keys(STATUS_LABEL) as Status[])
+  .map((status) => `<span>${STATUS_ICON[status]} ${STATUS_LABEL[status]}</span>`)
+  .join("");
+
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
 /** 上一次添加的结果（或报错）。放进 renderInventory 的模板里，重渲染不会丢。 */
@@ -138,6 +169,28 @@ let applySummary: ApplySummary | null = null;
 /** 上一次应用的结果（或报错），同样放进清单模板里。 */
 let applyReportHtml = "";
 
+/** 源目录绝对路径，boot 时取一次：清单里每行都重复的长前缀靠它省掉。 */
+let sourceDir = "";
+
+/** 源目录里的副本 → 镜像内相对路径；源目录未知时 `null`。 */
+function mirrorRel(source: string): string | null {
+  const mirror = `${sourceDir.replace(/\/+$/, "")}/home/`;
+  return sourceDir && source.startsWith(mirror) ? source.slice(mirror.length) : null;
+}
+
+/** $HOME 下的绝对路径 → `~/…`（负数靠同一文件的相对路径换算）。 */
+function shortTarget(target: string, rel: string | null): string {
+  return rel && target.endsWith(`/${rel}`) ? `~/${rel}` : target;
+}
+
+/** 一行的路径拆成「目录 + 文件名」：目录压暗，文件名留住，长路径也好扫。
+ *  镜像布局下源与目标只差前缀，所以一行只画一次（`~/…`），完整两列放进 title。 */
+/** 把一个路径切成「目录 / 文件名」，目录压暗用。 */
+function splitPath(path: string): { dir: string; name: string } {
+  const cut = path.lastIndexOf("/");
+  return cut === -1 ? { dir: "", name: path } : { dir: path.slice(0, cut + 1), name: path.slice(cut + 1) };
+}
+
 /** 任一源操作（拉取/推送/应用/冲突解决）进行中：禁用其它源操作按钮，避免 git 序列交错。 */
 function setBusy(value: boolean): void {
   app.querySelectorAll<HTMLButtonElement>(
@@ -148,41 +201,82 @@ function setBusy(value: boolean): void {
 function statusBar(status: RepoStatus): string {
   return `
     <header class="bar">
-      <span class="brand">config-sync</span>
       <span class="chips">
         <span class="chip">分支 <b>${escapeHtml(status.branch)}</b></span>
         <span class="chip">↑${status.ahead} ↓${status.behind}</span>
         <span class="chip">未提交 <b>${status.dirty}</b></span>
       </span>
-      <button class="nav" data-settings>设置</button>
+      <button class="nav" data-settings title="设置">设置</button>
     </header>`;
+}
+
+/** 本机与远端不一致时给一句话：该推送还是该拉取，一眼看得见。 */
+function pendingHint(status: RepoStatus): string {
+  const parts: string[] = [];
+  if (status.dirty > 0) {
+    parts.push(`<span>● 本机有 ${status.dirty} 处改动还没提交，推送会一并提交</span>`);
+  }
+  if (status.ahead > 0) {
+    parts.push(`<span>↑ 本机有 ${status.ahead} 个提交还没推到远端</span>`);
+  }
+  if (status.behind > 0) {
+    parts.push(`<span>↓ 远端有 ${status.behind} 个提交还没拉下来，先拉取</span>`);
+  }
+  return parts.length ? `<p class="pending-hint">${parts.join("")}</p>` : "";
 }
 
 function rows(entries: InventoryEntry[]): string {
   return entries
-    .map(
-      (entry) => `
-      <li class="row" data-target="${escapeHtml(entry.target)}">
-        <button type="button" class="row-head" aria-expanded="false">
-          <span class="paths">
-            <code>${escapeHtml(entry.source)}</code>
-            <span class="arrow">↔</span>
-            <code>${escapeHtml(entry.target)}</code>
+    .map((entry) => {
+      const rel = mirrorRel(entry.source);
+      // 左边是源目录里的副本（home/…），右边是它落到 $HOME 的位置（~/…）。
+      const mirror = splitPath(rel ? `home/${rel}` : escapeHtml(entry.source));
+      const target = splitPath(shortTarget(entry.target, rel));
+      const pair = `${escapeHtml(entry.source)} ↔ ${escapeHtml(entry.target)}`;
+      const gone = entry.deleted ? ` class="gone"` : "";
+      return `
+      <li class="row" data-target="${escapeHtml(entry.target)}"
+        data-rel="${escapeHtml(rel ?? "")}">
+        <button type="button" class="row-head" aria-expanded="false" title="展开或收起差异">
+          <span class="status status-${entry.status}" role="img"
+            title="${STATUS_LABEL[entry.status]}" aria-label="${STATUS_LABEL[entry.status]}">
+            <span class="status-icon" aria-hidden="true">${STATUS_ICON[entry.status]}</span>
           </span>
-          <span class="status status-${entry.status}">${STATUS_LABEL[entry.status]}</span>
+          <span class="paths" title="${pair}">
+            <code${gone} title="源目录里的副本"><span class="dir">${escapeHtml(mirror.dir)}</span>${escapeHtml(mirror.name)}</code>
+            <span class="arrow">↔</span>
+            <code class="alt"${gone} title="落到 $HOME 的位置"><span class="dir">${escapeHtml(target.dir)}</span>${escapeHtml(target.name)}</code>
+          </span>
         </button>
         ${
           entry.status === "Conflict"
             ? `<span class="resolve-actions">
-                <button type="button" class="resolve-choose" data-side="ours">保留本机</button>
-                <button type="button" class="resolve-choose" data-side="theirs">采用远端</button>
+                <button type="button" class="resolve-choose" data-side="ours"
+                  title="保留本机，并把这个文件重新提交">保留本机</button>
+                <button type="button" class="resolve-choose" data-side="theirs"
+                  title="用远端版本覆盖本机未提交的改动">采用远端</button>
               </span>`
             : ""
         }
-        <button type="button" class="row-edit" data-edit title="打开源目录里的副本">编辑</button>
+        ${entry.deleted ? "" : `<span class="row-actions">
+          <button type="button" class="row-action" data-edit title="编辑：打开源目录里的副本"
+            aria-label="编辑">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none"
+              stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 13l1.1-3.1 6-6a1.5 1.5 0 0 1 2.1 2.1l-6 6L3 13zM9.5 4.6l1.9 1.9" />
+            </svg>
+          </button>
+          <button type="button" class="row-action" data-delete title="从源目录移除（不删 $HOME 原文件）"
+            aria-label="移除">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none"
+              stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+              <path d="M6 2.5h4M3 4.5h10M4.6 4.5l.6 8a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.6-8M6.6 7v4M9.4 7v4" />
+            </svg>
+          </button>
+        </span>`}
         <div class="diff"></div>
-      </li>`,
-    )
+      </li>`;
+    })
     .join("");
 }
 
@@ -201,6 +295,75 @@ async function editRow(row: HTMLLIElement, button: HTMLButtonElement): Promise<v
   } finally {
     button.disabled = false;
   }
+}
+
+/** 应用内的确认框：webview 里的原生 confirm 不可靠，改成自己盖一层遮罩。 */
+function confirmAction(message: string, okLabel: string, danger = false): Promise<boolean> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal";
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true">
+        <p class="modal-text">${escapeHtml(message)}</p>
+        <div class="modal-actions">
+          <button type="button" class="modal-cancel">取消</button>
+          <button type="button" class="modal-ok${danger ? " danger" : ""}">${escapeHtml(okLabel)}</button>
+        </div>
+      </div>`;
+    const close = (answer: boolean) => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+      resolve(answer);
+    };
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") close(false);
+    }
+    overlay.querySelector(".modal-cancel")!.addEventListener("click", () => close(false));
+    overlay.querySelector(".modal-ok")!.addEventListener("click", () => close(true));
+    // 只有点到遮罩本身才算取消，框内的点击不受影响。
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) close(false);
+    });
+    document.addEventListener("keydown", onKey);
+    document.body.append(overlay);
+    overlay.querySelector<HTMLButtonElement>(".modal-cancel")!.focus();
+  });
+}
+
+/** 「移除」：把源目录里的副本删掉，$HOME 下的原文件不动。
+ *  删除在 git 里是未提交的删除，「推送」时才真正提交。 */
+async function removeRow(row: HTMLLIElement, button: HTMLButtonElement): Promise<void> {
+  const target = row.dataset.target!;
+  const short = shortTarget(target, row.dataset.rel || null);
+  const ok = await confirmAction(
+    `从源目录移除 ${short}？\n\n$HOME 下的原文件不受影响，之后可以重新添加。`,
+    "移除",
+    true,
+  );
+  if (!ok) return;
+  button.disabled = true;
+  try {
+    const outcomes = await invoke<RemoveOutcome[]>("remove", { targets: [target] });
+    addReportHtml = removeReport(outcomes);
+  } catch (error) {
+    addReportHtml = errorPanel(error);
+  }
+  await renderInventory();
+}
+
+/** 移除结果的汇总；「移除」只动源目录，所以文案不说「删除文件」。 */
+function removeReport(outcomes: RemoveOutcome[]): string {
+  const done = outcomes.filter((o) => o.result === "Removed").length;
+  const notes = outcomes.flatMap((o) => {
+    if (o.result === "Removed") return [];
+    if (o.result === "NotManaged") {
+      return [`<li><code>${escapeHtml(o.target)}</code> 本来就不在清单里。</li>`];
+    }
+    return [`<li><code>${escapeHtml(o.target)}</code> 没有移除：${escapeHtml(o.result.Rejected.reason)}</li>`];
+  });
+  return `<p class="add-summary">已从源目录移除 ${done} 个</p>${
+    notes.length ? `<ul class="add-notes">${notes.join("")}</ul>` : ""
+  }`;
 }
 
 /** 点行展开该文件的 diff；diff 由 Core 生成，这里只按行着色。 */
@@ -234,9 +397,10 @@ async function resolveRow(row: HTMLLIElement, button: HTMLButtonElement): Promis
   const side = button.dataset.side!;
   const target = row.dataset.target!;
   const local = side === "theirs"
-    ? "「采用远端」会用远端版本覆盖这个文件的本机未提交改动，覆盖后不可恢复。确定吗？"
-    : "保留本机版本，并把这个文件重新提交。确定吗？";
-  if (!window.confirm(local)) return;
+    ? "「采用远端」会用远端版本覆盖这个文件的本机未提交改动，覆盖后不可恢复。"
+    : "「保留本机」会丢掉远端对这个文件的改动，改用本机版本提交。";
+  const ok = await confirmAction(local, side === "theirs" ? "采用远端" : "保留本机", side === "theirs");
+  if (!ok) return;
   button.disabled = true;
   const slot = row.querySelector<HTMLDivElement>(".diff")!;
   try {
@@ -312,6 +476,14 @@ async function pushChanges(): Promise<void> {
   await renderInventory();
 }
 
+/** 跳过项的图标：一句话太长，用图标 + 悬停说明。 */
+const SKIP_HINT: Record<SkipReason, { icon: string; label: string }> = {
+  InSync: { icon: "✓", label: "内容已一致，不用写" },
+  SourceMissing: { icon: "○", label: "源目录里没有这个副本，不会覆盖目标" },
+  Uncommitted: { icon: "●", label: "源目录里还有未提交的改动，先推送再应用" },
+  Conflict: { icon: "⚠", label: "源目录与远端都改了这个文件，先解决冲突" },
+};
+
 const ACTION_LABEL: Record<ApplyAction, string> = { Create: "新建", Overwrite: "覆盖", Skip: "跳过" };
 
 /** 「应用」第一步：向 Core 要一份完整计划，只预览，一个字节都不写。 */
@@ -340,45 +512,83 @@ function renderApplyPreview(): void {
   const items = applyPlan!.items;
   const summary = applySummary!;
   const writes = summary.create + summary.overwrite;
+  // 要写的项目单独列；跳过的折起来，否则一屏都是「内容已一致，不用写」。
+  const writeItems = items.filter((item) => item.action !== "Skip");
+  const skipped = items.filter((item) => item.action === "Skip");
+
   app.innerHTML = `
     <header class="bar">
-      <span class="brand">config-sync</span>
+      <button type="button" class="nav back icon" data-cancel-apply title="返回清单（不写盘）" aria-label="返回清单">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
+          stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9.5 3.5 5 8l4.5 4.5M5 8h6.5" />
+        </svg>
+      </button>
       <span class="chips">
         <span class="chip">新建 <b>${summary.create}</b></span>
         <span class="chip">覆盖 <b>${summary.overwrite}</b></span>
         <span class="chip">跳过 <b>${summary.skip}</b></span>
       </span>
-      <button class="nav" data-settings>设置</button>
+      <button class="nav" data-settings title="设置">设置</button>
     </header>
     <main class="inventory apply-preview">
-      <h2>应用预览</h2>
-      <p class="apply-hint">确认后会把下面 ${writes} 个文件写到 $HOME；跳过的项不动。</p>
+      <p class="apply-hint">${
+        writes === 0
+          ? "这次没有要写的文件：清单里的每一项都不用动。"
+          : `确认后会把下面 ${writes} 个文件写到 $HOME；跳过的项不动。`
+      }</p>
       <div class="action-error"></div>
       ${
         items.length === 0
           ? `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`
-          : `<ul class="apply-items">${items.map(applyItemHtml).join("")}</ul>`
+          : writeItems.length
+            ? `<ul class="apply-items">${writeItems.map(applyItemHtml).join("")}</ul>`
+            : ""
+      }
+      ${
+        skipped.length
+          ? `<details class="apply-skipped">
+              <summary>跳过 ${skipped.length} 个，不会写盘</summary>
+              <ul class="apply-items">${skipped.map(applyItemHtml).join("")}</ul>
+            </details>`
+          : ""
       }
       <div class="apply-actions">
-        <button type="button" class="confirm-apply" ${writes === 0 ? "disabled" : ""}>确认应用</button>
-        <button type="button" class="cancel-apply">取消</button>
+        <button type="button" class="confirm-apply" ${writes === 0 ? "disabled" : ""}
+          title="把预览里的改动写到 $HOME">确认应用</button>
+        <button type="button" class="cancel-apply" title="不写盘，回到清单">取消</button>
       </div>
     </main>`;
 
+  app.querySelector<HTMLButtonElement>("[data-cancel-apply]")?.addEventListener("click", () => void cancelApply());
   app.querySelector<HTMLButtonElement>(".confirm-apply")?.addEventListener("click", () => void confirmApply());
   app.querySelector<HTMLButtonElement>(".cancel-apply")?.addEventListener("click", () => void cancelApply());
   bindSettingsEntry();
 }
 
+/** 预览里的路径：能换算成 `~/…` 就换算，和清单里一个口径。 */
+function applyPath(item: ApplyItem): string {
+  const rel = mirrorRel(item.source);
+  return rel === null ? item.target : `~/${rel}`;
+}
+
 function applyItemHtml(item: ApplyItem): string {
   const diff = item.diff ? `<pre class="apply-diff">${diffLines(item.diff)}</pre>` : "";
+  // 跳过项不写一句话，只在路径前面放个图标，说明留给悬停。
+  const hint = item.skip_reason ? SKIP_HINT[item.skip_reason] : null;
+  // 非跳过项也留出这一格，左侧边界才对齐。
+  const icon = hint
+    ? `<span class="apply-skip-icon" role="img" title="${escapeHtml(hint.label)}"
+         aria-label="${escapeHtml(hint.label)}">${hint.icon}</span>`
+    : `<span class="apply-skip-icon" aria-hidden="true"></span>`;
   return `
     <li class="apply-item apply-${item.action}">
       <div class="apply-head">
-        <code>${escapeHtml(item.target)}</code>
-        <span class="status">${ACTION_LABEL[item.action]}</span>
+        ${icon}
+        <code title="${escapeHtml(item.target)}">${escapeHtml(applyPath(item))}</code>
+        <span class="apply-tag apply-tag-${item.action}">${ACTION_LABEL[item.action]}</span>
       </div>
-      <p class="apply-reason">${escapeHtml(item.reason)}</p>
+      ${hint ? "" : `<p class="apply-reason">${escapeHtml(item.reason)}</p>`}
       ${diff}
     </li>`;
 }
@@ -434,40 +644,49 @@ async function renderInventory(): Promise<void> {
     ]);
     app.innerHTML = `
       ${statusBar(status)}
+      ${pendingHint(status)}
       <div class="toolbar">
-        <button type="button" data-pull>拉取</button>
-        <button type="button" data-push>推送</button>
-        <button type="button" data-apply>应用</button>
+        <button type="button" class="add-files" title="添加文件" aria-label="添加文件">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none"
+            stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+            <path d="M8 3.2v9.6M3.2 8h9.6" />
+          </svg>
+          添加文件
+        </button>
+        <button type="button" data-pull title="拉取" aria-label="拉取">↓</button>
+        <button type="button" data-push title="推送" aria-label="推送">↑</button>
+        <button type="button" data-apply title="应用：把源目录的内容写到 $HOME" aria-label="应用">
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
+            stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2.4 8a5.6 5.6 0 0 1 9.4-4.1" />
+            <path d="M12.4 1.6v2.9H9.5" />
+            <path d="M13.6 8a5.6 5.6 0 0 1-9.4 4.1" />
+            <path d="M3.6 14.4v-2.9h2.9" />
+          </svg>
+        </button>
       </div>
       <div class="action-error">${pushReportHtml}</div>
       <main class="inventory">
-        <div class="add-bar">
-          <button type="button" class="add-files">添加文件…</button>
-          <details class="add-paste">
-            <summary>粘贴路径</summary>
-            <form class="add-paths">
-              <textarea name="paths" rows="3" spellcheck="false"
-                placeholder="一行一个路径，文件或整棵目录；支持 ~ 开头"></textarea>
-              <button type="submit">添加</button>
-            </form>
-          </details>
-        </div>
         <div class="add-report">${addReportHtml}</div>
         <div class="apply-report">${applyReportHtml}</div>
         ${
           entries.length === 0
             ? `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`
-            : `<ul class="rows">${rows(entries)}</ul>`
+            : `<ul class="rows">${rows(entries)}</ul>
+              <p class="legend">${STATUS_LEGEND}</p>`
         }
       </main>`;
 
     app.querySelector<HTMLUListElement>(".rows")?.addEventListener("click", (event) => {
       const target = event.target as HTMLElement;
       const edit = target.closest<HTMLButtonElement>("[data-edit]");
+      const remove = target.closest<HTMLButtonElement>("[data-delete]");
       const row = target.closest<HTMLLIElement>(".row");
       if (!row) return;
       if (edit) {
         void editRow(row, edit);
+      } else if (remove) {
+        void removeRow(row, remove);
       } else if (target.closest(".row-head")) {
         void toggleDiff(row);
       }
@@ -531,25 +750,10 @@ async function pickFiles(): Promise<void> {
   }
 }
 
-async function submitPasted(form: HTMLFormElement): Promise<void> {
-  const textarea = form.querySelector<HTMLTextAreaElement>("textarea")!;
-  const paths = textarea.value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (paths.length === 0) {
-    addReportHtml = `<p class="add-summary">先粘贴至少一个路径（文件或整棵目录）。</p>`;
-    await renderInventory();
-    return;
-  }
-  textarea.value = "";
-  await addPaths(paths);
-}
-
 /** 错误面板 + 一个回到设置的入口：源目录指错时人不用重启应用。 */function renderError(error: unknown): void {
   app.innerHTML = `
     ${errorPanel(error)}
-    <div class="actions"><button class="nav" data-settings>设置</button></div>`;
+    <div class="actions"><button class="nav" data-settings title="设置">设置</button></div>`;
   bindSettingsEntry();
 }
 
@@ -559,7 +763,7 @@ function bindSettingsEntry(): void {
   });
 }
 
-/** 设置面板：三字段 + 当前远端地址。保存只落盘，随后按新源目录重读清单。 */
+/** 设置面板：源目录 / 远端 / 编辑器命令 / 分支。保存只落盘与写 git 配置，不提交、不写 $HOME。 */
 async function renderSettings(): Promise<void> {
   let view: SettingsView;
   try {
@@ -569,14 +773,15 @@ async function renderSettings(): Promise<void> {
     return;
   }
 
-  const remote = view.remote_url
-    ? `<code>${escapeHtml(view.remote_url)}</code>`
-    : `<span class="muted">源目录还不是 git 仓库，或没有配置 origin</span>`;
   app.innerHTML = `
     <header class="bar">
-      <span class="brand">config-sync</span>
+      <button type="button" class="nav back icon" data-back title="返回清单" aria-label="返回清单">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
+          stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9.5 3.5 5 8l4.5 4.5M5 8h6.5" />
+        </svg>
+      </button>
       <span class="chips"><span class="chip">设置</span></span>
-      <button class="nav" data-back>返回清单</button>
     </header>
     <main class="settings">
       ${
@@ -590,19 +795,23 @@ async function renderSettings(): Promise<void> {
             autocomplete="off" spellcheck="false" />
           <small>受管文件副本所在的 git 仓库，支持 <code>~</code> 开头。换它不会移动或删除旧目录里的任何文件。</small>
         </label>
-        <label>编辑器命令
-          <input name="editor_command" value="${escapeHtml(view.settings.editor_command)}"
-            placeholder="code -w {}" autocomplete="off" spellcheck="false" />
-          <small>留空表示用系统默认方式打开；非空时必须含 <code>{}</code> 作为文件路径占位。</small>
+        <label>远端仓库
+          <input name="remote" value="${escapeHtml(view.remote_url ?? "")}"
+            placeholder="git@github.com:you/dotfiles.git" autocomplete="off" spellcheck="false" />
+          <small>推送和拉取都用这个地址。留空表示不改；改它只动 git 的 origin，不碰提交和工作区。</small>
         </label>
         <label>分支
           <input name="branch" value="${escapeHtml(view.settings.branch)}"
             autocomplete="off" spellcheck="false" />
         </label>
-        <p class="hint">当前远端：${remote}</p>
+        <label>编辑器命令
+          <input name="editor_command" value="${escapeHtml(view.settings.editor_command)}"
+            placeholder="code -w {}" autocomplete="off" spellcheck="false" />
+          <small>留空表示用系统默认方式打开；非空时必须含 <code>{}</code> 作为文件路径占位。</small>
+        </label>
         <div class="actions">
-          <button type="submit">保存</button>
-          <button type="button" class="nav" data-back>取消</button>
+          <button type="submit" title="保存到 app 配置">保存</button>
+          <button type="button" class="nav" data-back title="放弃修改，返回清单">取消</button>
         </div>
         <div class="settings-error"></div>
       </form>
@@ -625,12 +834,18 @@ async function renderSettings(): Promise<void> {
       editor_command: field("editor_command").value,
       branch: field("branch").value,
     };
+    // 远端地址存在 git 里，和 config.toml 分开写；填了且变了才动 origin。
+    const remote = field("remote").value.trim();
+    const remoteChanged = remote !== "" && remote !== (view.remote_url ?? "").trim();
 
     slot.innerHTML = "";
     submit.disabled = true;
     submit.textContent = "正在保存…";
     try {
       await invoke("save_settings", { settings });
+      if (remoteChanged) {
+        await invoke("set_remote", { remote });
+      }
     } catch (error) {
       // 校验或落盘失败：停在表单上，人话 + 原始 stderr 都在 errorPanel 里。
       slot.innerHTML = errorPanel(error);
@@ -683,8 +898,8 @@ async function renderWizard(): Promise<void> {
       <form class="wizard-form">
         <ul class="candidates">${items}</ul>
         <div class="actions">
-          <button type="submit">添加选中的文件</button>
-          <button type="button" class="nav" data-skip>跳过</button>
+          <button type="submit" title="把勾选的配置文件加进源目录">添加选中的文件</button>
+          <button type="button" class="nav" data-skip title="不选任何文件，跳过向导">跳过</button>
         </div>
         <div class="wizard-error"></div>
       </form>
@@ -750,10 +965,10 @@ function renderOnboarding(sourceDir: string): void {
           autocomplete="off"
           spellcheck="false"
         />
-        <button type="submit">clone</button>
+        <button type="submit" title="把远端仓库 clone 到源目录">clone</button>
       </form>
       <div class="clone-error"></div>
-      <div class="actions"><button class="nav" data-settings>设置</button></div>
+      <div class="actions"><button class="nav" data-settings title="设置">设置</button></div>
     </main>`;
 
   const form = app.querySelector<HTMLFormElement>(".clone-form")!;
@@ -801,13 +1016,15 @@ async function startListening(): Promise<void> {
 
 async function boot(): Promise<void> {
   try {
-    const [hasRepo, sourceDir, wizardDone] = await Promise.all([
+    const [hasRepo, dir, wizardDone] = await Promise.all([
       invoke<boolean>("has_repo"),
       invoke<string>("source_dir"),
       invoke<boolean>("onboarding_done"),
     ]);
+    // 清单里每行都要剥掉源目录前缀，这里存下来给 pathParts 用。
+    sourceDir = dir;
     if (!hasRepo) {
-      renderOnboarding(sourceDir);
+      renderOnboarding(dir);
       return;
     }
     // 向导只出现一次：标记落在 app 配置目录里，跳过也会落。
@@ -832,12 +1049,6 @@ function escapeHtml(text: string): string {
 // 添加控件在每次重渲染后都是新的，所以用事件委派挂在 #app 上，只绑一次。
 app.addEventListener("click", (event) => {
   if ((event.target as HTMLElement).closest(".add-files")) void pickFiles();
-});
-app.addEventListener("submit", (event) => {
-  const form = (event.target as HTMLElement).closest<HTMLFormElement>(".add-paths");
-  if (!form) return;
-  event.preventDefault();
-  void submitPasted(form);
 });
 
 app.innerHTML = `<p class="empty">正在读取清单…</p>`;

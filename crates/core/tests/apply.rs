@@ -178,10 +178,12 @@ fn paths_outside_home_are_refused_by_both_phases() {
     let plan = ApplyPlan {
         items: vec![ApplyItem {
             target: outside.clone(),
+            source: outside.clone(),
             action: ApplyAction::Overwrite,
             reason: String::new(),
             diff: String::new(),
             digest: String::new(),
+            skip_reason: None,
         }],
     };
     let outcomes = core.execute_apply(&plan).unwrap();

@@ -2,7 +2,7 @@
 //!
 //! 只复制，不动 git（新文件在源目录里是未跟踪 → 清单显示「待提交」），也不写任何目标文件。
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -93,20 +93,6 @@ impl Core {
         Ok(())
     }
 
-    /// 把 `$HOME` 下的路径换算成镜像内相对路径；`$HOME` 之外（或带 `..` 这类穿透成分）返回 `None`。
-    fn mirror_relative_path(&self, path: &Path) -> Option<PathBuf> {
-        // 粘贴进来的 `~/…` 按注入的 $HOME 展开（不读环境变量）。
-        let expanded = match path.strip_prefix("~") {
-            Ok(rest) => self.home.join(rest),
-            Err(_) => path.to_path_buf(),
-        };
-        if let Some(rel) = inside(&expanded, &self.home) {
-            return Some(rel);
-        }
-        // 选择器与终端常给出带符号链接的路径（macOS 上 /tmp、/var 都是软链）：按真实路径再试一次。
-        inside(&expanded.canonicalize().ok()?, &self.home.canonicalize().ok()?)
-    }
-
     /// 单个文件的复制；源文件已存在时只报告，绝不覆盖。
     fn copy_into_mirror(&self, rel: &Path, out: &mut Vec<AddOutcome>) -> Result<(), CoreError> {
         let target = self.home.join(rel);
@@ -135,16 +121,6 @@ impl Core {
         out.push(AddOutcome { target, result: AddResult::Added });
         Ok(())
     }
-}
-
-/// `path` 相对 `home` 的纯普通路径；不在 `home` 下或带 `..`/`.` 这类穿透成分时返回 `None`。
-fn inside(path: &Path, home: &Path) -> Option<PathBuf> {
-    let rel = path.strip_prefix(home).ok()?;
-    // `..` 会让 join 出来的源路径穿出 home/，一律不收。
-    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-        return None;
-    }
-    Some(rel.to_path_buf())
 }
 
 /// 递归收集普通文件。符号链接按指向的内容算（不递归进符号链接目录，避免环），
