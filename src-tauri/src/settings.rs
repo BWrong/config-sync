@@ -67,6 +67,54 @@ impl Settings {
         }
     }
 
+    /// 去掉三字段两端的空白；用户粘贴路径时常见。
+    pub fn trimmed(self) -> Settings {
+        Settings {
+            source_dir: self.source_dir.trim().to_string(),
+            editor_command: self.editor_command.trim().to_string(),
+            branch: self.branch.trim().to_string(),
+        }
+    }
+
+    /// 保存前的校验。只检查「这份设置能不能指过去」，**不**做任何 git 操作。
+    ///
+    /// 空 `editor_command` 是合法的（用系统默认方式打开）；非空时必须带 `{}`，
+    /// 否则编辑器拿不到文件路径。
+    pub fn validate(&self, home: &Path) -> Result<(), String> {
+        let raw = self.source_dir.trim();
+        if raw.is_empty() {
+            return Err("源目录不能为空".to_string());
+        }
+        if !raw.starts_with('~') && !Path::new(raw).is_absolute() {
+            return Err(format!("源目录 {raw} 需要是绝对路径或以 ~ 开头"));
+        }
+
+        let resolved = self.resolved_source_dir(home);
+        match std::fs::metadata(&resolved) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("源目录 {} 不是目录", resolved.display())),
+            Err(_) => {
+                return Err(format!(
+                    "源目录 {} 不存在，请先创建它（或到清单页用远端地址 clone 到那里）",
+                    resolved.display()
+                ));
+            }
+        }
+
+        if self.branch.trim().is_empty() {
+            return Err("分支不能为空".to_string());
+        }
+
+        let editor = self.editor_command.trim();
+        if !editor.is_empty() && !editor.contains("{}") {
+            return Err(format!(
+                "编辑器命令 {editor} 里没有 {{}}，拿不到要打开的文件路径；写成 \"{editor} {{}}\" 这种形式，留空则用系统默认方式打开"
+            ));
+        }
+
+        Ok(())
+    }
+
     /// 注入 Core 的那份设置（不含 `source_dir`）。
     pub fn core_config(&self) -> Config {
         Config { branch: self.branch.clone(), editor_command: self.editor_command.clone() }
@@ -130,6 +178,80 @@ mod tests {
             let settings = Settings { source_dir: raw.to_string(), ..Settings::default() };
             assert_eq!(settings.resolved_source_dir(home), PathBuf::from(expected), "{raw}");
         }
+    }
+
+    #[test]
+    fn source_dir_must_be_an_existing_directory() {
+        let home = tempfile::tempdir().expect("临时 home");
+
+        let missing = Settings { source_dir: "~/missing".to_string(), ..Settings::default() };
+        let err = missing.validate(home.path()).expect_err("不存在的源目录必须报错");
+        assert!(err.contains("不存在"), "{err}");
+        assert!(err.contains("missing"), "错误里要有解析后的路径：{err}");
+
+        let file = home.path().join("a-file");
+        std::fs::write(&file, "x").expect("写文件");
+        let not_a_dir =
+            Settings { source_dir: file.display().to_string(), ..Settings::default() };
+        let err = not_a_dir.validate(home.path()).expect_err("文件不是源目录");
+        assert!(err.contains("不是目录"), "{err}");
+
+        let dir = home.path().join("dotfiles");
+        std::fs::create_dir(&dir).expect("建目录");
+        let ok = Settings { source_dir: "~/dotfiles".to_string(), ..Settings::default() };
+        assert_eq!(ok.validate(home.path()), Ok(()));
+    }
+
+    #[test]
+    fn editor_command_is_optional_but_non_empty_must_carry_the_placeholder() {
+        let home = tempfile::tempdir().expect("临时 home");
+
+        let base = Settings { source_dir: "~".to_string(), ..Settings::default() };
+
+        let empty = base.clone();
+        assert_eq!(empty.validate(home.path()), Ok(()), "留空表示用系统默认方式打开");
+
+        let with_placeholder = Settings { editor_command: "code -w {}".to_string(), ..base.clone() };
+        assert_eq!(with_placeholder.validate(home.path()), Ok(()));
+
+        let no_placeholder = Settings { editor_command: "code -w".to_string(), ..base };
+        let err = no_placeholder.validate(home.path()).expect_err("没有 {} 收不到路径");
+        assert!(err.contains("{}"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_or_relative_source_dir_and_empty_branch() {
+        let home = tempfile::tempdir().expect("临时 home");
+
+        let empty = Settings { source_dir: "  ".to_string(), ..Settings::default() };
+        assert!(empty.validate(home.path()).is_err(), "空源目录");
+
+        let relative = Settings { source_dir: "dotfiles".to_string(), ..Settings::default() };
+        let err = relative.validate(home.path()).expect_err("相对路径不接受");
+        assert!(err.contains("绝对路径"), "{err}");
+
+        let no_branch =
+            Settings { source_dir: "~".to_string(), branch: " ".to_string(), ..Settings::default() };
+        let err = no_branch.validate(home.path()).expect_err("空分支");
+        assert!(err.contains("分支"), "{err}");
+    }
+
+    #[test]
+    fn trimmed_normalizes_whitespace_without_touching_content() {
+        let settings = Settings {
+            source_dir: "  ~/dotfiles ".to_string(),
+            editor_command: "  code -w {} ".to_string(),
+            branch: " trunk ".to_string(),
+        };
+
+        assert_eq!(
+            settings.trimmed(),
+            Settings {
+                source_dir: "~/dotfiles".to_string(),
+                editor_command: "code -w {}".to_string(),
+                branch: "trunk".to_string(),
+            }
+        );
     }
 
     #[test]

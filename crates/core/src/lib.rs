@@ -72,6 +72,11 @@ impl Core {
         Ok(())
     }
 
+    /// 源目录里 `origin` 的地址；设置面板用它显示"当前对着哪个远端"。
+    pub fn remote_url(&self) -> Result<String, CoreError> {
+        git::run(&self.source_dir, &["remote", "get-url", "origin"])
+    }
+
     /// 受管文件的完整列表。完全没有受管文件时返回空集合（不是错误）。
     pub fn inventory(&self) -> Result<Vec<InventoryEntry>, CoreError> {
         let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);

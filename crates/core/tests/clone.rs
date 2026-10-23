@@ -72,3 +72,17 @@ fn empty_remote_address_is_rejected_without_touching_the_disk() {
     assert_eq!(err.kind, ErrorKind::Io);
     assert!(!source.exists(), "校验失败不该建目录");
 }
+
+#[test]
+fn remote_url_reports_origin_and_keeps_gits_own_words_when_there_is_no_repo() {
+    let f = fixtures::Fixture::new();
+    assert_eq!(f.core().remote_url().expect("origin 地址"), f.remote_url());
+
+    let plain = f.path("plain");
+    std::fs::create_dir_all(&plain).expect("建普通目录");
+    let err = Core::new(&f.home, &plain, Config::default())
+        .remote_url()
+        .expect_err("不是仓库就没有远端");
+    assert_eq!(err.kind, ErrorKind::Git);
+    assert!(!err.stderr.unwrap_or_default().trim().is_empty(), "git 的原话要带回来");
+}
