@@ -3,13 +3,16 @@
 //! 这里的 `#[tauri::command]` 只做转发：所有逻辑在 `config-sync-core` 里。
 //! 环境事实（`$HOME`、`config.toml`）由外壳读取后注入 Core，Core 自己绝不读。
 
+mod onboarding;
 mod settings;
 mod watch;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use config_sync_core::{AddOutcome, Core, CoreError, ErrorKind, FileDiff, InventoryEntry, RepoStatus};
+use config_sync_core::{
+    AddOutcome, Candidate, Core, CoreError, ErrorKind, FileDiff, InventoryEntry, RepoStatus,
+};
 use serde::Serialize;
 use settings::Settings;
 use tauri::{AppHandle, Manager, State};
@@ -85,7 +88,7 @@ impl AppState {
 
 /// `~/Library/Application Support/config-sync/config.toml`。
 fn config_path(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/config-sync/config.toml")
+    settings::app_dir(home).join("config.toml")
 }
 
 #[tauri::command]
@@ -130,6 +133,25 @@ fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreEr
 #[tauri::command]
 fn add(state: State<'_, AppState>, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome>, CoreError> {
     state.runtime().core.add(&paths)
+}
+
+/// 首次使用向导的候选：固定的一组常见配置文件 + 本机是否存在；勾选后交给 `add`。
+#[tauri::command]
+fn onboarding_candidates(state: State<'_, AppState>) -> Vec<Candidate> {
+    state.runtime().core.onboarding_candidates()
+}
+
+/// 向导是否已经走过（勾选或跳过都算）；走过就不再出现。
+#[tauri::command]
+fn onboarding_done(state: State<'_, AppState>) -> bool {
+    onboarding::is_done(&state.home)
+}
+
+/// 标记向导已完成：只写 app 配置目录里的标记，不碰源目录，也不进 git。
+#[tauri::command]
+fn finish_onboarding(state: State<'_, AppState>) -> Result<(), CoreError> {
+    onboarding::mark_done(&state.home)
+        .map_err(|message| CoreError { kind: ErrorKind::Io, message, stderr: None })
 }
 
 #[derive(Serialize)]
@@ -192,6 +214,9 @@ pub fn run() {
             source_dir,
             clone_remote,
             add,
+            onboarding_candidates,
+            onboarding_done,
+            finish_onboarding,
             pull,
             settings_view,
             save_settings

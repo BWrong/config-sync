@@ -9,6 +9,7 @@ mod editor;
 mod error;
 mod git;
 mod inventory;
+mod onboarding;
 mod paths;
 mod state;
 
@@ -17,6 +18,7 @@ pub use config::Config;
 pub use editor::Attempt;
 pub use error::{CoreError, ErrorKind};
 pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
+pub use onboarding::Candidate;
 
 use std::path::{Path, PathBuf};
 

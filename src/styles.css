@@ -402,6 +402,43 @@ pre {
   margin: 16px 0 0;
 }
 
+.wizard {
+  max-width: 34rem;
+}
+
+.candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.candidates label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.candidates .presence {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.candidates .missing label,
+.candidates .missing code {
+  color: var(--muted);
+  cursor: default;
+}
+
+.wizard-error:not(:empty) {
+  margin-top: 12px;
+}
+
 .add-bar {
   display: flex;
   align-items: flex-start;
