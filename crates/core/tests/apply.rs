@@ -181,7 +181,7 @@ fn paths_outside_home_are_refused_by_both_phases() {
             action: ApplyAction::Overwrite,
             reason: String::new(),
             diff: String::new(),
-            digest: 0,
+            digest: String::new(),
         }],
     };
     let outcomes = core.execute_apply(&plan).unwrap();

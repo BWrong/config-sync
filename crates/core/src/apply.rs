@@ -47,8 +47,9 @@ pub struct ApplyItem {
     pub reason: String,
     /// 应用会带来的改动（目标 → 源），unified diff；没有改动时是空串。
     pub diff: String,
-    /// 出计划时源文件内容的指纹：写盘前比对，源文件在这期间变过就不写。
-    pub digest: u64,
+    /// 出计划时源文件内容的指纹（十六进制）：写盘前比对，源文件在这期间变过就不写。
+    /// 用字符串是因为它要经 JSON 到界面再回来，u64 会丢精度。
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +139,7 @@ impl Core {
                     source.display()
                 ),
                 diff: String::new(),
-                digest: 0,
+                digest: String::new(),
             });
         }
 
@@ -251,8 +252,8 @@ fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
 }
 
 /// 源文件内容的指纹，只为「预览之后源文件变过没有」这一次比对服务。
-fn digest(bytes: &[u8]) -> u64 {
+fn digest(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
-    hasher.finish()
+    format!("{:016x}", hasher.finish())
 }
