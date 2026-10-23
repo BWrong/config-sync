@@ -163,6 +163,12 @@ fn save_settings(
     Ok(())
 }
 
+/// 拉取：`fetch` + `merge --ff-only`，只更新源目录，不动任何目标文件。
+#[tauri::command]
+fn pull(state: State<'_, AppState>) -> Result<(), CoreError> {
+    state.runtime().core.pull()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::from_environment())
@@ -178,6 +184,7 @@ pub fn run() {
             has_repo,
             source_dir,
             clone_remote,
+            pull,
             settings_view,
             save_settings
         ])
