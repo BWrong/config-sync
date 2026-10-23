@@ -141,6 +141,23 @@ function errorPanel(error: unknown): string {
   return `<div class="error"><p>${escapeHtml(e.message ?? String(error))}</p>${detail}</div>`;
 }
 
+/** 顶部全局动作「拉取」：只更新源目录，不动任何目标文件；拉完重新推导清单。 */
+async function pull(): Promise<void> {
+  const button = app.querySelector<HTMLButtonElement>("[data-pull]")!;
+  const slot = app.querySelector<HTMLDivElement>(".action-error")!;
+  button.disabled = true;
+  button.textContent = "正在拉取…";
+  try {
+    await invoke("pull");
+    await renderInventory();
+  } catch (error) {
+    // 没有远端 / 没有上游 / 网络失败 / 无法快进：message 分类，stderr 原样展示。
+    slot.innerHTML = errorPanel(error);
+    button.disabled = false;
+    button.textContent = "拉取";
+  }
+}
+
 async function renderInventory(): Promise<void> {
   try {
     const [entries, status] = await Promise.all([
@@ -149,6 +166,10 @@ async function renderInventory(): Promise<void> {
     ]);
     app.innerHTML = `
       ${statusBar(status)}
+      <div class="toolbar">
+        <button type="button" data-pull>拉取</button>
+      </div>
+      <div class="action-error"></div>
       <main class="inventory">
         ${
           entries.length === 0
@@ -162,6 +183,7 @@ async function renderInventory(): Promise<void> {
       const row = head?.closest<HTMLLIElement>(".row");
       if (row) void toggleDiff(row);
     });
+    app.querySelector<HTMLButtonElement>("[data-pull]")?.addEventListener("click", () => void pull());
     bindSettingsEntry();
   } catch (error) {
     renderError(error);
