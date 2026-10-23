@@ -156,10 +156,10 @@ impl Core {
                 "config-sync: 跳过 {skipped_symlinks} 个符号链接（v1 不支持符号链接语义）"
             );
         }
-        // 删掉的文件在磁盘上已经没有了，但 git 里那条删除还等着推送：不列出来的话，
-        // 清单上根本看不见「待提交」的删除。
+        // 删掉的文件在磁盘上已经没有了，但 git 里还挂着这桩删除（未提交，或已提交未推送）：
+        // 不列出来的话，清单上根本看不见「待提交」和「待推送」的删除。
         let mut deleted = HashSet::new();
-        for path in facts.dirty_paths() {
+        for path in facts.dirty_paths().chain(facts.push_deleted_paths()) {
             let Ok(rel) = path.strip_prefix(paths::MIRROR_ROOT) else { continue };
             // 磁盘上真没有才算删除；符号链接在这里也不收（C2 的跳过口径一致）。
             if std::fs::symlink_metadata(mirror_root.join(rel)).is_ok() {
@@ -269,6 +269,11 @@ impl Core {
             }
         }
         Err(last.unwrap_or_else(|| CoreError::io("没有可用的打开方式")))
+    }
+
+    /// 在 Finder 里打开源目录；目录不存在时报错，不弹空白窗口。
+    pub fn open_source_dir(&self) -> Result<(), CoreError> {
+        editor::reveal(&self.source_dir)
     }
 
     /// 目标文件与源文件的关系；源文件是受管文件本身，读不到是真错误。

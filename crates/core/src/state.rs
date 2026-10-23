@@ -13,6 +13,8 @@ pub(crate) struct GitFacts {
     unmerged: HashSet<PathBuf>,
     /// 远端相对 HEAD 改过的路径；`behind == 0` 时必为空。
     remote_changed: HashSet<PathBuf>,
+    /// 本机已有提交删掉的路径（远端此刻还有它）；`ahead == 0` 时必为空。
+    push_deleted: HashSet<PathBuf>,
 }
 
 impl GitFacts {
@@ -41,7 +43,7 @@ impl GitFacts {
         }
 
         // fetch 之后才有意义的 behind：没有上游或没拉过就一直为 0。
-        let (behind, _ahead) = git::ahead_behind(source_dir);
+        let (behind, ahead) = git::ahead_behind(source_dir);
         let remote_changed = if behind == 0 {
             HashSet::new()
         } else {
@@ -51,12 +53,31 @@ impl GitFacts {
                 .collect()
         };
 
-        Ok(GitFacts { dirty, unmerged, remote_changed })
+        // 已提交但没推送的删除：这些文件在磁盘上早就没了，不进这个集合就再也列不出来。
+        let push_deleted = if ahead == 0 {
+            HashSet::new()
+        } else {
+            git::run(
+                source_dir,
+                &["diff", "--diff-filter=D", "--name-only", "-z", "@{u}", "HEAD"],
+            )?
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect()
+        };
+
+        Ok(GitFacts { dirty, unmerged, remote_changed, push_deleted })
     }
 
     /// 未提交改动涉及的仓库内路径（推送前的硬拦扫这些文件）。
     pub(crate) fn dirty_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.dirty.iter()
+    }
+
+    /// 已提交、但还没推送出去的删除涉及的仓库内路径。
+    pub(crate) fn push_deleted_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.push_deleted.iter()
     }
 
     /// 这条仓库内路径是否处于真未合并（`UU`/`AA`/`DD`）状态。
@@ -73,15 +94,16 @@ pub(crate) enum Disk {
     Differs,
 }
 
-/// 六态推导。判定顺序即优先级，高者先返回：
+/// 七态推导。判定顺序即优先级，高者先返回：
 ///
 /// 1. 未合并 → 冲突
 /// 2. 本地有未提交改动 **且** 远端也改了同一路径 → 冲突
 /// 3. 本地有未提交改动 → 待提交
-/// 4. 远端改了这条路径（behind > 0）→ 待拉取
-/// 5. 目标缺失 → 目标缺失
-/// 6. 内容相同 → 一致
-/// 7. 其余 → 待应用
+/// 4. 本机提交里删了这个文件、还没推送 → 待推送删除
+/// 5. 远端改了这条路径（behind > 0）→ 待拉取
+/// 6. 目标缺失 → 目标缺失
+/// 7. 内容相同 → 一致
+/// 8. 其余 → 待应用
 pub(crate) fn derive(disk: Disk, repo_path: &Path, facts: &GitFacts) -> Status {
     let dirty = facts.dirty.contains(repo_path);
     let remote = facts.remote_changed.contains(repo_path);
@@ -92,6 +114,9 @@ pub(crate) fn derive(disk: Disk, repo_path: &Path, facts: &GitFacts) -> Status {
         Status::Conflict
     } else if dirty {
         Status::PendingCommit
+    } else if facts.push_deleted.contains(repo_path) {
+        // 源文件已经不在磁盘上，只剩一条待推送的删除：不单独成态就彻底看不见。
+        Status::PendingPushDelete
     } else if remote {
         Status::PendingPull
     } else {

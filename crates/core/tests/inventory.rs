@@ -103,3 +103,26 @@ fn a_deleted_mirror_file_stays_listed_as_pending_commit() {
     let diff = core.diff(&target).unwrap();
     assert!(diff.text.contains("-export A=1"), "{}", diff.text);
 }
+
+#[test]
+fn a_deletion_that_is_committed_but_not_pushed_stays_listed() {
+    let (f, core) = core();
+    let target = f.write_home(".zshrc", "export A=1\n");
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+
+    core.remove(&[target.clone()]).unwrap();
+    // 删除进了提交，但停在本地：远端此刻还有这个文件。
+    f.commit_all("config-sync: 0 files");
+
+    let entries = core.inventory().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].target, target);
+    assert_eq!(entries[0].status, Status::PendingPushDelete);
+    assert!(entries[0].deleted);
+
+    // 推送之后远端也没有了，这一行从清单消失。
+    f.push();
+    assert!(core.inventory().unwrap().is_empty());
+}

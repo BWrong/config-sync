@@ -43,6 +43,23 @@ impl Attempt {
     }
 }
 
+/// 在 Finder 里打开一个目录（源目录的「打开目录」按钮）。
+///
+/// 目录不存在就报错，不拉起一个空的 Finder 窗口。
+pub fn reveal(dir: &Path) -> Result<(), CoreError> {
+    if !dir.is_dir() {
+        return Err(CoreError::io(format!(
+            "目录 {} 不存在；源目录还没建好，先克隆或添加一个文件",
+            dir.display()
+        )));
+    }
+    std::process::Command::new("open")
+        .arg(dir)
+        .spawn()
+        .map_err(|e| CoreError::io(format!("打开 {} 失败：{e}", dir.display())))?;
+    Ok(())
+}
+
 /// 打开 `path` 的尝试序列，按顺序试到成功为止。
 ///
 /// - `editor_command` 非空：按空白切词，含 `{}` 的词里把占位换成路径。

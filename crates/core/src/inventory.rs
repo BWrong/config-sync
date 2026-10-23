@@ -10,7 +10,7 @@ pub struct InventoryEntry {
     /// 目标文件的绝对路径（`home` 下的镜像位置）。
     pub target: PathBuf,
     pub status: Status,
-    /// 源目录里这个副本已经被删掉，只剩 git 里那条未提交的删除（等推送记录）。
+    /// 源目录里这个副本已经不在了：未提交的删除，或已提交但还没推送的删除。
     pub deleted: bool,
 }
 
@@ -23,6 +23,8 @@ pub enum Status {
     Conflict,
     /// 待提交：源目录里这个文件有未提交改动。
     PendingCommit,
+    /// 待推送删除：本机提交里删掉了这个文件，远端还留着，推送后才会消失。
+    PendingPushDelete,
     /// 待拉取：远端改了这个文件，本地还没拉（快进得动）。
     PendingPull,
     /// 目标缺失

@@ -108,3 +108,16 @@ fn paths_outside_home_are_rejected() {
 
     assert!(error.message.contains("不在"), "{}", error.message);
 }
+
+#[test]
+fn opening_a_source_dir_that_does_not_exist_is_reported_not_spawned() {
+    // 只测不存在的分支：源目录存在时会真的弹出 Finder，不能进测试。
+    let f = Fixture::new();
+    let core = core_with(&f, "");
+    std::fs::remove_dir_all(&f.source_dir).unwrap();
+
+    let error = core.open_source_dir().expect_err("源目录不存在");
+
+    assert_eq!(error.kind, ErrorKind::Io);
+    assert!(error.message.contains("不存在"), "{}", error.message);
+}

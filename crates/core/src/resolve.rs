@@ -115,6 +115,7 @@ fn status_label(status: Status) -> &'static str {
     match status {
         Status::Conflict => "冲突",
         Status::PendingCommit => "待提交",
+        Status::PendingPushDelete => "待推送删除",
         Status::PendingPull => "待拉取",
         Status::TargetMissing => "目标缺失",
         Status::InSync => "一致",
