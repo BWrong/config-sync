@@ -598,8 +598,8 @@ async function renderSettings(): Promise<void> {
       return;
     }
 
-    // 配置已落盘：按新源目录重读清单；新目录不是仓库时，错误面板里就是 git 的原话。
-    await renderInventory();
+    // 配置已落盘：按新源目录重读。新目录不是仓库时回到「输入远端地址」，而不是错误面板。
+    window.location.reload();
   });
 }
 
