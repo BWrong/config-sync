@@ -1,0 +1,70 @@
+name: release
+
+# 推一个 v* 的 tag 就出一个草稿 Release：GitHub 生成更新日志，dmg 作为附件。
+# 发布前到 Releases 页面看一眼日志、点 Publish。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # 默认 token 只读，少了这句推 Release 会 403
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+
+      - run: npm ci
+
+      # 测试红了就不出包，别把坏包推上去。
+      - run: cargo test --workspace
+
+      - run: npm run tauri build -- --target aarch64-apple-darwin
+
+      - name: 建草稿 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME 与 tauri.conf.json 的 version $VERSION 不一致"
+            exit 1
+          fi
+          TAG="$GITHUB_REF_NAME"
+
+          gh release create "$TAG" --target "$GITHUB_SHA" \
+            --title "ConfigSync $TAG" --generate-notes --draft \
+            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+
+          # --generate-notes 写入的正文没有安装说明，补一段进去。
+          gh release view "$TAG" --json body -q .body > /tmp/body.md
+          cat >> /tmp/body.md <<'EOF'
+
+          ## 安装
+
+          下载上面的 `.dmg`，打开后把 `ConfigSync` 拖进 `/Applications`。
+
+          **这个包还没有签名**，首次打开会被拦一次。任选一种：
+
+          - 在 Finder 里右键点 `ConfigSync` → 打开 → 再点"打开"；
+          - 或者执行 `xattr -dr com.apple.quarantine /Applications/ConfigSync.app`
+
+          ## 要求
+
+          macOS 11 或更新，Apple Silicon（arm64）。
+          EOF
+          gh release edit "$TAG" --notes-file /tmp/body.md

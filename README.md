@@ -61,15 +61,31 @@ npm run tauri dev             # 起 Vite（5173）+ 编译并按 devUrl 启动�
 npm run build                 # tsc --noEmit + vite build → dist/
 ```
 
-## 打包 macOS .app
+## 打包 macOS
 
 ```sh
-npm run tauri build           # → target/release/bundle/macos/ConfigSync.app
+npm run tauri build           # → target/release/bundle/{macos/ConfigSync.app, dmg/ConfigSync_<版本>_aarch64.dmg}
 ```
 
 只装了 Command Line Tools（没有完整 Xcode）也能出包；打包出的 `.app` 双击即可启动。
 直接运行 `target/debug/config-sync-app`（不经 `.app`）在 macOS 上可能得到空白窗口，
 开发请走 `npm run tauri dev`。
+
+## 发版
+
+推一个与 `src-tauri/tauri.conf.json` 的 `version` 一致的 tag 即可：
+
+```sh
+# 先把 package.json 与 tauri.conf.json 的 version 一起改掉
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` 会跑 `cargo test --workspace`、打包 dmg，然后建一个
+**草稿** Release：更新日志由 GitHub 生成，dmg 作为附件。核对日志后点 Publish。
+
+包目前**没有签名也没有公证**，首次打开会被 Gatekeeper 拦一次，Release 正文里已经写了
+两种绕法。要用户双击即开，需要 Apple Developer Program（$99/年）的 Developer ID，
+届时把构建步骤换成 `tauri-apps/tauri-action` 并配上签名 secrets 即可。
 
 ## 约定（后续实现者必读）
 
