@@ -73,15 +73,32 @@ npm run tauri build           # → target/release/bundle/{macos/ConfigSync.app,
 
 ## 发版
 
-推一个与 `src-tauri/tauri.conf.json` 的 `version` 一致的 tag 即可：
+版本号有两个地方，必须一致：`package.json` 与 `src-tauri/tauri.conf.json` 的 `version`。
 
 ```sh
-# 先把 package.json 与 tauri.conf.json 的 version 一起改掉
+# 1. 改版本号（两处一起），提交
+git add package.json src-tauri/tauri.conf.json
+git commit -m "chore(release): 🏷️ 升到 v0.2.0"
+
+# 2. 打 tag 并推——tag 名是 v + 完整版本号，对不上 workflow 会直接失败
+git push origin main
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-`.github/workflows/release.yml` 会跑 `cargo test --workspace`、打包 dmg，然后建一个
-**草稿** Release：更新日志由 GitHub 生成，dmg 作为附件。核对日志后点 Publish。
+推 tag 之后 `.github/workflows/release.yml` 会：跑 `cargo test --workspace`（红了就不出包）
+→ 打 `ConfigSync_<版本>_aarch64.dmg` → 建一个**草稿** Release（更新日志由 GitHub 生成，
+dmg 作为附件，正文末尾追加安装说明）。
+
+最后一步是人工的：
+
+```sh
+gh release view v0.2.0 --json body -q .body   # 看一眼日志
+gh release edit v0.2.0 --draft=false         # 或者到网页上点 Publish
+```
+
+自动日志靠 PR 标题抓，直接推 main 的 commit 抓不到；要重发就先
+`gh release delete v0.2.0 --yes` 删掉草稿、删掉 tag，再重新打。
+完整步骤见 `.github/workflows/release.yml`。
 
 包目前**没有签名也没有公证**，首次打开会被 Gatekeeper 拦一次，Release 正文里已经写了
 两种绕法。要用户双击即开，需要 Apple Developer Program（$99/年）的 Developer ID，
