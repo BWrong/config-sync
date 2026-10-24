@@ -17,20 +17,30 @@ pub struct Attempt {
 }
 
 impl Attempt {
-    /// 真正拉起进程。编辑器不等退出；`open` 等退出码，好决定要不要回退。
-    pub(crate) fn run(&self) -> Result<(), CoreError> {
+    fn command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
         command.args(&self.args);
+        command
+    }
+
+    /// 真正拉起进程。编辑器不等退出；`open` 等退出码，好决定要不要回退。
+    pub(crate) fn run(&self) -> Result<(), CoreError> {
         let started = |e: std::io::Error| {
             CoreError::io(format!("启动 {} 失败：{e}", self.program))
         };
 
         if !self.wait {
-            command.spawn().map_err(started)?;
+            let spawned = match self.command().spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.spawn_with_login_path().unwrap_or_else(|| Err(e))
+                }
+                other => other,
+            };
+            spawned.map(|_| ()).map_err(started)?;
             return Ok(());
         }
 
-        let output = command.output().map_err(started)?;
+        let output = self.command().output().map_err(started)?;
         if output.status.success() {
             return Ok(());
         }
@@ -40,6 +50,38 @@ impl Attempt {
             self.args.join(" "),
             output.status
         )))
+    }
+
+    /// GUI 进程继承的 PATH 只有系统目录（`/etc/paths` 不生效），装在 `/usr/local/bin`
+    /// 的 `code` 就找不到。带上登录 shell 的 PATH 再试一次；拿不到就返回 `None`，
+    /// 让调用方报原来的错误。
+    fn spawn_with_login_path(&self) -> Option<std::io::Result<std::process::Child>> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let out = std::process::Command::new(shell)
+            .args(["-lc", "printf %s \"$PATH\""])
+            .output()
+            .ok()?;
+        let path = login_path(&out.stdout)?;
+        Some(self.command().env("PATH", path).spawn())
+    }
+}
+
+/// 登录 shell 打印的 PATH：`.zprofile` 之类的杂音在它前面，所以取最后一行。
+fn login_path(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let path = text.lines().last().unwrap_or("").trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_path;
+
+    #[test]
+    fn login_path_skips_banner_noise_and_rejects_empty_output() {
+        assert_eq!(login_path(b"banner\n/usr/local/bin:/usr/bin"), Some("/usr/local/bin:/usr/bin".to_string()));
+        assert_eq!(login_path(b""), None);
+        assert_eq!(login_path(b"welcome\n  \n"), None);
     }
 }
 
