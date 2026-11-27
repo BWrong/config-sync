@@ -285,6 +285,11 @@ struct Hit {
 }
 
 /// 在「工作区 ∪ 暂存区 ∪ 待推提交」上跑 9 条路径规则与 6 条内容规则。
+///
+/// 工作区与暂存区的内容扫描有单文件闸门：单个文件版本超过 `MAX_BLOB_BYTES`（16 MiB，
+/// 与待推 blob 一侧同一个口径）就不读内容，而是整次中止并点名文件与尺寸。绝不「太大的
+/// 跳过」——跳过就等于把大文件里的密钥放过去；代价是一个 16 MiB+ 的日志/镜像必须移出
+/// 受管目录（或先手动处理）才能推。
 fn scan(
     source_dir: &Path,
     facts: &state::GitFacts,
@@ -302,6 +307,15 @@ fn scan(
     let dirty_names: HashSet<String> = paths.iter().map(|path| repo_str(path)).collect();
     let staged_blobs = index_blobs(source_dir, &dirty_names)?;
     let index_specs: Vec<String> = staged_blobs.iter().map(|(_, sha)| sha.clone()).collect();
+    // 先只问 size：超过闸门的版本不取内容（取内容就是整份进内存），但也不能跳过——
+    // 跳过就等于大文件里的密钥照推，所以与待推 blob 一侧同样整次中止。
+    let index_metas = cat_file_meta(source_dir, &index_specs)?;
+    for (path, sha) in &staged_blobs {
+        let (_, size) = index_metas.get(sha).ok_or_else(|| missing_object(sha))?;
+        if *size > MAX_BLOB_BYTES {
+            return Err(blob_too_large("暂存区", &source_dir.join(path), *size));
+        }
+    }
     let index = cat_file_batch(source_dir, &index_specs)?;
     for (path, sha) in &staged_blobs {
         if let Some(text) = index.get(sha) {
@@ -312,6 +326,8 @@ fn scan(
     for path in &paths {
         let repo_path = repo_str(path);
         check_path_rules(&mut hits, &mut seen, &repo_path);
+        // 超过闸门：不读内容，整次中止（与暂存区、待推 blob 同一个 fail-closed 口径）。
+        check_worktree_size(source_dir, path)?;
         // 工作区版本读磁盘；二进制按有损 UTF-8 读，不影响正则。
         if let Ok(bytes) = std::fs::read(source_dir.join(path)) {
             check_content_rules(
@@ -569,6 +585,29 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} 字节")
     }
+}
+
+/// 工作区版本的尺寸闸门：`metadata` 就够，绝不为了判大小先读内容。
+/// 超过上限不是「跳过内容扫描」，而是整次中止——跳过就等于大文件里的密钥照推。
+/// 查不到 metadata（已删除、断链等）谈不上超大：那种路径本来就 `fs::read` 不出内容，
+/// 内容规则也就没有可扫的东西（暂存区版本另有自己的闸门）。
+fn check_worktree_size(source_dir: &Path, path: &Path) -> Result<(), CoreError> {
+    let full = source_dir.join(path);
+    match std::fs::metadata(&full) {
+        Ok(meta) if meta.len() > MAX_BLOB_BYTES => Err(blob_too_large("工作区", &full, meta.len())),
+        _ => Ok(()),
+    }
+}
+
+/// 单个文件版本超闸门的固定四项文案：哪一个文件（完整路径，能直接去打开）、当前多大、
+/// 上限、怎么办。尺寸一律过 `human_bytes`，上限用 `MAX_BLOB_BYTES`，与待推 blob 侧同源。
+fn blob_too_large(origin: &str, path: &Path, size: u64) -> CoreError {
+    over_limit(
+        format!("{origin}文件「{}」占", path.to_string_lossy()),
+        human_bytes(size),
+        human_bytes(MAX_BLOB_BYTES),
+        "把它移出受管目录，或先手动处理掉再推送",
+    )
 }
 
 fn repo_str(path: &Path) -> String {
