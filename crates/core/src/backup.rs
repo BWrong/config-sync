@@ -45,7 +45,9 @@ pub struct BackupManifest {
     pub created_at: String,
     /// 清单是否落到了 `commit()` 那一次。批次落盘写下的只是半截清单：进程在此之后死掉，
     /// 盘上这一份就停在那个落盘点（`false`），之后写到目标的项撤销不到。
-    /// 老清单没有这个字段，默认按完整算（那时只在结束时落一次，有清单就是落完了）。
+    /// 没有这个字段的老清单按完整算：`#41` 之前只在结束时落一次，有清单就是落完了；
+    /// 唯一读错的是「`#41` 之后、本字段之前」的构建——它按批落盘却不带标记，崩溃留下的
+    /// 半截清单会被读成完整。那个窗口没发过版，所以不做三态（`Option<bool>`）。
     #[serde(default = "complete_by_default")]
     pub complete: bool,
     pub entries: Vec<BackupEntry>,
@@ -99,6 +101,8 @@ pub struct RestorePlan {
     pub backup: String,
     pub created_at: String,
     /// 同 `BackupSummary::complete`：`false` 时预览要提示这份备份可能不完整。
+    /// `#[serde(default)]` 只服务于反序列化方向：测试手工构造的 plan、旧前端回传的 JSON
+    /// 可以不带这个字段；Rust → 前端序列化时它照常输出，加不加一样。
     #[serde(default)]
     pub complete: bool,
     pub items: Vec<RestoreItem>,
@@ -335,9 +339,15 @@ impl Snapshot {
     /// 返回值第二项是清单写失败的原因：那次应用已经写完盘了，所以这不叫失败，叫「这次备份
     /// 撤销不了」，由调用方当警告带回去。
     pub(crate) fn commit(mut self) -> (BackupSummary, Option<String>) {
-        // 最后一次落盘：只有它落下去了，盘上才是完整清单（`complete` 标记也在这里翻成 true）。
+        // 最后一次落盘要带着 `complete: true` 写出去，所以先翻后写；写失败了再翻回来，
+        // 让摘要和盘上那份都停在 `false`——摘要不能比盘先乐观一秒。
         self.manifest.complete = true;
-        let warning = match (self.write_manifest().err(), self.flush_failures) {
+        let final_error = self.write_manifest().err();
+        if final_error.is_some() {
+            self.manifest.complete = false;
+        }
+
+        let warning = match (final_error, self.flush_failures) {
             // 最后一次落成了 = 盘上是一份完整清单，中途批次失败没有留下后果：不报。
             // 报了前端会把「有警告」当成「清单没落盘」，白关掉一个本来能用的撤销入口。
             (None, _) => None,
@@ -963,6 +973,32 @@ mod tests {
             !on_disk.complete,
             "没有 commit 的清单是半截的：撤销预览要能提示「可能不完整」"
         );
+    }
+
+    /// 最后一次落盘失败时，摘要不能比盘乐观：盘上那份还是半截清单（`complete: false`），
+    /// 返回的 `BackupSummary.complete` 也跟着说 `false`，两边一致。
+    #[test]
+    fn a_failed_final_write_reports_the_summary_as_incomplete_too() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, home, source, target) = world();
+        let snapshot = snapshot_with_one_write(&home, &source, &target);
+        let dir = snapshot.dir.clone();
+        // 备份目录置只读：已有的清单还躺在盘上（半截），但 rename 不进去了。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let (summary, warning) = snapshot.commit();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(warning.is_some(), "最后一次没落成必须带警告");
+        assert!(
+            !summary.complete,
+            "最后一次没落成，摘要不能报完整，否则盘上是 false、摘要却说 true"
+        );
+        let text = std::fs::read_to_string(dir.join(MANIFEST)).unwrap();
+        let on_disk: BackupManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(on_disk.complete, summary.complete, "摘要与盘必须一致");
+        assert!(!on_disk.complete);
     }
 
     /// 批次落盘失败不能吞：最后一次也没落成时，警告要说清「另外有几次没落成」。
