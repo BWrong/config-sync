@@ -29,9 +29,12 @@ impl GitFacts {
         // 一个进程出齐三件事：`--branch` 带分支与 ahead/behind，逐文件改动来自同一份
         // `status`。以前是 `status` + `branch --show-current` + `rev-list` 三个进程（#19）。
         // `-uall` 才有未跟踪目录里的逐个文件，`-z` 才不会被带空格的路径骗到。
+        // `--no-optional-locks`：不顺手把 stat 缓存写回 `.git/index`——否则连着读两遍状态，
+        // 文件一个没改，索引的 ctime 却变了，上层按「`.git` 没动」做的缓存就永远命中不了（#42-a）。
         let porcelain = git::run(
             source_dir,
             &[
+                "--no-optional-locks",
                 "status",
                 "--porcelain=v2",
                 "--branch",
