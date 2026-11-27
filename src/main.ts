@@ -841,7 +841,7 @@ function applyReport(outcomes: ApplyOutcome[], undoId: string | null): string {
   // 撤销入口此时由调用方按同一条口径关掉（拿不到本次的备份 id）。
   const warnings = [...new Set(outcomes.map((outcome) => outcome.warning).filter((w): w is string => !!w))];
   for (const warning of warnings) {
-    notes.push(`<li>文件已经写了，但备份清单没落盘：${escapeHtml(warning)}</li>`);
+    notes.push(`<li>文件已经写了，但备份清单没落盘：${escapeHtml(warning)}，这次没法一键撤销，请到源目录确认写了什么</li>`);
   }
   // 撤销只在这份结果下面出现一次：它就是刚才那次应用留下的快照。
   const undo = undoId
