@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::backup::Snapshot;
 use crate::{
     Core, CoreError, DIFF_MAX_BYTES, Status, diff_gate_reason, paths, state, too_large_reason,
     unified_diff,
@@ -136,20 +137,52 @@ impl Core {
     /// 边界行为：单项失败不中断整批，其余项照常写；每个目标文件的写入是原子的
     /// （同目录临时文件 + rename），失败项的目标文件保持原样，也不留临时文件。
     pub fn execute_apply(&self, plan: &ApplyPlan) -> Result<Vec<ApplyOutcome>, CoreError> {
+        // 真要写盘才建快照：全跳过的计划一个字节都不写，也不留空备份。
+        if !plan
+            .items
+            .iter()
+            .any(|item| item.action != ApplyAction::Skip)
+        {
+            return Ok(Vec::new());
+        }
+        let mut snapshot = Snapshot::create(&self.home, &self.source_dir)?;
+
         let mut outcomes = Vec::new();
         for item in &plan.items {
             if item.action == ApplyAction::Skip {
                 continue;
             }
-            let result = match self.write_item(item) {
-                Ok(()) => ApplyResult::Written,
-                Err(message) => ApplyResult::Failed { message },
+            // 先备份再写：备份失败就这一项不写（目标文件原样），其余项照常。
+            let result = match snapshot.save(&self.home, &item.target) {
+                Ok(origin) => {
+                    let result = match self.write_item(item) {
+                        Ok(()) => ApplyResult::Written,
+                        Err(message) => ApplyResult::Failed { message },
+                    };
+                    match &result {
+                        ApplyResult::Written => {
+                            snapshot.record_written(&item.target, origin, item.digest.clone())
+                        }
+                        ApplyResult::Failed { message } => {
+                            snapshot.record_failed(&item.target, Some(origin), message.clone())
+                        }
+                    }
+                    result
+                }
+                Err(message) => {
+                    // 连备份都没拿到：这一项没有写，清单里也要说清楚。
+                    snapshot.record_failed(&item.target, None, message.clone());
+                    ApplyResult::Failed { message }
+                }
             };
             outcomes.push(ApplyOutcome {
                 target: item.target.clone(),
                 result,
             });
         }
+
+        // 清单落不下就是这次备份撤销不了；写盘已经发生，所以只作为错误报上去。
+        snapshot.commit()?;
         Ok(outcomes)
     }
 
@@ -324,47 +357,60 @@ impl Core {
             ));
         }
 
-        let parent = target
-            .parent()
-            .ok_or_else(|| format!("{} 没有父目录，没有写", target.display()))?;
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "创建 {} 失败：{e}；没有写 {}",
-                parent.display(),
-                target.display()
-            )
-        })?;
-
-        let temp = parent.join(format!(
-            ".{}.config-sync-{}-{}.tmp",
-            target.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-        ));
-
-        let written = std::fs::write(&temp, &bytes).and_then(|()| {
-            // 覆盖已有文件时保留它原来的权限；新建沿用源文件（可执行位不丢）。
-            let permissions = std::fs::metadata(target)
-                .or_else(|_| std::fs::metadata(&source))
-                .map(|meta| meta.permissions());
-            if let Ok(permissions) = permissions {
-                std::fs::set_permissions(&temp, permissions)?;
-            }
-            std::fs::rename(&temp, target)
-        });
-        written.map_err(|e| {
-            // rename 之前失败：目标文件从没被碰过，把临时文件清掉。
-            let _ = std::fs::remove_file(&temp);
-            format!("写 {} 失败：{e}", target.display())
-        })
+        // 覆盖已有文件时保留它原来的权限；新建沿用源文件（可执行位不丢）。
+        let permissions = std::fs::metadata(target)
+            .or_else(|_| std::fs::metadata(&source))
+            .map(|meta| meta.permissions())
+            .ok();
+        replace_file(target, &bytes, permissions)
     }
+}
+
+/// 原子写一份文件：补建父目录 → 同目录临时文件 → rename 到位。
+///
+/// 应用与撤销共用这一条写盘路径（权限由调用方给出）：临时文件保证编辑器之类的进程
+/// 不会读到半截内容，失败时目标文件从没被碰过，也不留临时文件。
+pub(crate) fn replace_file(
+    target: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("{} 没有父目录，没有写", target.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "创建 {} 失败：{e}；没有写 {}",
+            parent.display(),
+            target.display()
+        )
+    })?;
+
+    let temp = parent.join(format!(
+        ".{}.config-sync-{}-{}.tmp",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let written = std::fs::write(&temp, bytes).and_then(|()| {
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(&temp, permissions)?;
+        }
+        std::fs::rename(&temp, target)
+    });
+    written.map_err(|e| {
+        // rename 之前失败：目标文件从没被碰过，把临时文件清掉。
+        let _ = std::fs::remove_file(&temp);
+        format!("写 {} 失败：{e}", target.display())
+    })
 }
 
 /// 临时文件名里的序号，让同一进程内的多次写不会撞名。
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// 目标路径必须严格落在 `$HOME` 下（不能带 `..` / `.` 这类穿透成分）。
-fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
+pub(crate) fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
     let rel = target.strip_prefix(home).map_err(|_| {
         CoreError::io(format!(
             "{} 不在 {} 下，没有对应的受管文件",
@@ -387,12 +433,12 @@ fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
 /// 源文件内容的指纹，只为「预览之后源文件变过没有」这一次比对服务。
 /// 按字节数行（不做 lossy 转换）：只给超闸门时那句原因用。
 /// 与 `str::lines()` 一个口径：末行不带换行也算一行（第 2 轮 N3）。
-fn line_count(bytes: &[u8]) -> usize {
+pub(crate) fn line_count(bytes: &[u8]) -> usize {
     let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
     newlines + usize::from(bytes.last().is_some_and(|byte| *byte != b'\n'))
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(crate) fn digest(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())

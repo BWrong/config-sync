@@ -5,6 +5,7 @@
 
 mod add;
 mod apply;
+mod backup;
 mod config;
 mod editor;
 mod error;
@@ -20,6 +21,10 @@ mod state;
 pub use add::{AddOutcome, AddResult};
 pub use apply::{
     ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary, SkipReason,
+};
+pub use backup::{
+    BackupEntry, BackupManifest, BackupResult, BackupSummary, RestoreAction, RestoreItem,
+    RestoreOutcome, RestorePlan, RestoreResult,
 };
 pub use config::Config;
 pub use editor::Attempt;
