@@ -200,7 +200,7 @@ fn a_difference_past_the_truncation_point_still_shows_something() {
         diff.text
     );
     assert!(
-        diff.reason.contains("全文共 120000 行"),
+        diff.reason.contains("左侧 120000 行 / 右侧 120000 行"),
         "尾窗口的 reason 也要说全文多少行：{}",
         diff.reason
     );
@@ -234,7 +234,7 @@ fn a_difference_between_the_two_windows_says_how_much_was_skipped() {
     assert_eq!(diff.text, "", "窗口外不该硬编出内容");
     assert!(
         diff.reason.contains("头尾各 5000 行内都没有差异")
-            && diff.reason.contains("中间 110000 行"),
+            && diff.reason.contains("中间最多 110000 行"),
         "文案要说清楚跳过了多少行：{}",
         diff.reason
     );
@@ -257,9 +257,44 @@ fn a_difference_just_past_the_head_window_says_how_much_was_skipped() {
     assert!(diff.truncated, "{diff:?}");
     assert_eq!(diff.text, "");
     assert!(
-        diff.reason.contains("中间 110000 行"),
+        diff.reason.contains("中间最多 110000 行"),
         "文案要说清楚跳过了多少行：{}",
         diff.reason
+    );
+}
+
+#[test]
+fn the_reason_reports_both_sides_when_the_line_counts_differ() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let body: String = (0..120_000)
+        .map(|i| format!("key_{i:06} = value\n"))
+        .collect();
+    f.write_source("home/short.conf", &body);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    // 目标少 2000 行：两侧各取自己的最后 5000 行，在文件里差 2000 行，会多出一段看着像删除的内容。
+    // 差异本身没错（第 4 轮 QA 确认语义正确），但 reason 必须报两侧行数，读者才解释得掉。
+    let mut lines: Vec<String> = body
+        .lines()
+        .take(118_000)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    lines[117_000] = "key_117000 = changed\n".to_string();
+    let target = f.write_home("short.conf", &lines.concat());
+
+    let diff = core.diff(&target).unwrap();
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(diff.truncated, "{diff:?}");
+    assert!(
+        diff.reason.contains("左侧 118000 行 / 右侧 120000 行"),
+        "两侧行数不同就得都报：{}",
+        diff.reason
+    );
+    assert!(
+        diff.text.contains("@@ -"),
+        "该给末尾窗口的差异：{:?}",
+        diff.text
     );
 }
 

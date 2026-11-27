@@ -284,7 +284,10 @@ impl Core {
 
         // 显式点开的 diff 走按需闸门：比预览宽得多，超过也只截断、不整体拒绝（#17 S2）。
         let bytes = old.len().max(new.len());
-        let lines = old.lines().count().max(new.lines().count());
+        // 两侧行数可能不同（多删 / 多增），reason 里两个都要报：尾窗口各取各的最后 5000 行，
+        // 行数不等时会多出一段看着像删除的内容，读者得能自己解释掉它（第 4 轮）。
+        let (old_lines, new_lines) = (old.lines().count(), new.lines().count());
+        let lines = old_lines.max(new_lines);
         if bytes <= DIFF_ONDEMAND_MAX_BYTES && lines <= DIFF_ONDEMAND_MAX_LINES {
             return Ok(done(
                 unified_diff(&old_label, &new_label, &old, &new),
@@ -322,14 +325,15 @@ impl Core {
         );
         if tail_diff.is_empty() {
             // 头尾窗口都没差异：直说中间那段没对比，别让用户以为“没差异”。
+            // 两侧行数不等时「中间」只能报个上界，所以写「最多」（第 4 轮）。
             let skipped = lines.saturating_sub(2 * DIFF_TRUNCATE_LINES);
             return Ok(done(
                 tail_diff,
                 false,
                 true,
                 format!(
-                    "已截断：头尾各 {DIFF_TRUNCATE_LINES} 行内都没有差异，中间 {skipped} 行没有对比\
-                     （全文共 {lines} 行），完整内容请在编辑器里对比原文件"
+                    "已截断：头尾各 {DIFF_TRUNCATE_LINES} 行内都没有差异，中间最多 {skipped} 行没有对比\
+                     （左侧 {old_lines} 行 / 右侧 {new_lines} 行），完整内容请在编辑器里对比原文件"
                 ),
             ));
         }
@@ -339,7 +343,7 @@ impl Core {
             true,
             format!(
                 "已截断：前 {DIFF_TRUNCATE_LINES} 行内没有差异，只对比了末尾 {DIFF_TRUNCATE_LINES} 行\
-                 （全文共 {lines} 行），完整内容请在编辑器里对比原文件"
+                 （左侧 {old_lines} 行 / 右侧 {new_lines} 行），完整内容请在编辑器里对比原文件"
             ),
         ))
     }
