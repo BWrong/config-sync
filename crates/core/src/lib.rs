@@ -20,7 +20,8 @@ mod state;
 
 pub use add::{AddOutcome, AddResult};
 pub use apply::{
-    ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary, SkipReason,
+    ApplyAction, ApplyExecution, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplyStep,
+    ApplySummary, SkipReason,
 };
 pub use backup::{
     BackupEntry, BackupManifest, BackupResult, BackupSummary, RestoreAction, RestoreItem,
@@ -35,13 +36,116 @@ pub use push::PushOutcome;
 pub use remove::{RemoveOutcome, RemoveResult};
 pub use resolve::Side;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::SystemTime;
 
 pub struct Core {
     home: PathBuf,
     source_dir: PathBuf,
     config: Config,
+    caches: Caches,
+}
+
+/// 上次逐行比较磁盘时的两侧 `(长度, mtime)` 与结论：两侧都没动就不读内容（#42-1）。
+struct DiskStamp {
+    target: (u64, SystemTime),
+    source: (u64, SystemTime),
+    disk: state::Disk,
+}
+
+/// 计划阶段读到的源侧内容，执行阶段若源文件没变就直接用它，不再读一遍（#42-2）。
+struct PlannedSource {
+    len: u64,
+    mtime: SystemTime,
+    bytes: Vec<u8>,
+}
+
+/// 上限：计划里攒下的源内容最多这么多字节，超过就不进缓存（执行阶段照旧读盘）。
+const PLAN_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// 「设置分支 ≠ 当前分支」时 ahead/behind 用的 ref 事实，一次 `for-each-ref` 出齐（#42-4）。
+#[derive(Clone, Default, PartialEq, Eq)]
+struct SettingRefs {
+    /// `refs/heads/<setting>` 的 sha；本地还没这条分支时 `None`。
+    local: Option<String>,
+    /// 各远端下同名分支的 sha：`refs/remotes/<remote>/<setting>`。
+    remotes: BTreeMap<String, String>,
+}
+
+impl SettingRefs {
+    fn read(source_dir: &Path, setting: &str) -> Result<SettingRefs, CoreError> {
+        let out = git::run(
+            source_dir,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                &format!("refs/heads/{setting}"),
+                &format!("refs/remotes/*/{setting}"),
+            ],
+        )?;
+        let local_ref = format!("refs/heads/{setting}");
+        let remote_suffix = format!("/{setting}");
+        let mut refs = SettingRefs::default();
+        for line in out.lines() {
+            let Some((name, sha)) = line.split_once(' ') else {
+                continue;
+            };
+            if name == local_ref {
+                refs.local = Some(sha.to_string());
+            } else if let Some(remote) = name
+                .strip_prefix("refs/remotes/")
+                .and_then(|rest| rest.strip_suffix(&remote_suffix))
+            {
+                refs.remotes.insert(remote.to_string(), sha.to_string());
+            }
+        }
+        Ok(refs)
+    }
+}
+
+/// 设置分支 ≠ 当前分支时算出来的 ahead/behind，连同一份 ref 事实当键：ref 一个都没动就
+/// 直接复用，不再起 git（#42-4）。
+#[derive(Clone, PartialEq, Eq)]
+struct ForkStatus {
+    setting: String,
+    refs: SettingRefs,
+    ahead: u32,
+    behind: u32,
+}
+
+/// Core 的加速旁路：只省 IO 与进程，不参与任何结论推导。
+struct Caches {
+    inner: Mutex<CacheData>,
+}
+
+#[derive(Default)]
+struct CacheData {
+    disk: HashMap<PathBuf, DiskStamp>,
+    planned: HashMap<PathBuf, PlannedSource>,
+    planned_bytes: usize,
+    fork_status: Option<ForkStatus>,
+}
+
+impl Caches {
+    fn new() -> Self {
+        Caches {
+            inner: Mutex::new(CacheData::default()),
+        }
+    }
+
+    /// 中毒（有线程持锁时 panic）就清空重来：缓存丢了只是慢一点，不能把读状态一起拖垮。
+    fn lock(&self) -> MutexGuard<'_, CacheData> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = CacheData::default();
+                guard
+            }
+        }
+    }
 }
 
 /// `rev` 能不能解析成一个提交/引用（不存在时静默为 false）。
@@ -90,6 +194,7 @@ impl Core {
             home: home.into(),
             source_dir: source_dir.into(),
             config,
+            caches: Caches::new(),
         }
     }
 
@@ -321,10 +426,12 @@ impl Core {
             }
             deleted.insert(rel.to_path_buf());
         }
-        for rel in &deleted {
-            if let Err(at) = rels.binary_search(rel) {
-                rels.insert(at, rel.clone());
-            }
+        // 补齐的删除行与 `rels` 都排好序、互不相交：一次线性归并，不再逐条 `Vec::insert`
+        // 搬尾部（D 条删除时那是 O(D×N) 指针搬移，#42-5）。输出顺序不变。
+        if !deleted.is_empty() {
+            let mut extra: Vec<PathBuf> = deleted.iter().cloned().collect();
+            extra.sort_unstable();
+            rels = merge_sorted(rels, extra);
         }
 
         for rel in rels {
@@ -546,16 +653,26 @@ impl Core {
         )
     }
 
-    /// 先比长度：不相等直接不同，相等才读内容（#20）。
+    /// 先比长度：不相等直接不同，相等才读内容（#20）。两侧 `(长度, mtime)` 都没变时
+    /// 直接沿用上次的结论，一个字节都不读（#42-1）。
+    ///
+    /// shortcut: 判「没变」只看 `(长度, mtime)`，同一时间粒度内等长改写会被当成没变；
+    /// 它只跳过读内容，结论仍只有 Same / Differs 两档，下游判等不变。
     fn disk(&self, rel: &Path) -> Result<state::Disk, CoreError> {
         let target = self.home.join(rel);
-        let target_len = match std::fs::metadata(&target) {
-            Ok(meta) if meta.is_file() => meta.len(),
+        let (target_len, target_stamp) = match std::fs::metadata(&target) {
+            Ok(meta) if meta.is_file() => (meta.len(), stamp(&meta)),
             // 目录等非普通文件：走原来的读错误路径，错误类型与文案不变（#20 N3）。
-            Ok(_) => std::fs::read(&target)
-                .map(|bytes| bytes.len() as u64)
-                .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(state::Disk::Missing),
+            Ok(_) => (
+                std::fs::read(&target)
+                    .map(|bytes| bytes.len() as u64)
+                    .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?,
+                None,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.caches.lock().disk.remove(rel);
+                return Ok(state::Disk::Missing);
+            }
             Err(e) => {
                 return Err(CoreError::io(format!(
                     "读取 {} 失败：{e}",
@@ -565,23 +682,34 @@ impl Core {
         };
 
         let source = self.source_dir.join(paths::MIRROR_ROOT).join(rel);
-        let source_len = std::fs::metadata(&source)
-            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?
-            .len();
-        if source_len != target_len {
+        let source_meta = std::fs::metadata(&source)
+            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
+        if source_meta.len() != target_len {
+            self.caches.lock().disk.remove(rel);
             return Ok(state::Disk::Differs);
         }
 
-        let target_bytes = std::fs::read(&target)
-            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?;
-        let source_bytes = std::fs::read(&source)
-            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
+        let (Some(target_stamp), Some(source_stamp)) = (target_stamp, stamp(&source_meta)) else {
+            // 拿不到 mtime：不进缓存，老实读内容。
+            return read_both(&target, &source);
+        };
+        if let Some(cached) = self.caches.lock().disk.get(rel)
+            && cached.target == target_stamp
+            && cached.source == source_stamp
+        {
+            return Ok(cached.disk);
+        }
 
-        Ok(if source_bytes == target_bytes {
-            state::Disk::Same
-        } else {
-            state::Disk::Differs
-        })
+        let disk = read_both(&target, &source)?;
+        self.caches.lock().disk.insert(
+            rel.to_path_buf(),
+            DiskStamp {
+                target: target_stamp,
+                source: source_stamp,
+                disk,
+            },
+        );
+        Ok(disk)
     }
 
     /// 顶部状态条：分支、ahead/behind、未提交改动数。
@@ -615,18 +743,36 @@ impl Core {
         // 状态条上的数字必须等于「按下推送真会送出多少」：推送从设置分支自己的本地 ref
         // 出发、落到它的远端跟踪 ref，所以区间两端都用设置分支，不用 HEAD（HEAD 可能停在
         // 别的分支上，那样数出来既不是当前分支也不是设置分支的）。
-        let remote = branch_remote(&self.source_dir, &setting);
-        let count = |rev: String| push::count_commits(&self.source_dir, &rev).unwrap_or(0);
-        let local = rev_exists(&self.source_dir, &format!("refs/heads/{setting}"));
-        let (ahead, behind) = match push::destination_base(&self.source_dir, &remote, &setting) {
-            Some(base) if local => (
-                count(format!("{base}..{setting}")),
-                count(format!("{setting}..{base}")),
-            ),
-            // 本地还没有这个分支：推送会先按远端建它（或新建一条空分支），没有待推的东西，
-            // 也谈不上落后；状态条上的「还没切过去」就是说的这一档。
-            Some(_) => (0, 0),
-            None => (count(setting.clone()), 0),
+        // 每次刷新都要这几个数，而刷新是 fs 事件驱动的：先花一个 `for-each-ref` 拿全 ref
+        // 事实，ref 一个都没动就复用上次的数，一次 git 都不再起（#42-4）。读不出来（仓库坏掉
+        // 之类）就当没有这些 ref：这条路上的 git 调用以前也不让状态条整条报错。
+        let refs = SettingRefs::read(&self.source_dir, &setting).unwrap_or_default();
+        let cached = self.caches.lock().fork_status.clone();
+        let (ahead, behind) = match cached {
+            Some(c) if c.setting == setting && c.refs == refs => (c.ahead, c.behind),
+            _ => {
+                let remote = branch_remote(&self.source_dir, &setting);
+                let count = |rev: String| push::count_commits(&self.source_dir, &rev).unwrap_or(0);
+                let local = refs.local.is_some();
+                let numbers = match (refs.remotes.contains_key(&remote), local) {
+                    (true, true) => {
+                        let base = format!("{remote}/{setting}");
+                        // 一次数两个方向：left = 远端独有 = behind，right = 本地独有 = ahead。
+                        push::count_between(&self.source_dir, &base, &setting).unwrap_or((0, 0))
+                    }
+                    // 本地还没有这个分支：推送会先按远端建它（或新建一条空分支），没有待推的
+                    // 东西，也谈不上落后；状态条上的「还没切过去」就是说的这一档。
+                    (true, false) => (0, 0),
+                    (false, _) => (count(setting.clone()), 0),
+                };
+                self.caches.lock().fork_status = Some(ForkStatus {
+                    setting: setting.clone(),
+                    refs,
+                    ahead: numbers.0,
+                    behind: numbers.1,
+                });
+                numbers
+            }
         };
 
         Ok(RepoStatus {
@@ -637,6 +783,44 @@ impl Core {
             setting: Some(setting),
         })
     }
+}
+
+/// 两侧 `(长度, mtime)`：拿不到 mtime（少见）就 `None`，调用方退回老实读内容。
+fn stamp(meta: &std::fs::Metadata) -> Option<(u64, SystemTime)> {
+    meta.modified().ok().map(|mtime| (meta.len(), mtime))
+}
+
+/// 两侧长度已确认相等时，读内容比字节（错误文案与判等口径不变）。
+fn read_both(target: &Path, source: &Path) -> Result<state::Disk, CoreError> {
+    #[cfg(test)]
+    DISK_READS.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+    let target_bytes = std::fs::read(target)
+        .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?;
+    let source_bytes = std::fs::read(source)
+        .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
+    Ok(if source_bytes == target_bytes {
+        state::Disk::Same
+    } else {
+        state::Disk::Differs
+    })
+}
+
+/// #42-1 的取证用：`read_both` 每读一次内容就自增，单元测试据此断言缓存真的省掉了读。
+#[cfg(test)]
+static DISK_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 两条已排序、互不相交的路径表线性归并；`PathBuf` 的 `Ord` 与 `sort_unstable` 同一个口径。
+fn merge_sorted(left: Vec<PathBuf>, right: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let mut right = right.into_iter().peekable();
+    for path in left {
+        while right.peek().is_some_and(|next| next < &path) {
+            merged.extend(right.next());
+        }
+        merged.push(path);
+    }
+    merged.extend(right);
+    merged
 }
 
 /// 源目录里一条受管文件相对仓库根的路径（`home/<rel>`）；git 的输出都以它为键。
@@ -826,4 +1010,194 @@ fn unified_diff(old_label: &str, new_label: &str, old: &str, new: &str) -> Strin
         .context_radius(3)
         .header(old_label, new_label)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::apply::EXECUTE_SOURCE_READS;
+    use crate::git;
+
+    /// 一个真 git 工作区：`main` 上一次提交，里面一条受管文件 `home/profile`。
+    fn repo(root: &Path) -> PathBuf {
+        let source_dir = root.join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        for args in [
+            &["init", "--initial-branch=main"][..],
+            &["config", "user.name", "config-sync test"][..],
+            &["config", "user.email", "test@config-sync.invalid"][..],
+            &["config", "commit.gpgsign", "false"][..],
+        ] {
+            git::run(&source_dir, args).unwrap();
+        }
+        let mirror = source_dir.join(paths::MIRROR_ROOT);
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::write(mirror.join("profile"), "export A=1\n").unwrap();
+        git::run(&source_dir, &["add", "-A"]).unwrap();
+        git::run(&source_dir, &["commit", "-m", "init"]).unwrap();
+        source_dir
+    }
+
+    fn home(root: &Path) -> PathBuf {
+        let home = root.join("home-dir");
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn merge_sorted_keeps_one_ascending_order() {
+        let p = |name: &str| PathBuf::from(name);
+        let all = ["a", "b", "c", "d", "e"].map(p);
+        assert_eq!(
+            merge_sorted(vec![p("a"), p("c"), p("e")], vec![p("b"), p("d")]),
+            all
+        );
+        // 一侧为空、两侧首尾交错、以及一条都不重合的边角。
+        assert_eq!(merge_sorted(Vec::new(), all.to_vec()), all);
+        assert_eq!(merge_sorted(all.to_vec(), Vec::new()), all);
+        assert_eq!(
+            merge_sorted(vec![p("z")], vec![p("a")]),
+            vec![p("a"), p("z")]
+        );
+    }
+
+    /// #42-1：两侧 `(长度, mtime)` 都没变就不再读内容；变了立刻失效。
+    #[test]
+    fn unchanged_metadata_skips_rereading_both_sides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home(tmp.path());
+        let core = Core::new(&home, repo(tmp.path()), Config::default());
+        let rel = Path::new("profile");
+        std::fs::write(home.join(rel), "export A=1\n").unwrap();
+
+        assert_eq!(core.disk(rel).unwrap(), state::Disk::Same);
+        let first = DISK_READS.load(Ordering::Relaxed);
+        assert!(first >= 2, "第一次必须读两侧内容，实际读了 {first} 次");
+
+        assert_eq!(core.disk(rel).unwrap(), state::Disk::Same);
+        assert_eq!(
+            DISK_READS.load(Ordering::Relaxed),
+            first,
+            "两侧 (长度, mtime) 都没变就不该再读内容"
+        );
+
+        // 等长改写（只有 mtime 变）：短路必须失效，判等仍按内容算。
+        std::fs::write(home.join(rel), "export B=1\n").unwrap();
+        assert_eq!(core.disk(rel).unwrap(), state::Disk::Differs);
+        assert_eq!(
+            DISK_READS.load(Ordering::Relaxed),
+            first + 2,
+            "mtime 变了就得重读两侧"
+        );
+    }
+
+    /// #42-2：出计划时读过的源内容，执行阶段源没变就不再读第二遍；变了必须重读并拒绝写。
+    #[test]
+    fn the_execute_phase_reuses_the_source_bytes_read_by_the_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home(tmp.path());
+        let source_dir = repo(tmp.path());
+        let core = Core::new(&home, &source_dir, Config::default());
+
+        let plan = core.plan_apply(None).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].action, ApplyAction::Create);
+
+        EXECUTE_SOURCE_READS.store(0, Ordering::Relaxed);
+        let outcomes = core.execute_apply(&plan).unwrap();
+        assert!(matches!(outcomes[0].result, ApplyResult::Written));
+        assert_eq!(
+            EXECUTE_SOURCE_READS.load(Ordering::Relaxed),
+            0,
+            "源文件没变时执行阶段不该再读一遍"
+        );
+        assert_eq!(
+            std::fs::read(home.join("profile")).unwrap(),
+            b"export A=1\n"
+        );
+
+        // 预览之后源文件被改了：内存里那份不能用，必须重读并报「改过了」，目标不动。
+        std::fs::write(home.join("profile"), "export Z=9\n").unwrap();
+        let plan = core.plan_apply(None).unwrap();
+        assert_eq!(plan.items[0].action, ApplyAction::Overwrite);
+        std::fs::write(
+            source_dir.join(paths::MIRROR_ROOT).join("profile"),
+            "export SNEAKY=1\n",
+        )
+        .unwrap();
+        EXECUTE_SOURCE_READS.store(0, Ordering::Relaxed);
+        let outcomes = core.execute_apply(&plan).unwrap();
+        assert_eq!(
+            EXECUTE_SOURCE_READS.load(Ordering::Relaxed),
+            1,
+            "源变了就必须重读一遍"
+        );
+        assert!(matches!(
+            &outcomes[0].result,
+            ApplyResult::Failed { message } if message.contains("改过")
+        ));
+        assert_eq!(
+            std::fs::read(home.join("profile")).unwrap(),
+            b"export Z=9\n",
+            "改过的源不许写下去"
+        );
+    }
+
+    /// #42-4：设置分支 ≠ 当前分支时，ref 没动就只起一次 `for-each-ref`。
+    #[test]
+    fn a_settled_setting_branch_costs_one_git_process_per_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home(tmp.path());
+        let source_dir = repo(tmp.path());
+        // 本地有 release、远端也有一份（同一个提交，ahead/behind 都是 0）。
+        git::run(&source_dir, &["branch", "release"]).unwrap();
+        git::run(
+            &source_dir,
+            &["update-ref", "refs/remotes/origin/release", "HEAD"],
+        )
+        .unwrap();
+
+        // 基线：设置分支 == 当前分支，状态条只花 `git status` 那一次。
+        let baseline = {
+            let core = Core::new(&home, &source_dir, Config::default());
+            git::reset_git_runs();
+            core.repo_status().unwrap();
+            git::git_runs()
+        };
+
+        let core = Core::new(
+            &home,
+            &source_dir,
+            Config {
+                branch: "release".to_string(),
+                ..Config::default()
+            },
+        );
+        git::reset_git_runs();
+        let cold = core.repo_status().unwrap();
+        let cold_runs = git::git_runs();
+        assert_eq!(cold.setting.as_deref(), Some("release"));
+
+        git::reset_git_runs();
+        let warm = core.repo_status().unwrap();
+        let warm_runs = git::git_runs();
+
+        assert_eq!(warm, cold, "缓存不许改变结论");
+        assert_eq!(
+            warm_runs,
+            baseline + 1,
+            "ref 没动时只该起一次 for-each-ref（基线 {baseline} 次）"
+        );
+        assert!(
+            cold_runs > warm_runs,
+            "冷启动还要解析远端名并计数：{cold_runs} 次 vs 复用时的 {warm_runs} 次"
+        );
+        // 冷启动比基线多的那一截，正是 #42-4 要消掉的那串：远端名（1-2 次）+ 分支计数。
+        assert!(
+            cold_runs - baseline >= 4,
+            "冷启动 {cold_runs} 次 vs 基线 {baseline} 次"
+        );
+    }
 }

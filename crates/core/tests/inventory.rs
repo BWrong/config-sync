@@ -123,6 +123,39 @@ fn a_deleted_mirror_file_stays_listed_as_pending_commit() {
 }
 
 #[test]
+fn deleted_rows_keep_their_alphabetical_place_between_the_surviving_ones() {
+    let (f, core) = core();
+    for (rel, content) in [
+        (".zshrc", "export Z=1\n"),
+        (".zshenv", "export E=1\n"),
+        (".zprofile", "export P=1\n"),
+    ] {
+        f.write_home(rel, content);
+        f.write_source(&format!("home/{rel}"), content);
+    }
+    f.commit_all("config-sync: 3 files");
+
+    // 只删中间那一条：清单里它得回到自己那一格，而不是被追加到末尾。
+    core.remove(&[f.home.join(".zshenv")]).unwrap();
+
+    let names: Vec<String> = core
+        .inventory()
+        .unwrap()
+        .into_iter()
+        .map(|entry| {
+            entry
+                .target
+                .strip_prefix(&f.home)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    // `.zshenv` < `.zshrc`：删掉的那条落在两条留下的之间，不是末尾。
+    assert_eq!(names, [".zprofile", ".zshenv", ".zshrc"]);
+}
+
+#[test]
 fn a_deletion_that_is_committed_but_not_pushed_stays_listed() {
     let (f, core) = core();
     let target = f.write_home(".zshrc", "export A=1\n");

@@ -109,10 +109,33 @@ interface ApplyItem {
   diff_reason: string;
   /** 跳过项的归类：界面用图标表达。非跳过项是 null。 */
   skip_reason: SkipReason | null;
+  /** 出计划时源文件内容的指纹：执行阶段原样回传，写盘前 Core 拿它比对。 */
+  digest: string;
 }
 
 interface ApplyPlan {
   items: ApplyItem[];
+}
+
+/** 执行要的那一小份：目标 / 动作 / 指纹（Core 的 `ApplyExecution`）。 */
+interface ApplyExecution {
+  items: ApplyStep[];
+}
+
+interface ApplyStep {
+  target: string;
+  action: ApplyAction;
+  digest: string;
+}
+
+/**
+ * 预览里只有执行用得上的三个字段会回传给 Core：整段 diff 已经显示过了，
+ * 再序列化一次跨 IPC 传回去纯属白搬（#42-3）。
+ */
+function applyExecution(plan: ApplyPlan): ApplyExecution {
+  return {
+    items: plan.items.map(({ target, action, digest }) => ({ target, action, digest })),
+  };
 }
 
 interface ApplySummary {
@@ -121,7 +144,7 @@ interface ApplySummary {
   skip: number;
 }
 
-/** `plan_apply` 回来的一整份计划 + 摘要；确认时把同一份 `plan` 原样送回去执行。 */
+/** `plan_apply` 回来的一整份计划 + 摘要；确认时只把执行用得上的那部分送回去。 */
 interface ApplyPreview {
   plan: ApplyPlan;
   summary: ApplySummary;
@@ -788,7 +811,7 @@ function applyItemHtml(item: ApplyItem): string {
     </li>`;
 }
 
-/** 「应用」第二步：把预览里那一份计划原样送回去执行，不重新计算动作。 */
+/** 「应用」第二步：把预览里那一份计划的执行部分送回去，不重新计算动作。 */
 async function confirmApply(): Promise<void> {
   if (!applyPlan) return;
   const button = app.querySelector<HTMLButtonElement>(".confirm-apply")!;
@@ -796,7 +819,9 @@ async function confirmApply(): Promise<void> {
   button.textContent = "正在写…";
   let outcomes: ApplyOutcome[] | null = null;
   try {
-    outcomes = await invoke<ApplyOutcome[]>("execute_apply", { plan: applyPlan });
+    outcomes = await invoke<ApplyOutcome[]>("execute_apply", {
+      execution: applyExecution(applyPlan),
+    });
   } catch (error) {
     applyReportHtml = errorPanel(error);
   }

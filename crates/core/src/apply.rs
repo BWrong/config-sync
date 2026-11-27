@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::backup::Snapshot;
 use crate::{
-    Core, CoreError, DIFF_MAX_BYTES, Status, diff_gate_reason, paths, state, too_large_reason,
-    unified_diff,
+    Core, CoreError, DIFF_MAX_BYTES, PLAN_CACHE_MAX_BYTES, PlannedSource, Status, diff_gate_reason,
+    paths, state, too_large_reason, unified_diff,
 };
 
 /// 一份完整的应用计划。预览展示它，写盘也执行它。
@@ -35,6 +35,37 @@ impl ApplyPlan {
             skip: count(ApplyAction::Skip),
         }
     }
+
+    /// 执行用的投影：`execute` 只吃这个（`src-tauri` 也因此只传这一份过 IPC，#42-3）。
+    pub fn execution(&self) -> ApplyExecution {
+        ApplyExecution {
+            items: self
+                .items
+                .iter()
+                .map(|item| ApplyStep {
+                    target: item.target.clone(),
+                    action: item.action,
+                    digest: item.digest.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// 执行真正需要的部分：写哪个目标、做什么、源侧指纹（#42-3）。
+///
+/// 预览用的 diff 与原因只留在 `ApplyPlan` 里走一趟 IPC：整段 diff 序列化两次纯属白搬，
+/// 执行时一项也用不上。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyExecution {
+    pub items: Vec<ApplyStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyStep {
+    pub target: PathBuf,
+    pub action: ApplyAction,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -114,6 +145,11 @@ impl Core {
         let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);
         let facts = state::GitFacts::read(&self.source_dir)?;
         let mut items = Vec::new();
+        // 上一份计划留下的源内容不再有用：这次重新读的才是这份计划的（#42-2）。
+        let mut caches = self.caches.lock();
+        caches.planned.clear();
+        caches.planned_bytes = 0;
+        drop(caches);
 
         match targets {
             Some(targets) => {
@@ -138,50 +174,55 @@ impl Core {
     /// 边界行为：单项失败不中断整批，其余项照常写；每个目标文件的写入是原子的
     /// （同目录临时文件 + rename），失败项的目标文件保持原样，也不留临时文件。
     pub fn execute_apply(&self, plan: &ApplyPlan) -> Result<Vec<ApplyOutcome>, CoreError> {
+        self.execute(&plan.execution())
+    }
+
+    /// 按执行投影写盘；`execute_apply` 是它加一层投影的便捷版。
+    pub fn execute(&self, execution: &ApplyExecution) -> Result<Vec<ApplyOutcome>, CoreError> {
         // 真要写盘才建快照：全跳过的计划一个字节都不写，也不留空备份。
-        if !plan
+        if !execution
             .items
             .iter()
-            .any(|item| item.action != ApplyAction::Skip)
+            .any(|step| step.action != ApplyAction::Skip)
         {
             return Ok(Vec::new());
         }
         let mut snapshot = Snapshot::create(&self.home, &self.source_dir)?;
 
         let mut outcomes = Vec::new();
-        for item in &plan.items {
-            if item.action == ApplyAction::Skip {
+        for step in &execution.items {
+            if step.action == ApplyAction::Skip {
                 continue;
             }
             // 先备份再写：备份失败就这一项不写（目标文件原样），其余项照常。
-            let result = match snapshot.save(&self.home, &item.target) {
+            let result = match snapshot.save(&self.home, &step.target) {
                 Ok(origin) => {
-                    let result = match self.write_item(item) {
+                    let result = match self.write_item(step) {
                         Ok(()) => ApplyResult::Written,
                         Err(message) => ApplyResult::Failed { message },
                     };
                     match &result {
                         ApplyResult::Written => snapshot.record_written(
-                            &item.target,
+                            &step.target,
                             origin,
-                            item.digest.clone(),
+                            step.digest.clone(),
                             // 写下去的长度：撤销时跟指纹一起比对。
-                            std::fs::metadata(&item.target).ok().map(|meta| meta.len()),
+                            std::fs::metadata(&step.target).ok().map(|meta| meta.len()),
                         ),
                         ApplyResult::Failed { message } => {
-                            snapshot.record_failed(&item.target, Some(origin), message.clone())
+                            snapshot.record_failed(&step.target, Some(origin), message.clone())
                         }
                     }
                     result
                 }
                 Err(message) => {
                     // 连备份都没拿到：这一项没有写，清单里也要说清楚。
-                    snapshot.record_failed(&item.target, None, message.clone());
+                    snapshot.record_failed(&step.target, None, message.clone());
                     ApplyResult::Failed { message }
                 }
             };
             outcomes.push(ApplyOutcome {
-                target: item.target.clone(),
+                target: step.target.clone(),
                 result,
                 warning: None,
             });
@@ -204,22 +245,26 @@ impl Core {
         let target = self.home.join(rel);
 
         // 源目录里没有这个文件：目标已存在也绝不覆盖（DESIGN 关键行为 1）。
-        if !source.is_file() {
-            return Ok(ApplyItem {
-                target,
-                source: source.clone(),
-                action: ApplyAction::Skip,
-                reason: format!(
-                    "源目录里没有这个文件（{}），目标已存在也不会被覆盖",
-                    source.display()
-                ),
-                diff: String::new(),
-                diff_omitted: false,
-                diff_reason: String::new(),
-                digest: String::new(),
-                skip_reason: Some(SkipReason::SourceMissing),
-            });
-        }
+        // 这一次 stat 同时给出 `is_file` 与下面缓存要用的长度 / mtime（不额外读盘）。
+        let source_meta = match std::fs::metadata(&source) {
+            Ok(meta) if meta.is_file() => meta,
+            _ => {
+                return Ok(ApplyItem {
+                    target,
+                    source: source.clone(),
+                    action: ApplyAction::Skip,
+                    reason: format!(
+                        "源目录里没有这个文件（{}），目标已存在也不会被覆盖",
+                        source.display()
+                    ),
+                    diff: String::new(),
+                    diff_omitted: false,
+                    diff_reason: String::new(),
+                    digest: String::new(),
+                    skip_reason: Some(SkipReason::SourceMissing),
+                });
+            }
+        };
 
         // 源侧必须完整读：digest 与 diff 的新内容都要它（#20）。
         let source_bytes = std::fs::read(&source)
@@ -328,12 +373,34 @@ impl Core {
             }
         };
 
+        let digest = digest(&source_bytes);
+
+        // 执行阶段本来要再读一遍这份源内容（#42-2）。小批量先把它留在内存里：源文件到执行
+        // 时没变就直接用，省掉那次整份读。
+        // shortcut: 只留累计不超过 PLAN_CACHE_MAX_BYTES 的部分，超了执行阶段照旧读盘。
+        if action != ApplyAction::Skip
+            && let Ok(mtime) = source_meta.modified()
+        {
+            let mut caches = self.caches.lock();
+            if caches.planned_bytes + source_bytes.len() <= PLAN_CACHE_MAX_BYTES {
+                caches.planned_bytes += source_bytes.len();
+                caches.planned.insert(
+                    target.clone(),
+                    PlannedSource {
+                        len: source_meta.len(),
+                        mtime,
+                        bytes: source_bytes.clone(),
+                    },
+                );
+            }
+        }
+
         Ok(ApplyItem {
-            source: source.clone(),
+            source,
             diff,
             diff_omitted,
             diff_reason,
-            digest: digest(&source_bytes),
+            digest,
             target,
             action,
             reason,
@@ -345,19 +412,27 @@ impl Core {
     ///
     /// 临时文件保证编辑器之类的进程不会读到半截内容；权限上新建沿用源文件（可执行位不丢），
     /// 覆盖沿用目标文件原来的权限。
-    fn write_item(&self, item: &ApplyItem) -> Result<(), String> {
-        let rel = relative_to_home(&item.target, &self.home).map_err(|e| e.message)?;
+    fn write_item(&self, step: &ApplyStep) -> Result<(), String> {
+        let rel = relative_to_home(&step.target, &self.home).map_err(|e| e.message)?;
         let source = self.source_dir.join(paths::MIRROR_ROOT).join(&rel);
-        let target = &item.target;
+        let target = &step.target;
 
-        let bytes = std::fs::read(&source).map_err(|e| {
-            format!(
-                "读取源文件 {} 失败：{e}；没有写 {}",
-                source.display(),
-                target.display()
-            )
-        })?;
-        if digest(&bytes) != item.digest {
+        // 出计划时读过这份源内容、源文件之后没再变过：直接用，不再读第二遍（#42-2）。
+        let bytes = match self.take_planned_source(target, &source) {
+            Some(bytes) => bytes,
+            None => {
+                #[cfg(test)]
+                EXECUTE_SOURCE_READS.fetch_add(1, Ordering::Relaxed);
+                std::fs::read(&source).map_err(|e| {
+                    format!(
+                        "读取源文件 {} 失败：{e}；没有写 {}",
+                        source.display(),
+                        target.display()
+                    )
+                })?
+            }
+        };
+        if digest(&bytes) != step.digest {
             return Err(format!(
                 "源文件 {} 在预览之后改过了，写下去的内容不是确认过的那份；没有写 {}，请重新预览",
                 source.display(),
@@ -372,7 +447,25 @@ impl Core {
             .ok();
         replace_file(target, &bytes, permissions)
     }
+
+    /// 出计划时留在内存里的源内容：源文件到现在没变（长度 + mtime 都一样）才用它，
+    /// 否则退回读盘。取走即删——一份内容不留给第二份计划复用（#42-2）。
+    fn take_planned_source(&self, target: &Path, source: &Path) -> Option<Vec<u8>> {
+        let mut caches = self.caches.lock();
+        let planned = caches.planned.remove(target)?;
+        caches.planned_bytes = caches.planned_bytes.saturating_sub(planned.bytes.len());
+        let meta = std::fs::metadata(source).ok()?;
+        let unchanged = meta.is_file()
+            && meta.len() == planned.len
+            && meta.modified().ok() == Some(planned.mtime);
+        unchanged.then_some(planned.bytes)
+    }
 }
+
+/// #42-2 的取证用：执行阶段每退回读一次源内容就自增。
+#[cfg(test)]
+pub(crate) static EXECUTE_SOURCE_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// 原子写一份文件：补建父目录 → 同目录临时文件 → rename 到位。
 ///
@@ -479,6 +572,34 @@ mod tests {
             result,
             warning: None,
         }
+    }
+
+    /// #42-3：预览那份整段 diff 只走一趟 IPC；执行回传的载荷里不再带它。
+    #[test]
+    fn the_execution_payload_carries_no_diff() {
+        let plan = ApplyPlan {
+            items: vec![ApplyItem {
+                target: PathBuf::from("/home/u/.zshrc"),
+                source: PathBuf::from("/src/home/.zshrc"),
+                action: ApplyAction::Overwrite,
+                reason: "目标文件存在且内容不同，会覆盖（保留它原来的权限）".to_string(),
+                diff: format!("--- a\n+++ b\n{}", "+export B=2\n".repeat(512)),
+                diff_omitted: false,
+                diff_reason: String::new(),
+                skip_reason: None,
+                digest: "0123456789abcdef".to_string(),
+            }],
+        };
+        let preview = serde_json::to_string(&plan).unwrap();
+        let execution = serde_json::to_string(&plan.execution()).unwrap();
+        assert!(
+            execution.len() * 20 < preview.len(),
+            "执行载荷 {} 字节 vs 预览 {} 字节",
+            execution.len(),
+            preview.len()
+        );
+        assert!(!execution.contains("diff"), "{execution}");
+        assert!(!execution.contains("+export B=2"), "整段 diff 不该回传");
     }
 
     #[test]
