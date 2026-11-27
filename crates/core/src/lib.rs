@@ -409,12 +409,13 @@ impl Core {
         self.status(&state::GitFacts::read(&self.source_dir)?)
     }
 
-    /// 上次读到的 git 事实：`.git` 里决定 `git status` 输出的那些文件一个都没动就直接复用。
-    /// 刷新已经读过一份了，点开一行 diff 不必再为一行字重跑一遍 `git status`（#42-a）。
+    /// 上次读到的那份 git 事实：`.git` 里决定 `git status` 输出的那些文件一个都没动就直接复用。
+    /// 只给 `diff` 用——点开一行是为了看字，不必为一行字再问一遍「哪里有改动」（#42-a）。
     ///
     /// 失效条件：分支/HEAD、索引、refs、`FETCH_HEAD`、配置、忽略规则里任意一处变了，或者
-    /// 那份事实压根还没读过。工作区内容的改动不落进 `.git`，所以不设工作区戳——读之前之后
-    /// 的戳对不上（有别的进程正在改仓库）就照常返回但不缓存，宁可慢一次也不给出对不上号的事实。
+    /// 那份事实压根还没读过。工作区内容的改动不落进 `.git`，戳看不出来，所以复用到的只可能是
+    /// 「上一次 `refresh` 那一刻的事实」：与用户正看着的那一行同源，不会互相打脸。
+    /// 要「现在到底有没有未提交改动」的调用方必须走 `facts_fresh`。
     fn facts(&self) -> Result<Arc<state::GitFacts>, CoreError> {
         let stamp = git_stamp(&self.source_dir);
         if let Some(cached) = &self.caches.lock().facts
@@ -422,6 +423,24 @@ impl Core {
         {
             return Ok(Arc::clone(&cached.facts));
         }
+        self.read_facts(stamp)
+    }
+
+    /// 重新读一份 git 事实，不看缓存；读完照样把「戳 + 事实」存进去供 `diff` 复用。
+    ///
+    /// 界面上的「有没有未提交改动」必须现读：在编辑器里改一个受管文件、`git rm`、新建未跟踪文件，
+    /// 一个 `.git` 里的字节都不动，光靠戳分不出「改了」和「没改」——拿旧事实就会一直显示 0 处改动，
+    /// 直到有别的动作改写 `.git`（#42-a 复审 B1）。
+    fn facts_fresh(&self) -> Result<Arc<state::GitFacts>, CoreError> {
+        self.read_facts(git_stamp(&self.source_dir))
+    }
+
+    /// 读一份新事实。读之前之后戳一致才进缓存：有别的进程正在改仓库就不缓存，宁可下次再慢一次，
+    /// 也不留一份来历不明的事实给 `diff`。
+    fn read_facts(
+        &self,
+        stamp: Option<Vec<(PathBuf, Option<Stamp>)>>,
+    ) -> Result<Arc<state::GitFacts>, CoreError> {
         let facts = Arc::new(state::GitFacts::read(&self.source_dir)?);
         if let Some(stamp) = stamp
             && git_stamp(&self.source_dir).as_ref() == Some(&stamp)
@@ -437,7 +456,7 @@ impl Core {
     /// 一次刷新要的两半（清单 + 状态条），同一份 git 事实算出来：
     /// 前端原来分两次 IPC 各跑一遍 git，现在一次 IPC、一份 `git status`（#19）。
     pub fn refresh(&self) -> Result<Refresh, CoreError> {
-        let facts = self.facts()?;
+        let facts = self.facts_fresh()?;
         let entries = self.entries(&facts)?;
         let status = self.status(&facts)?;
         Ok(Refresh { entries, status })
@@ -884,8 +903,12 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        // 不跟随符号链接：`refs` 里不该有，有也不该顺着它绕出去（`file_type` 不解析链接）。
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if kind.is_dir() {
             collect_files(&path, out);
         } else {
             out.push(path);
@@ -1396,5 +1419,36 @@ mod tests {
         let again = core.diff(&target).unwrap();
         assert_eq!(again, diff, "同一份事实，结论不变");
         assert_eq!(git::git_runs(), 1, "第二次点开只剩读 HEAD 内容的那一次");
+    }
+
+    /// #42-a 复审 B1：工作区改了但不碰 `.git`，下一次 `refresh` 也必须看得见。
+    ///
+    /// 拿旧的 git 事实算清单，就会一直说「0 处未提交改动」、那一行还挂在已同步上，
+    /// 直到有别的动作改写 `.git`——界面与推送各自看到的世界不一致。
+    #[test]
+    fn a_worktree_edit_reaches_the_next_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home(tmp.path());
+        let source_dir = repo(tmp.path());
+        let core = Core::new(&home, &source_dir, Config::default());
+        std::fs::write(home.join("profile"), "export A=1\n").unwrap();
+        let cold = core.refresh().unwrap();
+        assert_eq!(cold.status.dirty, 0);
+        assert_eq!(cold.entries[0].status, Status::InSync);
+
+        // 编辑器里改源目录的副本：只动工作区，不 add、不 commit，`.git` 一个字节不动。
+        std::fs::write(
+            source_dir.join(paths::MIRROR_ROOT).join("profile"),
+            "export A=2\n",
+        )
+        .unwrap();
+
+        let warm = core.refresh().unwrap();
+        assert_eq!(warm.status.dirty, 1, "工作区改了就得算一处未提交改动");
+        assert_eq!(
+            warm.entries[0].status,
+            Status::PendingCommit,
+            "没暂存也已经是待提交改动"
+        );
     }
 }

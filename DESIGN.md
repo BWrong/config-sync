@@ -14,7 +14,7 @@
 |---|---|---|
 | 外壳 | Tauri 2（Rust 内核 + web 前端） | 产物 10–15MB；本机 Rust 1.97 + Node 24 + CLT 已就绪；不写死平台，将来可出 Windows |
 | 平台 | 先只出 macOS arm64 | 现有工具链足够，无需安装 Xcode；出 Windows 版要动的改动见 [docs/windows.md](./docs/windows.md) |
-| git | **shell 调用系统 `git`** | SSH key / credential helper / 代理 / host key 全部复用，不自建凭据存储 |
+| git | **shell 调用系统 `git`**（2.15+） | SSH key / credential helper / 代理 / host key 全部复用，不自建凭据存储 |
 | 前端 | 纯 TypeScript + Vite，无 UI 框架 | 只有清单、diff、设置三类视图，框架带不来收益；`npm run build` 只有 `tsc --noEmit` + `vite build` |
 
 凭据、代理、host key 校验一律不由本应用接管；git 报什么错，就原样解释给用户。
@@ -99,6 +99,19 @@ save_settings）在一条队列里串行，互不重叠；读命令（`refresh`�
 3000 文件档：中位 39.1ms、最大 45.4ms。锁已不在关键路径上（写命令持门闩 10s 什么都不干时，
 取快照中位数约 1µs）；剩下是 `refresh` 自己跑 `git status` 的成本叠加 `git push` 对 git 索引与
 页缓存的争用。要更快，方向是少扫一点仓库，不是再拆锁。
+
+### git 版本下限与事实复用的代价
+
+`git status` 带 `--no-optional-locks`（不带的话 git 会把索引的 stat 缓存写回 `.git/index`，文件一个
+没改、索引指纹却每次都在变），这个开关要 **git 2.15+**：更老的 git 不认识它，`status` 直接报错，
+界面看到的是「git 执行失败」。
+
+清单里的 `diff` 复用上一次刷新读到的 git 事实（`crates/core/src/lib.rs` 的 `facts`），失效靠给 `.git`
+里那几处拍指纹。代价是每次点开一行都要 walk 一遍 `.git/refs/**`：量级是「loose ref 数 × 一次 stat」，
+几千个 loose ref 就是几千次 stat（几毫秒量级）；跑过 `git pack-refs` 之后这个目录基本是空的，成本
+回到个位数。指纹里没有工作区（改一个受管文件不动 `.git` 一个字节），所以复用到的永远是「上一次
+`refresh` 那一刻」的事实，与用户正看着的那一行同源；要现况的调用方（`refresh`）走 `facts_fresh`，
+永远重读——界面上的「有没有未提交改动」不能靠指纹猜。
 
 ## 界面
 
