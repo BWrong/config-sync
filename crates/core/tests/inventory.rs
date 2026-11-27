@@ -69,7 +69,9 @@ fn repo_status_follows_real_git_state_and_the_bare_remote() {
             branch: "main".into(),
             ahead: 0,
             behind: 0,
-            dirty: 1
+            dirty: 1,
+            // 设置的分支就是当前分支：状态条不需要额外标注。
+            setting: None,
         }
     );
 

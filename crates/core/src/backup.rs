@@ -15,7 +15,11 @@ use chrono::{Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::apply::{digest, line_count, relative_to_home, replace_file};
-use crate::{Core, CoreError, DIFF_MAX_BYTES, diff_gate_reason, too_large_reason, unified_diff};
+use crate::push::human_bytes;
+use crate::{
+    Core, CoreError, DIFF_HARD_MAX_BYTES, DIFF_MAX_BYTES, diff_gate_reason, too_large_reason,
+    unified_diff,
+};
 
 /// 备份根目录（app 配置目录下）：不在源仓库里，因此不会被 git 跟踪、不会被推送。
 pub(crate) const BACKUP_ROOT: &str = ".config/config-sync/backups";
@@ -48,6 +52,9 @@ pub struct BackupEntry {
     pub mode: Option<u32>,
     /// 应用写下去的内容指纹；没写成时为 `None`。撤销靠它判断「目标还是那次写的样子吗」。
     pub written_digest: Option<String>,
+    /// 应用写下去的内容长度：与指纹一起比对，抵掉哈希撞车（老清单没有这一项时跳过这项检查）。
+    #[serde(default)]
+    pub written_len: Option<u64>,
     /// 这一项写成了没有。没写成的项目标文件原样不动，不用撤销。
     pub result: BackupResult,
 }
@@ -106,6 +113,9 @@ pub struct RestoreItem {
     /// 出计划时目标内容的指纹：执行前再比一次，变了就失败，不覆盖。
     #[serde(default)]
     pub expected_digest: Option<String>,
+    /// 出计划时目标内容的长度：与指纹一起比对（双保险）。
+    #[serde(default)]
+    pub expected_len: Option<u64>,
     /// 备份原文的指纹：执行时再读一次也比一次。
     #[serde(default)]
     pub backup_digest: Option<String>,
@@ -235,6 +245,7 @@ impl Snapshot {
         target: &Path,
         origin: Option<Origin>,
         written_digest: Option<String>,
+        written_len: Option<u64>,
         result: BackupResult,
     ) {
         self.manifest.entries.push(BackupEntry {
@@ -243,31 +254,49 @@ impl Snapshot {
             existed: origin.as_ref().is_some_and(|origin| origin.existed),
             mode: origin.and_then(|origin| origin.mode),
             written_digest,
+            written_len,
             result,
         });
+        // 每记一项就落一次盘：应用中途崩掉、或最后一次落清单失败时，已经写成的项
+        // 仍然可撤销（清单里就是它们）。
+        let _ = self.write_manifest();
     }
 
-    pub(crate) fn record_written(&mut self, target: &Path, origin: Origin, written_digest: String) {
+    pub(crate) fn record_written(
+        &mut self,
+        target: &Path,
+        origin: Origin,
+        written_digest: String,
+        written_len: Option<u64>,
+    ) {
         self.push(
             target,
             Some(origin),
             Some(written_digest),
+            written_len,
             BackupResult::Written,
         );
     }
 
     /// 没写成的一项：`origin` 为 `None` 表示连备份都没拿到（目标文件没被碰过）。
     pub(crate) fn record_failed(&mut self, target: &Path, origin: Option<Origin>, message: String) {
-        self.push(target, origin, None, BackupResult::Failed { message });
+        self.push(target, origin, None, None, BackupResult::Failed { message });
     }
 
-    /// 落清单并按保留策略清旧备份；清单写失败只算这次的备份不可撤销（返回错误给调用方）。
-    pub(crate) fn commit(self) -> Result<BackupSummary, CoreError> {
+    fn write_manifest(&self) -> Result<(), String> {
         let path = self.dir.join(MANIFEST);
         let json = serde_json::to_string_pretty(&self.manifest)
-            .map_err(|e| CoreError::io(format!("生成备份清单失败：{e}")))?;
-        std::fs::write(&path, json)
-            .map_err(|e| CoreError::io(format!("写备份清单 {} 失败：{e}", path.display())))?;
+            .map_err(|e| format!("生成备份清单失败：{e}"))?;
+        // 原子写：崩溃时不会留下一份写到一半的清单（它会盖掉上一次落好的那份）。
+        replace_file(&path, json.as_bytes(), None)
+    }
+
+    /// 落清单并按保留策略清旧备份。
+    ///
+    /// 返回值第二项是清单写失败的原因：那次应用已经写完盘了，所以这不叫失败，叫「这次备份
+    /// 撤销不了」，由调用方当警告带回去。
+    pub(crate) fn commit(self) -> (BackupSummary, Option<String>) {
+        let warning = self.write_manifest().err();
 
         // 保留策略是「还好」，清不掉不影响这次应用的结果。
         let _ = prune(
@@ -276,22 +305,25 @@ impl Snapshot {
             KEEP_DAYS,
         );
 
-        Ok(BackupSummary {
-            written: self
-                .manifest
-                .entries
-                .iter()
-                .filter(|entry| matches!(entry.result, BackupResult::Written))
-                .count(),
-            failed: self
-                .manifest
-                .entries
-                .iter()
-                .filter(|entry| matches!(entry.result, BackupResult::Failed { .. }))
-                .count(),
-            id: self.manifest.id,
-            created_at: self.manifest.created_at,
-        })
+        (
+            BackupSummary {
+                written: self
+                    .manifest
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry.result, BackupResult::Written))
+                    .count(),
+                failed: self
+                    .manifest
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry.result, BackupResult::Failed { .. }))
+                    .count(),
+                id: self.manifest.id,
+                created_at: self.manifest.created_at,
+            },
+            warning,
+        )
     }
 }
 
@@ -350,6 +382,55 @@ impl Core {
 
         for entry in &manifest.entries {
             let target = &entry.target;
+            let mut item = RestoreItem {
+                target: target.clone(),
+                action: RestoreAction::Skip,
+                reason: String::new(),
+                diff: String::new(),
+                diff_omitted: false,
+                diff_reason: String::new(),
+                conflict: false,
+                file: entry.file.clone(),
+                mode: entry.mode,
+                expected_digest: None,
+                expected_len: None,
+                backup_digest: None,
+            };
+
+            if !matches!(entry.result, BackupResult::Written) {
+                item.reason = "这次应用没有写成这一项，目标文件原样未动，不需要恢复".to_string();
+                items.push(item);
+                continue;
+            }
+
+            // 预览要把目标与备份原文整份读进内存，所有判断（指纹 / diff）都建立在读到的字节上：
+            // 先看长度，超硬上限就只说「太大，请在编辑器里对比」，不去读它。
+            let target_len = match std::fs::metadata(target) {
+                Ok(meta) => Some(meta.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(CoreError::io(format!(
+                        "读取 {} 失败：{e}",
+                        target.display()
+                    )));
+                }
+            };
+            let backup_path = entry.file.as_ref().map(|file| dir.join(file));
+            let backup_len = backup_path
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok().map(|meta| meta.len()));
+            let widest = target_len.into_iter().chain(backup_len).max().unwrap_or(0);
+            if widest > DIFF_HARD_MAX_BYTES {
+                item.reason = format!(
+                    "文件太大（能碰到的那一份有 {}，单个文件上限 {}）：撤销预览不读这么大的内容，\
+                     请在编辑器里对比后手动处理",
+                    human_bytes(widest),
+                    human_bytes(DIFF_HARD_MAX_BYTES)
+                );
+                items.push(item);
+                continue;
+            }
+
             let current = match std::fs::read(target) {
                 Ok(bytes) => Some(bytes),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -361,30 +442,16 @@ impl Core {
                 }
             };
             let current_digest = current.as_deref().map(digest);
-            let written_digest = entry.written_digest.as_deref();
+            let current_len = current.as_ref().map(|bytes| bytes.len() as u64);
             // 「目标还是那次应用写下的样子」：撤销的安全前提。
-            let untouched =
-                current_digest.as_deref().is_some() && current_digest.as_deref() == written_digest;
-
-            let mut item = RestoreItem {
-                target: target.clone(),
-                action: RestoreAction::Skip,
-                reason: String::new(),
-                diff: String::new(),
-                diff_omitted: false,
-                diff_reason: String::new(),
-                conflict: false,
-                file: entry.file.clone(),
-                mode: entry.mode,
-                expected_digest: current_digest,
-                backup_digest: None,
-            };
-
-            if !matches!(entry.result, BackupResult::Written) {
-                item.reason = "这次应用没有写成这一项，目标文件原样未动，不需要恢复".to_string();
-                items.push(item);
-                continue;
-            }
+            let untouched = matches_original(
+                current_digest.as_deref(),
+                current_len,
+                entry.written_digest.as_deref(),
+                entry.written_len,
+            );
+            item.expected_digest = current_digest;
+            item.expected_len = current_len;
 
             if !entry.existed {
                 // 那次是新建：目标还是写下的样子 → 删掉它；否则是用户自己又改过。
@@ -413,14 +480,14 @@ impl Core {
             }
 
             // 那次是覆盖：备份里应该有原文。
-            let backup_bytes = match entry.file.as_ref() {
-                Some(file) => match std::fs::read(dir.join(file)) {
+            let backup_bytes = match backup_path.as_ref() {
+                Some(path) => match std::fs::read(path) {
                     Ok(bytes) => Some(bytes),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => {
                         return Err(CoreError::io(format!(
                             "读取备份文件 {} 失败：{e}",
-                            dir.join(file).display()
+                            path.display()
                         )));
                     }
                 },
@@ -489,8 +556,23 @@ impl Core {
     }
 
     fn restore_item(&self, dir: &Path, item: &RestoreItem) -> Result<RestoreResult, String> {
-        let current = std::fs::read(&item.target).ok().as_deref().map(digest);
-        if current != item.expected_digest {
+        // 计划是前端送回来的：写盘前和 apply 一样守「目标必须在 $HOME 下」这条规矩，
+        // 被改过的计划不能把任意路径当目标。
+        relative_to_home(&item.target, &self.home).map_err(|error| error.message)?;
+
+        let current = std::fs::read(&item.target).ok();
+        // 删除项的目标如果在预览之后已经被删掉，就当已经做完（删除是幂等的，不会碰到别的东西）。
+        if current.is_none() && item.action == RestoreAction::Delete {
+            return Ok(RestoreResult::Deleted);
+        }
+        let current_digest = current.as_deref().map(digest);
+        let current_len = current.as_ref().map(|bytes| bytes.len() as u64);
+        if !matches_original(
+            current_digest.as_deref(),
+            current_len,
+            item.expected_digest.as_deref(),
+            item.expected_len,
+        ) {
             return Err(format!(
                 "{} 在预览之后又变过，撤销会覆盖新内容；没有动它，请重新预览",
                 item.target.display()
@@ -507,6 +589,18 @@ impl Core {
                 let file = item.file.as_ref().ok_or_else(|| {
                     format!("备份里没有 {} 的原文位置，没法恢复", item.target.display())
                 })?;
+                // 备份里的位置只能是备份目录内的相对路径：`..`、绝对路径都不能拿来指到别处。
+                if file.as_os_str().is_empty()
+                    || file
+                        .components()
+                        .any(|component| !matches!(component, Component::Normal(_)))
+                {
+                    return Err(format!(
+                        "备份里的路径 {} 不是备份目录内的相对路径；没有写 {}",
+                        file.display(),
+                        item.target.display()
+                    ));
+                }
                 let path = dir.join(file);
                 let bytes = std::fs::read(&path)
                     .map_err(|e| format!("读取备份 {} 失败：{e}", path.display()))?;
@@ -581,6 +675,20 @@ fn is_backup_dir(dir: &Path) -> bool {
     dir.is_dir() && dir.join(MANIFEST).is_file()
 }
 
+/// 「这份内容还是那次写下的样子」：指纹与长度都对得上。
+/// 老清单没有长度（`written_len`）时只比指纹，不至于把旧备份一棍子打死。
+fn matches_original(
+    current_digest: Option<&str>,
+    current_len: Option<u64>,
+    written_digest: Option<&str>,
+    written_len: Option<u64>,
+) -> bool {
+    let (Some(current_digest), Some(written_digest)) = (current_digest, written_digest) else {
+        return false;
+    };
+    current_digest == written_digest && written_len.is_none_or(|len| current_len == Some(len))
+}
+
 /// `backups/<id>` 一级目录 0700：里面有密钥，别人不能翻。
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -631,13 +739,25 @@ fn unique_id(root: &Path, base: &str) -> String {
 }
 
 /// 保留策略：留最近 `keep_latest` 次，且任何一次最多留 `keep_days` 天（两者取更严的）。
-/// 只动带 `manifest.json` 的一级目录，别人的东西不碰。失败就算了，不影响应用结果。
+/// 只动备份根目录下的一级目录，别人的东西不碰。失败就算了，不影响应用结果。
 fn prune(root: &Path, keep_latest: usize, keep_days: i64) -> std::io::Result<()> {
-    let mut ids: Vec<String> = std::fs::read_dir(root)?
-        .flatten()
-        .filter(|entry| is_backup_dir(&entry.path()))
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path.join(MANIFEST).is_file() {
+            // 应用写到一半崩掉留下的半截备份：没有清单就撤销不了，按 mtime 过期清掉，
+            // 否则它会永远躺在 backups/ 里（上面按 id 排名的逻辑看不见它）。
+            if older_than(&entry, keep_days) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        }
+        ids.push(entry.file_name().to_string_lossy().into_owned());
+    }
     ids.sort_by(|a, b| b.cmp(a));
 
     let now = Local::now().naive_local();
@@ -651,8 +771,124 @@ fn prune(root: &Path, keep_latest: usize, keep_days: i64) -> std::io::Result<()>
     Ok(())
 }
 
+/// 目录的 mtime 至少是 `days` 天之前。读不到 mtime 一律当「不够旧」，不动它。
+fn older_than(entry: &std::fs::DirEntry, days: i64) -> bool {
+    let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+    age.as_secs() >= (days.max(0) as u64).saturating_mul(86_400)
+}
+
 /// 从目录名 `YYYYMMDD-HHMMSS[-N]` 取时间；取不出来就不按年龄删。
 fn parse_id(id: &str) -> Option<NaiveDateTime> {
     let head: String = id.chars().take(15).collect();
     NaiveDateTime::parse_from_str(&head, "%Y%m%d-%H%M%S").ok()
+}
+
+/// 清单落盘与保留策略的单元测试：只碰临时目录，不需要 git。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个 home / 一个（跟 home 无关的）源目录，外加一份已写好的目标文件。
+    fn world() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        let target = home.join(".zshrc");
+        std::fs::write(&target, "export A=1\n").unwrap();
+        (tmp, home, source, target)
+    }
+
+    fn snapshot_with_one_write(home: &Path, source: &Path, target: &Path) -> Snapshot {
+        let mut snapshot = Snapshot::create(home, source).unwrap();
+        let origin = snapshot.save(home, target).unwrap();
+        let len = std::fs::metadata(target).unwrap().len();
+        snapshot.record_written(
+            target,
+            origin,
+            crate::apply::digest(b"export A=1\n"),
+            Some(len),
+        );
+        snapshot
+    }
+
+    /// 清单写不下去（磁盘满 / 目录被人删了换成了文件）不能变成 Err：
+    /// 文件已经写了，调用方还欠界面一句「已写 N 个」，撤销入口也得留着。
+    #[test]
+    fn a_failed_manifest_write_becomes_a_warning_not_an_error() {
+        let (_tmp, home, source, target) = world();
+        let snapshot = snapshot_with_one_write(&home, &source, &target);
+
+        // 把备份目录整个换成同名文件：清单再也写不进去。
+        std::fs::remove_dir_all(&snapshot.dir).unwrap();
+        std::fs::write(&snapshot.dir, b"not a dir").unwrap();
+
+        let (summary, warning) = snapshot.commit();
+
+        assert_eq!(
+            (summary.written, summary.failed),
+            (1, 0),
+            "清单失败不能把已经写好的结果抹掉"
+        );
+        let warning = warning.expect("清单没写成必须带一条警告回去");
+        assert!(
+            warning.contains("manifest.json"),
+            "警告要说清是哪个清单没写成：{warning}"
+        );
+    }
+
+    /// 应用中途崩掉也不会丢「哪些已经写了」：每记一项就落一次盘，不等到最后。
+    #[test]
+    fn every_recorded_entry_is_on_disk_before_commit() {
+        let (_tmp, home, source, target) = world();
+        let snapshot = snapshot_with_one_write(&home, &source, &target);
+
+        let manifest = snapshot.dir.join(MANIFEST);
+        let text = std::fs::read_to_string(&manifest).expect("记录一项之后清单就该在盘上");
+        assert!(text.contains(".zshrc"), "清单里要有这一项的路径：{text}");
+        assert!(
+            text.contains("written_len"),
+            "清单里要存下写入长度（指纹之外的第二种比对）：{text}"
+        );
+    }
+
+    /// 没有 `manifest.json` 的半截备份（应用写到一半崩了）也要按 mtime 清掉，
+    /// 否则它永远躺在 `backups/` 里、按 id 排名的保留策略看不见它。
+    #[test]
+    fn prune_removes_manifest_less_dirs_once_they_are_old_enough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("backups");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let orphan = root.join("20200101-000000");
+        std::fs::create_dir_all(orphan.join(FILES)).unwrap();
+        let fresh = root.join(Local::now().format("%Y%m%d-%H%M%S").to_string());
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(
+            fresh.join(MANIFEST),
+            format!(
+                r#"{{"id":"{}","created_at":"刚刚","entries":[]}}"#,
+                fresh.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        // 把孤儿目录的 mtime 拨到 90 天前（std 的 set_times，不引第三方库）。
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+        std::fs::File::open(&orphan)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        prune(&root, KEEP_LATEST, KEEP_DAYS).unwrap();
+
+        assert!(!orphan.exists(), "没有清单的旧备份要按 mtime 清掉");
+        assert!(fresh.exists(), "有清单的新备份不能被顺手删掉");
+    }
 }

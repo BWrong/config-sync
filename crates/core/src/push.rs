@@ -82,6 +82,9 @@ pub struct PushOutcome {
     /// 推送前就已在本地、这次顺手推出去的提交数（不含本次自动提交）；
     /// `0` 且 `committed == false` 才是真的「没有需要推送的改动」。
     pub existing_commits: u32,
+    /// 这次推送前为了对齐设置的分支而切过分支时，给界面的一句话
+    /// （例如「已从 main 切到 trunk 再推送」）；没切过是 `None`。
+    pub switch_note: Option<String>,
 }
 
 impl Core {
@@ -94,8 +97,12 @@ impl Core {
     /// 提交成功而 push 失败是可接受的终态：错误里如实说明「已提交」并带上 git 原始 stderr。
     pub fn commit_and_push(&self) -> Result<PushOutcome, CoreError> {
         // 推送目标分支来自设置：HEAD 不在它上面就先对齐（工作区脏时 ensure_branch 会拒绝，
-        // 绝不把改动静默带到别的分支）。
-        let branch = self.ensure_branch()?.to_string();
+        // 绝不把改动静默带到别的分支）。切过就把这件事告诉界面：否则用户看到「没有需要
+        // 推送的改动」，而刚刚他明明在另一个分支上看到了待推提交。
+        let (branch, switched_from) = self.ensure_branch()?;
+        let switch_note = switched_from
+            .as_ref()
+            .map(|from| format!("已从 {from} 切到 {branch} 再推送"));
         // 一份 GitFacts 同时喂给硬拦与「有没有改动」，不重复跑 `git status`。
         let facts = state::GitFacts::read(&self.source_dir)?;
         let target = PushTarget::read(&self.source_dir, &branch)?;
@@ -112,7 +119,7 @@ impl Core {
         let dirty = facts.dirty_paths().next().is_some();
         // 工作区干净、也没有待推提交：真的没事可做（空仓库同样落在这里）。
         if !dirty && target.ahead == 0 {
-            return Ok(self.outcome(false, 0, String::new(), 0));
+            return Ok(self.outcome(&target, switch_note, false, 0, String::new()));
         }
 
         let mut committed = false;
@@ -161,22 +168,27 @@ impl Core {
             ..e
         })?;
 
-        Ok(self.outcome(committed, files, message, target.ahead))
+        Ok(self.outcome(&target, switch_note, committed, files, message))
     }
 
+    /// 结果里带上「这次究竟对着哪个远端」，远端不叫 origin 时也不能显示成 origin 的地址。
     fn outcome(
         &self,
+        target: &PushTarget,
+        switch_note: Option<String>,
         committed: bool,
         files: u32,
         message: String,
-        existing_commits: u32,
     ) -> PushOutcome {
         PushOutcome {
             committed,
             files,
             message,
-            remote_url: self.remote_url().unwrap_or_default(),
-            existing_commits,
+            remote_url: self
+                .remote_url_of(&target.push_to.remote)
+                .unwrap_or_default(),
+            existing_commits: target.ahead,
+            switch_note,
         }
     }
 }
@@ -215,11 +227,7 @@ impl PushTarget {
         let upstream = upstream.trim();
         // 上游指向本地分支（`branch.<b>.remote = .`）时推不到任何远端，那就不算远端：
         // 回落 origin，否则「推送」会在本地空转一场、远端永远收不到东西。
-        let remote = if upstream.is_empty() || upstream == "." {
-            "origin".to_string()
-        } else {
-            upstream.to_string()
-        };
+        let remote = crate::branch_remote(source_dir, branch);
         let remote_ref = format!("refs/heads/{branch}");
 
         // 比较基准必须是**目标分支**在远端上的 tracking ref：上游可能指向别的远端分支，
@@ -246,7 +254,7 @@ impl PushTarget {
 
 /// 待推区间与硬拦扫描的唯一基准：目标分支在目的远端上的 tracking ref
 /// （`<remote>/<branch>`）；不存在才是 `None`（整棵 HEAD 树）。
-fn destination_base(source_dir: &Path, remote: &str, branch: &str) -> Option<String> {
+pub(crate) fn destination_base(source_dir: &Path, remote: &str, branch: &str) -> Option<String> {
     let base = format!("{remote}/{branch}");
     rev_exists(source_dir, &base).then_some(base)
 }
@@ -255,7 +263,7 @@ fn rev_exists(source_dir: &Path, rev: &str) -> bool {
     git::run(source_dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok()
 }
 
-fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
+pub(crate) fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
     git::run(source_dir, &["rev-list", "--count", rev])
         .ok()?
         .trim()
@@ -554,7 +562,7 @@ fn over_limit(what: String, current: String, cap: String, advice: &str) -> CoreE
     ))
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     if bytes as f64 >= MIB {
         format!("{:.1} MiB", bytes as f64 / MIB)

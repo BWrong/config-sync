@@ -49,6 +49,40 @@ fn rev_exists(source_dir: &Path, rev: &str) -> bool {
     git::run(source_dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok()
 }
 
+/// 设置分支对应的远端名：clone / 拉取 / 推送三条路径共用这一个来源。
+///
+/// 优先用这个分支上游配置的远端名；没有上游、或上游指向本机分支（`remote = .`）时
+/// 回落 `origin`；连 `origin` 都没有而仓库只有一个远端，就用那一个——否则远端改成别的
+/// 名字之后，拉取还在问一个不存在的 `origin`。三条路径同一个远端，才不会各推各的。
+pub(crate) fn branch_remote(source_dir: &Path, branch: &str) -> String {
+    let local_ref = format!("refs/heads/{branch}");
+    let upstream = git::run(
+        source_dir,
+        &[
+            "for-each-ref",
+            "--format=%(upstream:remotename)",
+            &local_ref,
+        ],
+    )
+    .unwrap_or_default();
+    let upstream = upstream.trim();
+    if !upstream.is_empty() && upstream != "." {
+        return upstream.to_string();
+    }
+
+    let remotes = git::run(source_dir, &["remote"]).unwrap_or_default();
+    let mut names: Vec<&str> = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.contains(&"origin") || names.len() != 1 {
+        "origin".to_string()
+    } else {
+        names.remove(0).to_string()
+    }
+}
+
 impl Core {
     /// `home` 是镜像布局的根（目标文件根），`source_dir` 是 git 工作区。
     pub fn new(home: impl Into<PathBuf>, source_dir: impl Into<PathBuf>, config: Config) -> Self {
@@ -121,12 +155,12 @@ impl Core {
         Ok(branch)
     }
 
-    /// 保证源目录的 HEAD 就在设置的分支上，返回那个分支名。
+    /// 保证源目录的 HEAD 就在设置的分支上，返回那个分支名，以及切之前在哪里（没切是 `None`）。
     ///
     /// 当前分支与设置不一致时：工作区干净就切过去（本地有就 `switch`，只有远端有就
     /// `switch -c --track`）；有未提交改动就拒绝并说清楚——切分支会把这些改动带走，
     /// 撞上冲突还会半途失败，宁可停下。拒绝时一个字节都不动，没有丢任何改动。
-    fn ensure_branch(&self) -> Result<&str, CoreError> {
+    fn ensure_branch(&self) -> Result<(String, Option<String>), CoreError> {
         let branch = self.branch()?;
         if !self.has_repo() {
             return Err(CoreError::io(format!(
@@ -137,7 +171,7 @@ impl Core {
 
         let current = git::run(&self.source_dir, &["branch", "--show-current"])?;
         if current == branch {
-            return Ok(branch);
+            return Ok((branch.to_string(), None));
         }
         if current.is_empty() {
             return Err(CoreError::io(format!(
@@ -156,7 +190,9 @@ impl Core {
         }
 
         let local = format!("refs/heads/{branch}");
-        let tracking = format!("origin/{branch}");
+        // 远端名与推送同源：远端不叫 origin 时这里也得问同一个地方。
+        let remote = branch_remote(&self.source_dir, branch);
+        let tracking = format!("{remote}/{branch}");
         if rev_exists(&self.source_dir, &local) {
             git::run(&self.source_dir, &["switch", branch])?;
         } else if rev_exists(&self.source_dir, &tracking) {
@@ -166,11 +202,11 @@ impl Core {
             )?;
         } else {
             return Err(CoreError::io(format!(
-                "源目录当前在 {current} 上，设置的分支 {branch} 本地和 origin 上都没有；\
+                "源目录当前在 {current} 上，设置的分支 {branch} 本地和 {remote} 上都没有；\
                  先确认分支名，或拉取一次让它出现"
             )));
         }
-        Ok(branch)
+        Ok((branch.to_string(), Some(current)))
     }
 
     /// 拉取：`fetch` 之后只允许 `merge --ff-only`。
@@ -179,24 +215,26 @@ impl Core {
     /// 任何会生成 merge commit 的路径都不存在：不能快进就直接拒绝（附带 git 原始 stderr），
     /// 源目录保持原样。
     pub fn pull(&self) -> Result<(), CoreError> {
-        let remote_url = self.remote_url().map_err(|e| CoreError {
-            message: "源目录没有配置远端，无法拉取".to_string(),
-            ..e
-        })?;
-
         // 分支来自设置，不需要先有上游：`fetch` 显式给出 refspec，源目录没有
         // `remote.origin.fetch`（clone 之外建的仓库）也不会「fetch 完什么都没更新」。
-        let branch = self.ensure_branch()?;
-        let fetched = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        // 远端名与推送同源（上游配置 - 回落 origin）：三条路径必须对着同一个远端，
+        // 否则远端不叫 origin 时，推送能出去、拉取却在问一个不存在的远端。
+        let (branch, _switched) = self.ensure_branch()?;
+        let remote = branch_remote(&self.source_dir, &branch);
+        let remote_url = self.remote_url_of(&remote).map_err(|e| CoreError {
+            message: format!("源目录没有配置远端 {remote}，无法拉取"),
+            ..e
+        })?;
+        let fetched = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
 
-        git::run(&self.source_dir, &["fetch", "origin", &fetched]).map_err(|e| CoreError {
+        git::run(&self.source_dir, &["fetch", &remote, &fetched]).map_err(|e| CoreError {
             message: format!(
                 "拉取失败：无法从远端 {remote_url} 取回最新提交（远端可能没有 {branch} 分支）"
             ),
             ..e
         })?;
 
-        let upstream = format!("origin/{branch}");
+        let upstream = format!("{remote}/{branch}");
         git::run(&self.source_dir, &["merge", "--ff-only", &upstream]).map_err(|e| CoreError {
             message: format!(
                 "拉取被拒：无法快进到 {upstream}（本机有远端没有的提交，或工作区改动挡住了合并），\
@@ -210,7 +248,12 @@ impl Core {
 
     /// 源目录里 `origin` 的地址；设置面板用它显示"当前对着哪个远端"。
     pub fn remote_url(&self) -> Result<String, CoreError> {
-        git::run(&self.source_dir, &["remote", "get-url", "origin"])
+        self.remote_url_of("origin")
+    }
+
+    /// 指定远端名的地址：拉取按上游配置的远端名取地址，不能只看 `origin`。
+    fn remote_url_of(&self, remote: &str) -> Result<String, CoreError> {
+        git::run(&self.source_dir, &["remote", "get-url", remote])
     }
 
     /// 写入或替换 origin 的地址；不动分支、提交和工作区。
@@ -542,7 +585,10 @@ impl Core {
     }
 
     /// 顶部状态条：分支、ahead/behind、未提交改动数。
-    /// 状态条那一半：分支、ahead/behind、未提交改动数，全部取自同一份 git 事实。
+    ///
+    /// 设置的分支就是「推送会送到哪里」：两者不一致时状态条要说清（`setting` 非空），
+    /// ahead/behind 也按**目标分支**的远端跟踪 ref 算——按当前分支的 `@{u}` 算出来的数
+    /// 会和点下推送后的结果对不上（同一个会话里两个数字互相打脸）。
     fn status(&self, facts: &state::GitFacts) -> Result<RepoStatus, CoreError> {
         let branch = facts.branch();
         if branch.is_empty() {
@@ -553,13 +599,36 @@ impl Core {
             });
         }
 
-        let (ahead, behind) = facts.ahead_behind();
+        let setting = self.config.branch.trim().to_string();
+        let dirty = facts.dirty_count();
+        if setting.is_empty() || setting == branch {
+            let (ahead, behind) = facts.ahead_behind();
+            return Ok(RepoStatus {
+                branch: branch.to_string(),
+                ahead,
+                behind,
+                dirty,
+                setting: None,
+            });
+        }
+
+        // 目标分支在目的远端上的 tracking ref 才是推送的起点；没有它时整树都算待推。
+        let remote = branch_remote(&self.source_dir, &setting);
+        let count = |rev: String| push::count_commits(&self.source_dir, &rev).unwrap_or(0);
+        let (ahead, behind) = match push::destination_base(&self.source_dir, &remote, &setting) {
+            Some(base) => (
+                count(format!("{base}..HEAD")),
+                count(format!("HEAD..{base}")),
+            ),
+            None => (count("HEAD".to_string()), 0),
+        };
 
         Ok(RepoStatus {
             branch: branch.to_string(),
             ahead,
             behind,
-            dirty: facts.dirty_count(),
+            dirty,
+            setting: Some(setting),
         })
     }
 }

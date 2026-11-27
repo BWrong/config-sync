@@ -280,3 +280,121 @@ fn push_refuses_to_switch_branches_with_uncommitted_changes() {
         "远端不该收到任何东西"
     );
 }
+
+/// 状态条与推送必须说同一件事：设置的分支是 `trunk`、HEAD 在 `main` 时，
+/// 状态条要标出设置的分支，ahead/behind 也要按 `trunk` 的远端跟踪 ref 算。
+/// 按当前分支的 `@{u}` 算出来的数字会和点下推送之后的结果对不上。
+#[test]
+fn the_status_bar_counts_against_the_configured_branch_and_says_so() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    // 远端有一个 trunk，且比 HEAD 多两个提交；本地 main 与自己的上游是齐的。
+    let other = f.other();
+    f.git_at(&other, &["checkout", "-q", "-b", "trunk"]);
+    for content in ["export T1=1\n", "export T2=2\n"] {
+        std::fs::write(other.join("home/.zshrc"), content).unwrap();
+        f.git_at(&other, &["add", "-A"]);
+        f.git_at(&other, &["commit", "-m", "config-sync: 1 files"]);
+    }
+    f.git_at(&other, &["push", "origin", "trunk"]);
+    f.git(&[
+        "fetch",
+        "-q",
+        "origin",
+        "+refs/heads/trunk:refs/remotes/origin/trunk",
+    ]);
+    assert_eq!(
+        f.git(&["rev-list", "--count", "HEAD..origin/main"]),
+        "0",
+        "当前分支自己与上游是齐的：按 @{{u}} 算会得到 0/0"
+    );
+
+    let status = core_on(&f, "trunk").repo_status().unwrap();
+
+    assert_eq!(status.branch, "main");
+    assert_eq!(
+        status.setting.as_deref(),
+        Some("trunk"),
+        "设置的分支与当前分支不一致时必须标出来：{status:?}"
+    );
+    assert_eq!(
+        (status.ahead, status.behind),
+        (0, 2),
+        "ahead/behind 要对着目标分支 trunk 算，而不是当前分支的 @{{u}}：{status:?}"
+    );
+}
+
+/// 推送把 HEAD 切到设置的分支时，结果里要带上「从哪儿切到哪儿」：
+/// 否则用户刚在 main 上看到的待推提交，在「没有需要推送的改动」之后就像凭空消失了。
+#[test]
+fn push_reports_the_branch_it_switched_from() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    f.git(&["push", "-q", "origin", "main:trunk"]);
+    f.git(&[
+        "fetch",
+        "-q",
+        "origin",
+        "+refs/heads/trunk:refs/remotes/origin/trunk",
+    ]);
+    // 本地 main 上多一个没推的提交：状态条（按 @{u}）会显示 ahead 1。
+    f.write_source("home/.zshrc", "export A=1\nexport LOCAL=2\n");
+    f.commit_all("config-sync: 1 files");
+
+    let outcome = core_on(&f, "trunk")
+        .commit_and_push()
+        .expect("干净的工作区应该能切到设置的分支再推送");
+
+    assert_eq!(f.git(&["branch", "--show-current"]), "trunk");
+    assert_eq!(
+        outcome.switch_note.as_deref(),
+        Some("已从 main 切到 trunk 再推送"),
+        "切过分支就必须说出来：{outcome:?}"
+    );
+    assert!(!outcome.committed);
+    assert_eq!(outcome.existing_commits, 0, "trunk 上确实没有待推提交");
+    assert_eq!(
+        f.git(&["rev-list", "--count", "origin/main..main"]),
+        "1",
+        "main 上那个提交还在本地，不该被抹掉"
+    );
+}
+
+/// 远端不叫 `origin` 时，拉取要认上游配置的远端名（与推送同源），
+/// 而不是硬编码一个不存在的 `origin`。
+#[test]
+fn pull_follows_the_upstream_remote_name_not_a_hardcoded_origin() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    f.git(&["remote", "rename", "origin", "fork"]);
+
+    let other = f.other();
+    std::fs::write(other.join("home/.zshrc"), "export B=9\n").unwrap();
+    f.git_at(&other, &["add", "-A"]);
+    f.git_at(&other, &["commit", "-m", "config-sync: 1 files"]);
+    f.git_at(&other, &["push", "origin", "main"]);
+    let remote_head = f.git_remote(&["rev-parse", "main"]);
+
+    core.pull()
+        .expect("远端改名为 fork 之后，拉取也要跟着上游的远端名走");
+
+    assert_eq!(f.head_sha(), remote_head, "远端的新提交要落下来");
+    assert!(!f.is_dirty(), "快进之后工作区必须是干净的");
+
+    // 推送结果里显示的地址也得是这个远端，不能还去问一个不存在的 origin。
+    let outcome = core
+        .commit_and_push()
+        .expect("远端改名之后推送也要对着 fork");
+    assert_eq!(
+        outcome.remote_url,
+        f.remote_url(),
+        "结果里要显示真正推送去的那个远端"
+    );
+}

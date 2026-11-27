@@ -39,6 +39,8 @@ interface RepoStatus {
   ahead: number;
   behind: number;
   dirty: number;
+  /** 设置里的分支与当前分支不一致时是那个分支（此时 ahead/behind 按它算）；一致时为 null。 */
+  setting: string | null;
 }
 
 /** 与 Core 的 `Refresh` 一一对应：清单与状态条出自同一次 `git status`。 */
@@ -56,6 +58,8 @@ interface PushOutcome {
   remote_url: string;
   /** 推送前就已在本地、这次一并推出去的提交数（不含本次自动提交）。 */
   existing_commits: number;
+  /** 这次推送前为了对齐设置的分支而切过分支时的一句话（例：已从 main 切到 trunk 再推送）。 */
+  switch_note: string | null;
 }
 
 interface CoreError {
@@ -129,6 +133,8 @@ type ApplyResult = "Written" | { Failed: { message: string } };
 interface ApplyOutcome {
   target: string;
   result: ApplyResult;
+  /** 文件已经写了、但清单没落盘时的整次警告；有它就不给撤销入口，但写入结果照常展示。 */
+  warning: string | null;
 }
 
 /** 备份摘要：`list_backups` 回来的，新的在前。 */
@@ -310,10 +316,17 @@ function markBusy(button: HTMLButtonElement, busy: boolean, label: string): void
 }
 
 function statusBar(status: RepoStatus): string {
+  // 推送送到的是「设置的分支」，不一定是 HEAD 所在的那一个：两者不一致时状态条必须说清楚，
+  // 否则用户会照着这里的分支名理解「已经推完了」，而另一个分支上的提交其实还躺在本地。
+  const branchChip = status.setting
+    ? `<span class="chip" title="推送会送到设置的分支；源目录当前不在它上面">设置分支 <b>${escapeHtml(
+        status.setting,
+      )}</b>（当前在 ${escapeHtml(status.branch)}）</span>`
+    : `<span class="chip">分支 <b>${escapeHtml(status.branch)}</b></span>`;
   return `
     <header class="bar">
       <span class="chips">
-        <span class="chip">分支 <b>${escapeHtml(status.branch)}</b></span>
+        ${branchChip}
         <span class="chip">${glyph("arrowUp", 11)}${status.ahead} ${glyph("arrowDown", 11)}${status.behind}</span>
         <span class="chip">未提交 <b>${status.dirty}</b></span>
       </span>
@@ -325,6 +338,13 @@ ${SETTINGS_BUTTON}
 /** 本机与远端不一致时给一句话：该推送还是该拉取，一眼看得见。 */
 function pendingHint(status: RepoStatus): string {
   const parts: string[] = [];
+  if (status.setting) {
+    parts.push(
+      `<span>推送会把源目录切到设置的分支 <b>${escapeHtml(
+        status.setting,
+      )}</b> 再推；工作区有未提交改动时会先拒绝</span>`,
+    );
+  }
   if (status.dirty > 0) {
     parts.push(`<span>${glyph("dot", 13)}本机有 ${status.dirty} 处改动还没提交，推送会一并提交</span>`);
   }
@@ -599,16 +619,20 @@ async function pushChanges(): Promise<void> {
   try {
     const outcome = await invoke<PushOutcome>("commit_and_push");
     const remote = `<code>${escapeHtml(outcome.remote_url)}</code>`;
+    // 切过分支就先说这一句：不说的话，「没有需要推送的改动」会让人以为刚才看到的东西消失了。
+    const switchNote = outcome.switch_note
+      ? `<p class="pending-hint"><span>${escapeHtml(outcome.switch_note)}</span></p>`
+      : "";
     if (outcome.committed) {
       // dirty + ahead 同时存在时，这次推送送出去的是「新提交 + 本机已有提交」，两句都说清楚。
       const also = outcome.existing_commits > 0 ? `，并把本机已有的 ${outcome.existing_commits} 个提交一并推上去` : "";
-      pushReportHtml = `<p class="add-summary">已提交并推送 ${outcome.files} 个文件${also}到 ${remote}：${escapeHtml(
+      pushReportHtml = `${switchNote}<p class="add-summary">已提交并推送 ${outcome.files} 个文件${also}到 ${remote}：${escapeHtml(
         outcome.message,
       )}</p>`;
     } else if (outcome.existing_commits > 0) {
-      pushReportHtml = `<p class="add-summary">已推送 ${outcome.existing_commits} 个本机已有提交到 ${remote}。</p>`;
+      pushReportHtml = `${switchNote}<p class="add-summary">已推送 ${outcome.existing_commits} 个本机已有提交到 ${remote}。</p>`;
     } else {
-      pushReportHtml = `<p class="add-summary">没有需要推送的改动。</p>`;
+      pushReportHtml = `${switchNote}<p class="add-summary">没有需要推送的改动。</p>`;
     }
   } catch (error) {
     pushReportHtml = errorPanel(error);
@@ -810,6 +834,11 @@ function applyReport(outcomes: ApplyOutcome[], undoId: string | null): string {
       )}</li>`,
     ];
   });
+  // 清单没写成时文件其实已经写了：这条警告不能吞掉「已写 N 个」，也不能吞掉撤销入口。
+  const warnings = [...new Set(outcomes.map((outcome) => outcome.warning).filter((w): w is string => !!w))];
+  for (const warning of warnings) {
+    notes.push(`<li>文件已经写了，但备份清单没落盘：${escapeHtml(warning)}</li>`);
+  }
   // 撤销只在这份结果下面出现一次：它就是刚才那次应用留下的快照。
   const undo = undoId
     ? `<button type="button" class="undo-apply" data-undo-apply="${escapeHtml(undoId)}"

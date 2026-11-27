@@ -294,3 +294,122 @@ fn restore_rechecks_the_target_between_preview_and_execution() {
     );
     assert_eq!(f.read_home(".zshrc"), "export LATE=1\n");
 }
+
+/// 恢复计划是前端回传的：一份被改过的计划不能让「备份目录里的任意文件」写到「任意路径」。
+#[test]
+fn restore_refuses_a_plan_that_points_outside_home_or_outside_the_backup() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let target = f.write_home(".zshrc", "export OLD=1\n");
+    f.write_source("home/.zshrc", "export NEW=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    core.execute_apply(&core.plan_apply(None).unwrap()).unwrap();
+
+    // ① 目标不在 $HOME 下：apply 侧一直守着这条，恢复这边也得守。
+    let mut plan = core.plan_restore_backup(&latest_id(&core)).unwrap();
+    plan.items[0].target = f.tmp_root().join("outside/.zshrc");
+    let outcomes = core.restore_backup(&plan).unwrap();
+    match &outcomes[0].result {
+        RestoreResult::Failed { message } => assert!(
+            message.contains("不在"),
+            "拒绝理由要说清目标不在 $HOME 下：{message}"
+        ),
+        other => panic!("越界的恢复必须失败：{other:?}"),
+    }
+    assert!(
+        !f.tmp_root().join("outside/.zshrc").exists(),
+        "一个字节都不许写"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "export NEW=1\n",
+        "被拒绝的计划不能动真目标"
+    );
+
+    // ② 备份文件不在 `backups/<id>/` 里（`..` 跳出去）：不许 join 完就去读。
+    let mut plan = core.plan_restore_backup(&latest_id(&core)).unwrap();
+    plan.items[0].file = Some(std::path::PathBuf::from("../manifest.json"));
+    plan.items[0].target = target.clone();
+    let outcomes = core.restore_backup(&plan).unwrap();
+    match &outcomes[0].result {
+        RestoreResult::Failed { message } => assert!(
+            message.contains("不是备份目录内"),
+            "拒绝理由要说清这份备份文件不在备份目录里：{message}"
+        ),
+        other => panic!("越界的备份文件必须失败：{other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "export NEW=1\n");
+}
+
+/// 撤销预览不许为了一个 200MB 的文件把 400MB 读进内存：先看大小，超了只让人去编辑器里对比。
+#[test]
+fn restore_preview_skips_a_file_that_is_too_large_to_read() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let target = f.write_home(".zshrc", "export A=1\n");
+    f.write_source("home/.zshrc", "export B=2\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    core.execute_apply(&core.plan_apply(None).unwrap()).unwrap();
+
+    // 应用之后用户把它撑到 65 MiB（比单个文件硬上限 64 MiB 大一点）。
+    let huge = 65 * 1024 * 1024;
+    std::fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_len(huge)
+        .unwrap();
+
+    let plan = core.plan_restore_backup(&latest_id(&core)).unwrap();
+    let item = &plan.items[0];
+    assert_eq!(item.action, RestoreAction::Skip, "{item:?}");
+    assert!(
+        item.reason.contains("太大"),
+        "超限要说清「太大、去编辑器里对比」：{}",
+        item.reason
+    );
+    assert!(item.diff.is_empty(), "超限不生成 diff");
+    assert!(!item.conflict, "太大不是冲突，别混成一种提示");
+}
+
+/// 指纹被写进清单、几天后又读回来比对：必须是稳定哈希（FNV-1a 64，常量写死在代码里），
+/// 外加长度做第二道保险。换成 `DefaultHasher` 之类跨版本不稳的哈希，这条会红。
+#[test]
+fn the_manifest_stores_a_stable_digest_and_the_written_length() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_home(".zshrc", "export A=1\n");
+    let source = "export A=1\nexport B=2\n";
+    f.write_source("home/.zshrc", source);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    core.execute_apply(&core.plan_apply(None).unwrap()).unwrap();
+
+    // 手算一遍 FNV-1a 64：这份十六进制串不随 toolchain 变。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let manifest = std::fs::read_to_string(
+        backup_root(&f.home)
+            .join(latest_id(&core))
+            .join("manifest.json"),
+    )
+    .expect("清单要在盘上");
+    assert!(
+        manifest.contains(&format!("\"{hash:016x}\"")),
+        "清单里的指纹必须等于 FNV-1a 64 的手算值：{manifest}"
+    );
+    assert!(
+        manifest.contains(&format!("\"written_len\": {}", source.len())),
+        "清单还要存下写入长度做双保险：{manifest}"
+    );
+
+    // 长度对得上、内容被改过：仍然判冲突（指纹是主判据）。
+    let mut plan = core.plan_restore_backup(&latest_id(&core)).unwrap();
+    plan.items[0].expected_len = Some(source.len() as u64);
+    assert_eq!(plan.items[0].action, RestoreAction::Restore);
+}
