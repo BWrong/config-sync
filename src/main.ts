@@ -319,9 +319,9 @@ function statusBar(status: RepoStatus): string {
   // 推送送到的是「设置的分支」，不一定是 HEAD 所在的那一个：两者不一致时状态条必须说清楚，
   // 否则用户会照着这里的分支名理解「已经推完了」，而另一个分支上的提交其实还躺在本地。
   const branchChip = status.setting
-    ? `<span class="chip" title="推送会送到设置的分支；源目录当前不在它上面">设置分支 <b>${escapeHtml(
+    ? `<span class="chip" title="推送会送到设置的分支；源目录当前不在它上面，推送前会先切过去">设置分支 <b>${escapeHtml(
         status.setting,
-      )}</b>（当前在 ${escapeHtml(status.branch)}）</span>`
+      )}</b>（当前在 ${escapeHtml(status.branch)}，还没切过去）</span>`
     : `<span class="chip">分支 <b>${escapeHtml(status.branch)}</b></span>`;
   return `
     <header class="bar">
@@ -800,8 +800,11 @@ async function confirmApply(): Promise<void> {
   applySummary = null;
   if (outcomes) {
     // 最新一份备份就是刚才这次；一个文件都没写成时没有可撤销的东西。
+    // 清单没落盘时也拿不到这份备份（list_backups 过滤没有清单的目录），
+    // 回落问「最新一份」会拿到上一次的 id，撤销按钮就指向了别的快照——宁可不给。
     const written = outcomes.filter((outcome) => outcome.result === "Written").length;
-    applyReportHtml = applyReport(outcomes, written ? await latestBackup() : null);
+    const warned = outcomes.some((outcome) => outcome.warning);
+    applyReportHtml = applyReport(outcomes, written && !warned ? await latestBackup() : null);
   }
   await renderInventory();
 }
@@ -834,7 +837,8 @@ function applyReport(outcomes: ApplyOutcome[], undoId: string | null): string {
       )}</li>`,
     ];
   });
-  // 清单没写成时文件其实已经写了：这条警告不能吞掉「已写 N 个」，也不能吞掉撤销入口。
+  // 清单没写成时文件其实已经写了：这条警告不能吞掉「已写 N 个」；
+  // 撤销入口此时由调用方按同一条口径关掉（拿不到本次的备份 id）。
   const warnings = [...new Set(outcomes.map((outcome) => outcome.warning).filter((w): w is string => !!w))];
   for (const warning of warnings) {
     notes.push(`<li>文件已经写了，但备份清单没落盘：${escapeHtml(warning)}</li>`);

@@ -612,15 +612,21 @@ impl Core {
             });
         }
 
-        // 目标分支在目的远端上的 tracking ref 才是推送的起点；没有它时整树都算待推。
+        // 状态条上的数字必须等于「按下推送真会送出多少」：推送从设置分支自己的本地 ref
+        // 出发、落到它的远端跟踪 ref，所以区间两端都用设置分支，不用 HEAD（HEAD 可能停在
+        // 别的分支上，那样数出来既不是当前分支也不是设置分支的）。
         let remote = branch_remote(&self.source_dir, &setting);
         let count = |rev: String| push::count_commits(&self.source_dir, &rev).unwrap_or(0);
+        let local = rev_exists(&self.source_dir, &format!("refs/heads/{setting}"));
         let (ahead, behind) = match push::destination_base(&self.source_dir, &remote, &setting) {
-            Some(base) => (
-                count(format!("{base}..HEAD")),
-                count(format!("HEAD..{base}")),
+            Some(base) if local => (
+                count(format!("{base}..{setting}")),
+                count(format!("{setting}..{base}")),
             ),
-            None => (count("HEAD".to_string()), 0),
+            // 本地还没有这个分支：推送会先按远端建它（或新建一条空分支），没有待推的东西，
+            // 也谈不上落后；状态条上的「还没切过去」就是说的这一档。
+            Some(_) => (0, 0),
+            None => (count(setting.clone()), 0),
         };
 
         Ok(RepoStatus {

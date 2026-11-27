@@ -457,6 +457,8 @@ pub(crate) fn line_count(bytes: &[u8]) -> usize {
 /// 内容指纹：FNV-1a 64。`DefaultHasher` 不保证跨 Rust 版本稳定，而这份指纹会被写进
 /// 备份清单、几天后再读回来比对——换了 toolchain 旧备份就全被判成「被改过」
 /// （方向是 fail-closed，但等于旧备份全废）。FNV-1a 的常量写死在代码里，永远稳定。
+/// 换哈希本身会让 `DefaultHasher` 时代的清单必然判成「被改过」；撤销功能发布前不存在
+/// 这类清单，所以不写迁移——真需要读那种清单时按 `written_len` 重新认一遍即可。
 pub(crate) fn digest(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {

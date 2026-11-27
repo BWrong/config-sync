@@ -413,3 +413,46 @@ fn the_manifest_stores_a_stable_digest_and_the_written_length() {
     plan.items[0].expected_len = Some(source.len() as u64);
     assert_eq!(plan.items[0].action, RestoreAction::Restore);
 }
+
+/// 前端拿「最新一份备份」当「刚才这次」用（`list_backups()[0]`）。
+/// 清单没落盘的目录不在列表里——否则一次「文件写了、清单没写成」的应用会拿到上一份的 id，
+/// 「撤销这次应用」就按更早的状态往回写。这条就是那 2 行前端判断的后端依据。
+#[test]
+fn a_backup_dir_without_a_manifest_is_never_offered_as_the_latest_one() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let target = f.write_home(".zshrc", "export OLD=1\n");
+
+    // 第一次应用：写了一份完整备份。
+    f.write_source("home/.zshrc", "export NEW=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    core.execute_apply(&core.plan_apply(None).unwrap()).unwrap();
+    let first = latest_id(&core);
+
+    // 第二次应用：又是一份备份，然后模拟「清单没落盘」。
+    f.write_source("home/.zshrc", "export NEWER=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    core.execute_apply(&core.plan_apply(None).unwrap()).unwrap();
+    let second = latest_id(&core);
+    assert_ne!(first, second, "两次应用各留一份备份");
+    std::fs::remove_file(backup_root(&f.home).join(&second).join("manifest.json")).unwrap();
+
+    let listed: Vec<String> = core
+        .list_backups()
+        .unwrap()
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(
+        listed,
+        vec![first.clone()],
+        "没有清单的那份不能被当成「最新一份」：否则撤销按钮会指向 {first} 而不是刚才那次"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "export NEWER=1\n",
+        "列表变化不该动目标文件"
+    );
+}

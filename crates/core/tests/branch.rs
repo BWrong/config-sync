@@ -305,6 +305,10 @@ fn the_status_bar_counts_against_the_configured_branch_and_says_so() {
         "origin",
         "+refs/heads/trunk:refs/remotes/origin/trunk",
     ]);
+    // 本地也有一条 trunk，停在远端的前一个提交上：落后的就是那两个。
+    let base = f.head_sha();
+    f.git(&["branch", "trunk", &base]);
+    f.git(&["branch", "--set-upstream-to=origin/trunk", "trunk"]);
     assert_eq!(
         f.git(&["rev-list", "--count", "HEAD..origin/main"]),
         "0",
@@ -322,7 +326,49 @@ fn the_status_bar_counts_against_the_configured_branch_and_says_so() {
     assert_eq!(
         (status.ahead, status.behind),
         (0, 2),
-        "ahead/behind 要对着目标分支 trunk 算，而不是当前分支的 @{{u}}：{status:?}"
+        "ahead/behind 要对着设置分支 trunk 自己的 ref 算，而不是当前分支的 @{{u}}：{status:?}"
+    );
+}
+
+/// 状态条的数字必须等于「按下推送真会送出多少」。
+/// 反例：本地 trunk 比 origin/trunk 多 3 个提交，HEAD 停在 main 上、main 比 origin/trunk
+/// 多 1 个——按 `<base>..HEAD` 算会显示 1，而推送切到 trunk 之后真送 3 个。
+#[test]
+fn the_status_bar_counts_what_a_push_would_really_send() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+
+    f.git(&["switch", "-q", "-c", "trunk"]);
+    f.git(&["push", "-q", "-u", "origin", "trunk"]);
+    for index in 0..3 {
+        f.write_source(&format!("home/trunk-{index}"), "x\n");
+        f.commit_all(&format!("config-sync: trunk {index}"));
+    }
+    f.git(&["switch", "-q", "main"]);
+    f.write_source("home/main-only", "y\n");
+    f.commit_all("config-sync: main only");
+
+    assert_eq!(
+        f.git(&["rev-list", "--count", "origin/trunk..HEAD"]),
+        "1",
+        "按 HEAD 算只有 main 上那 1 条，trunk 上的 3 条会被吞掉——这正是要避免的口径"
+    );
+
+    let core = core_on(&f, "trunk");
+    let status = core.repo_status().unwrap();
+    assert_eq!(status.branch, "main");
+    assert_eq!(status.setting.as_deref(), Some("trunk"));
+    assert_eq!(
+        status.ahead, 3,
+        "设置分支 trunk 有 3 个未推提交：{status:?}"
+    );
+
+    let outcome = core.commit_and_push().unwrap();
+    assert_eq!(
+        status.ahead, outcome.existing_commits,
+        "状态条上的 ahead 必须等于推送真送出的提交数"
     );
 }
 
@@ -341,6 +387,10 @@ fn push_reports_the_branch_it_switched_from() {
         "origin",
         "+refs/heads/trunk:refs/remotes/origin/trunk",
     ]);
+    // 本地也有一条 trunk，停在远端的前一个提交上：落后的就是那两个。
+    let base = f.head_sha();
+    f.git(&["branch", "trunk", &base]);
+    f.git(&["branch", "--set-upstream-to=origin/trunk", "trunk"]);
     // 本地 main 上多一个没推的提交：状态条（按 @{u}）会显示 ahead 1。
     f.write_source("home/.zshrc", "export A=1\nexport LOCAL=2\n");
     f.commit_all("config-sync: 1 files");
