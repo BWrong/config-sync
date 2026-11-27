@@ -1,7 +1,7 @@
 //! 源目录的 fs watch：编辑器保存后让前端自己重读清单，界面上就没有「刷新」按钮。
 //!
 //! 只监视源目录 `home/` 子树（受管副本），**永远不写** `$HOME` 里的目标文件。
-//! 事件合并了才发一次 `inventory-changed`，前端收到就重跑 `inventory` + `repo_status`。
+//! 事件合并了才发一次 `inventory-changed`，前端收到就重跑一次 `refresh`。
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
