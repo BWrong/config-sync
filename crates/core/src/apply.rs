@@ -188,7 +188,7 @@ impl Core {
         }
 
         // 清单写不下去不算这次应用失败：文件其实已经写了，把它降级成警告带回去，
-        // 「已写 N 个」和撤销入口都不会因此消失（清单每记一项就会落一次盘）。
+        // 「已写 N 个」和撤销入口都不会因此消失（清单每批已经落过盘，这次只是再落一次）。
         let (_, warning) = snapshot.commit();
         attach_warning(&mut outcomes, warning);
         Ok(outcomes)
