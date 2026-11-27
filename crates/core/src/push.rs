@@ -129,10 +129,18 @@ impl Core {
             committed = true;
         }
 
-        // 第一次推送没有上游，顺手建立跟踪（拉取那边靠它判断能否 fetch）。
-        let push: Vec<&str> = match target.upstream {
-            Some(_) => vec!["push"],
-            None => vec!["push", "-u", "origin", &target.branch],
+        // 推送目标必须显式写出来：裸 `git push` 服从 `push.default`，配成 `matching` 时
+        // 会把远端已有的同名分支一起推上去，而那些分支不在本次扫描范围内。
+        // `--no-follow-tags` 同理，堵住 `push.followTags=true` 顺手推 tag。
+        let push: Vec<&str> = match target.upstream.as_deref() {
+            Some(upstream) => vec![
+                "push",
+                "--no-follow-tags",
+                remote_of(upstream),
+                &target.branch,
+            ],
+            // 第一次推送没有上游，顺手建立跟踪（拉取那边靠它判断能否 fetch）。
+            None => vec!["push", "--no-follow-tags", "-u", "origin", &target.branch],
         };
         git::run(&self.source_dir, &push).map_err(|e| CoreError {
             message: if committed {
@@ -391,18 +399,17 @@ fn pending_blobs(
     let mut seen_blob: HashSet<String> = HashSet::new();
     let mut total: u64 = 0;
     for (oid, listed_path) in objects {
-        let Some((kind, size)) = metas.get(&oid) else {
-            continue;
-        };
+        // 名单来自 rev-list，问不到类型就是仓库缺对象：宁可中止也不能当成「没内容可扫」。
+        let (kind, size) = metas.get(&oid).ok_or_else(|| missing_object(&oid))?;
         if kind != "blob" || !seen_blob.insert(oid.clone()) {
             continue;
         }
         // 优先用 raw diff 给的完整路径；没有 diff 记录（如 merge 带进来的内容）才退回 rev-list 的。
-        let path = paths.get(&oid).cloned().unwrap_or(listed_path);
-        let path = if path.is_empty() {
-            "（路径未知）".to_string()
-        } else {
-            path
+        let path = match paths.get(&oid).filter(|path| !path.is_empty()) {
+            Some(path) => path.clone(),
+            // rev-list 的路径会被换行截断，只当兜底；连它都没有就点名 oid，别只说「未知」。
+            None if !listed_path.is_empty() => listed_path,
+            None => format!("（路径未知，blob {oid}）"),
         };
         if *size > MAX_BLOB_BYTES {
             return Err(over_limit(
@@ -437,23 +444,17 @@ fn pending_blobs(
 
 /// `git rev-list --objects` 的输出：每行 `<oid>[ <path>]`。
 ///
-/// oid 永远在行首，所以 blob 名单完整；但路径只作兜底（带换行的路径会被截断，
-/// 完整路径由 `parse_raw_paths` 提供）。
+/// 这里只要对象名单，所以按行首 oid 取。路径只作兜底：带换行的路径会被**截断**
+/// （实测换行之后的全部内容都不出现在输出里，也就不会留下续行），所以没有「续行看起来
+/// 像新记录」的歧义；完整路径由 `parse_raw_paths` 从 `log --raw -z` 取。
 fn parse_objects(raw: &str) -> Vec<(String, String)> {
-    let mut objects: Vec<(String, String)> = Vec::new();
-    for line in raw.lines() {
-        match line.split_once(' ') {
-            Some((oid, path)) if is_oid(oid) => objects.push((oid.to_string(), path.to_string())),
-            None if is_oid(line) => objects.push((line.to_string(), String::new())),
-            _ => {
-                if let Some((_, path)) = objects.last_mut() {
-                    path.push('\n');
-                    path.push_str(line);
-                }
-            }
-        }
-    }
-    objects
+    raw.lines()
+        .filter_map(|line| match line.split_once(' ') {
+            Some((oid, path)) if is_oid(oid) => Some((oid.to_string(), path.to_string())),
+            _ if is_oid(line) => Some((line.to_string(), String::new())),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_oid(text: &str) -> bool {
@@ -504,8 +505,8 @@ fn parse_raw_paths(raw: &str) -> HashMap<String, String> {
 
 /// `cat-file --batch-check` 问一批对象：oid → (类型, 字节数)。
 ///
-/// 每行都解析不了就整次报错；`missing` 是 `parse_objects` 的解析残留（假 oid），
-/// 它对应的对象不存在、没有内容可扫，不算漏扫。
+/// 每行都要对得上查询：`missing` 说明 rev-list 列出的对象在仓库里不存在，
+/// 那部分内容就扫不到 —— fail-closed，整次中止并点名 oid。
 fn cat_file_meta(
     source_dir: &Path,
     specs: &[String],
@@ -532,13 +533,21 @@ fn cat_file_meta(
             return Err(batch_parse_error(&format!("查询「{spec}」回了「{oid}」")));
         }
         if kind == "missing" {
-            continue;
+            return Err(missing_object(spec));
         }
         let size = fields.next().and_then(|size| size.parse::<u64>().ok());
         let size = size.ok_or_else(|| batch_parse_error(spec))?;
         metas.insert(oid.to_string(), (kind.to_string(), size));
     }
     Ok(metas)
+}
+
+/// 待推区间里列了、却取不到的对象：仓库可能损坏，扫不了就别推。
+fn missing_object(oid: &str) -> CoreError {
+    CoreError::git(
+        format!("扫描待推提交时找不到对象 {oid}，为免漏扫这次推送已中止"),
+        "仓库可能已损坏",
+    )
 }
 
 /// 超限文案固定含四项：超了哪一项、当前值、上限、下一步该干什么。
@@ -554,6 +563,13 @@ fn human_bytes(bytes: u64) -> String {
         format!("{:.1} MiB", bytes as f64 / MIB)
     } else {
         format!("{bytes} 字节")
+    }
+}
+
+fn remote_of(upstream: &str) -> &str {
+    match upstream.split_once('/') {
+        Some((remote, _)) if !remote.is_empty() => remote,
+        _ => "origin",
     }
 }
 
@@ -754,4 +770,23 @@ fn blocked_error(hits: &[Hit]) -> CoreError {
         names.len(),
         names.join("；")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 仓库里缺对象时 `--batch-check` 回 `missing`：必须报错点名 oid，不能静默跳过。
+    /// （集成测试那边 rev-list 会先失败，所以这条走单元测试才验得到。）
+    #[test]
+    fn a_missing_object_is_reported_instead_of_being_skipped() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        git::run(dir.path(), &["init", "-q"]).expect("建空仓库");
+        let oid = "0".repeat(40);
+
+        let error = cat_file_meta(dir.path(), std::slice::from_ref(&oid))
+            .expect_err("missing 必须报错，不能当没内容可扫");
+
+        assert!(error.message.contains(&oid), "点名 oid：{}", error.message);
+    }
 }

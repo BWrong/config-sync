@@ -911,3 +911,85 @@ fn too_many_unpushed_blobs_abort_the_push_with_the_numbers() {
         "远端不该收到任何东西"
     );
 }
+
+/// `push.default=matching`（git 2.0 之前的默认值，仍是合法机器配置）下，裸 `git push` 会把
+/// 远端已有的同名分支一起推上去；那些分支不在 `@{u}..HEAD` 的扫描范围内，所以推送目标必须
+/// 显式写出来，让「送出去的」字面上等于「扫过的」。
+#[test]
+fn a_matching_push_default_cannot_smuggle_an_unscanned_branch_past_the_scan() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+
+    // 远端先有一个干净的 other 分支。
+    f.git(&["checkout", "-q", "-b", "other"]);
+    f.write_source("home/other.conf", "k = 1\n");
+    f.commit_all("local: other");
+    f.git(&["push", "-q", "origin", "other"]);
+    let other_remote_before = f.git_remote(&["rev-parse", "other"]);
+
+    // 之后在 other 上提交一个密钥，但不推。
+    f.write_source("home/token.conf", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+    let secret_sha = f.commit_all("local: secret on other");
+
+    // 回到 main 正常改一个文件，并把 push.default 调成 matching。
+    f.git(&["checkout", "-q", "main"]);
+    f.write_source("home/.zshrc", "export A=2\n");
+    f.git(&["config", "push.default", "matching"]);
+
+    let outcome = f.core().commit_and_push().expect("main 自己的推送应当成功");
+
+    assert!(outcome.committed, "{outcome:?}");
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        f.head_sha(),
+        "main 该推上去"
+    );
+    assert_ne!(
+        f.git_remote(&["rev-parse", "other"]),
+        secret_sha,
+        "含着密钥的 other 分支绝不能被顺手推上去"
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "other"]),
+        other_remote_before,
+        "other 的远端 ref 不该动"
+    );
+}
+
+/// 待推区间里有取不到的对象（仓库损坏）：扫不到就不能推，错误里要能看到是哪个 oid。
+///
+/// 实际触发点在 `git rev-list --objects`（它自己回 `missing blob object '<oid>'`）；
+/// `cat_file_meta` 的 `missing` 检查是第二道保险 —— rev-list 万一放行，也绝不能把那个
+/// 版本当成「没内容可扫」。
+#[test]
+fn a_missing_object_in_the_unpushed_range_aborts_the_scan() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+    f.write_source("home/lost.conf", "k = 1\n");
+    f.commit_all("local: one");
+
+    // 删掉那个 blob 的松散对象文件，制造「rev-list 列了但取不到」。
+    let oid = f.git(&["rev-parse", "HEAD:home/lost.conf"]);
+    let (dir, file) = oid.split_at(2);
+    std::fs::remove_file(f.source_dir.join(".git/objects").join(dir).join(file))
+        .expect("删掉松散对象");
+
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("缺对象时必须中止，不能当没内容可扫");
+
+    let text = format!("{} / {:?}", error.message, error.stderr);
+    assert!(text.contains(&oid), "必须点名缺失的 oid：{text}");
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "缺对象时什么都不能推"
+    );
+}
