@@ -1,5 +1,6 @@
-# 钉住 CI 已验证过的 stable（ci.yml 上一直跑的就是这个版本），
-# 让 rustfmt / clippy 的版本跨机器一致。
+# 钉住 CI / release / 本地开发共用的 stable 版本，保证 rustfmt 与 clippy 跨机器一致。
+# 升级路径：改 channel 这一行 → 同步改 ci.yml、release.yml 里 dtolnay/rust-toolchain@<版本> →
+# 跑一次 `cargo fmt --all`（新 rustfmt 可能重排）→ `cargo test --workspace --locked` 全绿再提 PR。
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy"]

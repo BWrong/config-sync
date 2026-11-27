@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt
 
@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
@@ -41,8 +41,8 @@ jobs:
       # --locked：CI 严格按 Cargo.lock 解析，不让依赖在流水线里漂移。
       - run: cargo test --workspace --locked
 
-      # --all-targets 覆盖测试代码；先不带 `-D warnings`：历史 clippy 告警（paths.rs:50、resolve.rs:55 等 15 条）还没清完，
-      # 清完了再收紧成门禁。
+      # --all-targets 覆盖测试代码；先不带 `-D warnings`：历史 clippy 告警仍在（lib 2 条：paths.rs:50、resolve.rs:55；
+      # 测试代码 16 处，共 18 处），清完了再收紧成门禁。
       - run: cargo clippy --workspace --all-targets
 
   frontend:
