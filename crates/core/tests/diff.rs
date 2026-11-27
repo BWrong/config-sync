@@ -193,6 +193,74 @@ fn a_difference_past_the_truncation_point_still_shows_something() {
         "差异在第 12 万行时也得能看见：{:?}",
         diff.text
     );
+    // hunk 头要报真实文件行号，不是窗口内相对行号（第 3 轮 B2）。
+    assert!(
+        diff.text.contains("@@ -119997,"),
+        "hunk 头还是窗口内相对行号：{:?}",
+        diff.text
+    );
+    assert!(
+        diff.reason.contains("全文共 120000 行"),
+        "尾窗口的 reason 也要说全文多少行：{}",
+        diff.reason
+    );
+}
+
+/// 12 万行里只改第 `line` 行（0 起）：差异落在头部窗口之外、尾部窗口之内 / 之外。
+fn one_changed_line(line: usize) -> String {
+    let mut lines: Vec<String> = (0..120_000)
+        .map(|i| format!("key_{i:06} = value\n"))
+        .collect();
+    lines[line] = format!("key_{line:06} = changed\n");
+    lines.concat()
+}
+
+#[test]
+fn a_difference_between_the_two_windows_says_how_much_was_skipped() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let body: String = (0..120_000)
+        .map(|i| format!("key_{i:06} = value\n"))
+        .collect();
+    f.write_source("home/mid.conf", &body);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    // 只改第 60000 行：两个窗口内都没有差异，就得直说中间 11 万行没对比（第 3 轮 B1）。
+    let target = f.write_home("mid.conf", &one_changed_line(60_000));
+
+    let diff = core.diff(&target).unwrap();
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(diff.truncated, "{diff:?}");
+    assert_eq!(diff.text, "", "窗口外不该硬编出内容");
+    assert!(
+        diff.reason.contains("头尾各 5000 行内都没有差异")
+            && diff.reason.contains("中间 110000 行"),
+        "文案要说清楚跳过了多少行：{}",
+        diff.reason
+    );
+}
+
+#[test]
+fn a_difference_just_past_the_head_window_says_how_much_was_skipped() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let body: String = (0..120_000)
+        .map(|i| format!("key_{i:06} = value\n"))
+        .collect();
+    f.write_source("home/edge.conf", &body);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    // 头窗口外的第一行（第 5001 行）同样落在两个窗口之间。
+    let target = f.write_home("edge.conf", &one_changed_line(5_000));
+
+    let diff = core.diff(&target).unwrap();
+    assert!(diff.truncated, "{diff:?}");
+    assert_eq!(diff.text, "");
+    assert!(
+        diff.reason.contains("中间 110000 行"),
+        "文案要说清楚跳过了多少行：{}",
+        diff.reason
+    );
 }
 
 #[test]

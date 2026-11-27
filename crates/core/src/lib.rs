@@ -312,19 +312,34 @@ impl Core {
             return Ok(done(head_diff, false, true, reason));
         }
         // 差异全在头部窗口之外：给末尾窗口，别让用户点开看到空白（第 2 轮 N1）。
-        let tail_diff = unified_diff(
-            &old_label,
-            &new_label,
-            &tail_window(&old),
-            &tail_window(&new),
+        // 尾窗口的 hunk 头是窗口内相对行号，得加回跳过的行数，不然和正文对不上（第 3 轮 B2）。
+        let (tail_old, skipped_old) = tail_window(&old);
+        let (tail_new, skipped_new) = tail_window(&new);
+        let tail_diff = offset_hunk_headers(
+            &unified_diff(&old_label, &new_label, &tail_old, &tail_new),
+            skipped_old,
+            skipped_new,
         );
+        if tail_diff.is_empty() {
+            // 头尾窗口都没差异：直说中间那段没对比，别让用户以为“没差异”。
+            let skipped = lines.saturating_sub(2 * DIFF_TRUNCATE_LINES);
+            return Ok(done(
+                tail_diff,
+                false,
+                true,
+                format!(
+                    "已截断：头尾各 {DIFF_TRUNCATE_LINES} 行内都没有差异，中间 {skipped} 行没有对比\
+                     （全文共 {lines} 行），完整内容请在编辑器里对比原文件"
+                ),
+            ));
+        }
         Ok(done(
             tail_diff,
             false,
             true,
             format!(
-                "已截断：前 {DIFF_TRUNCATE_LINES} 行内没有差异，只对比了末尾 {DIFF_TRUNCATE_LINES} 行，\
-                 完整内容请在编辑器里对比原文件"
+                "已截断：前 {DIFF_TRUNCATE_LINES} 行内没有差异，只对比了末尾 {DIFF_TRUNCATE_LINES} 行\
+                 （全文共 {lines} 行），完整内容请在编辑器里对比原文件"
             ),
         ))
     }
@@ -513,7 +528,8 @@ fn head_window(text: &str) -> String {
 }
 
 /// 尾部窗口：差异全在头部窗口之外时用，上限同上（第 2 轮 N1）。
-fn tail_window(text: &str) -> String {
+/// 一并回带「跳过了多少行」：hunk 头要把这段偏移加回去（第 3 轮 B2）。
+fn tail_window(text: &str) -> (String, usize) {
     let mut kept: Vec<&str> = Vec::new();
     let mut bytes = 0;
     for line in text.lines().rev().take(DIFF_TRUNCATE_LINES) {
@@ -528,7 +544,35 @@ fn tail_window(text: &str) -> String {
         kept.push(line);
         bytes += extra;
     }
-    kept.iter().rev().map(|line| format!("{line}\n")).collect()
+    let total = text.lines().count();
+    let window: String = kept.iter().rev().map(|line| format!("{line}\n")).collect();
+    (window, total - kept.len())
+}
+
+/// 尾窗口的 hunk 头是窗口内相对行号，加回跳过的行数才对得上正文（`@@ -4997` → `@@ -119997`，第 3 轮 B2）。
+fn offset_hunk_headers(diff: &str, old_offset: usize, new_offset: usize) -> String {
+    diff.lines()
+        .map(|line| {
+            let shifted = line.strip_prefix("@@ -").and_then(|rest| {
+                let (old, rest) = rest.split_once(" +")?;
+                let (new, tail) = rest.split_once(' ')?;
+                Some(format!(
+                    "@@ -{} +{} {tail}",
+                    shift_range(old, old_offset)?,
+                    shift_range(new, new_offset)?
+                ))
+            });
+            format!("{}\n", shifted.unwrap_or_else(|| line.to_string()))
+        })
+        .collect()
+}
+
+/// `4997` 或 `4997,4` → 起始行加上偏移，行数不变。
+fn shift_range(range: &str, offset: usize) -> Option<String> {
+    match range.split_once(',') {
+        Some((start, count)) => Some(format!("{},{count}", start.parse::<usize>().ok()? + offset)),
+        None => Some((range.parse::<usize>().ok()? + offset).to_string()),
+    }
 }
 
 /// 不超过 `at` 的 char 边界。
