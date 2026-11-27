@@ -144,6 +144,8 @@ interface BackupSummary {
   /** 写成几项（撤销时要恢复的）。 */
   written: number;
   failed: number;
+  /** 清单落到了最后一次落盘（`false` = 进程死在应用中途，这份备份可能不完整）。 */
+  complete: boolean;
 }
 
 /** 撤销动作：恢复原文 / 删掉那次新建的文件 / 不动。 */
@@ -165,6 +167,8 @@ interface RestoreItem {
 interface RestorePlan {
   backup: string;
   created_at: string;
+  /** 同 `BackupSummary.complete`：`false` 时预览要提示这份备份可能不完整。 */
+  complete: boolean;
   items: RestoreItem[];
 }
 
@@ -959,6 +963,7 @@ ${SETTINGS_BUTTON}
           ? "这次没有可撤销的改动：文件在应用之后又被改过，或者当时就没写成。"
           : `确认后会把下面 ${writes.length} 个文件恢复到 ${escapeHtml(plan.created_at)} 那次应用之前；你之后改过的文件不会被动。`
       }</p>
+      ${plan.complete ? "" : `<p class="apply-hint">这份备份可能不完整，最近的改动可能撤销不到。</p>`}
       <div class="action-error"></div>
       ${writes.length ? `<ul class="apply-items">${writes.map(restoreItemHtml).join("")}</ul>` : ""}
       ${
