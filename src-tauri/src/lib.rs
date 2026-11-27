@@ -8,7 +8,7 @@ mod settings;
 mod watch;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use config_sync_core::{
     AddOutcome, ApplyOutcome, ApplyPlan, ApplySummary, BackupSummary, Candidate, Core, CoreError,
@@ -41,7 +41,15 @@ impl Runtime {
 
 pub struct AppState {
     home: PathBuf,
-    runtime: Mutex<Runtime>,
+    /// 当前配置快照。`save_settings` 整体换掉它，其余命令只在锁里取一份 `Arc` 就走。
+    ///
+    /// 长任务（push / apply / clone）**不**持这把锁，所以刷新不会被它们排住（#31）。
+    runtime: RwLock<Arc<Runtime>>,
+    /// 写命令之间的互斥门闩：apply / push / clone / … 全程持有，读命令一律不碰。
+    ///
+    /// 写命令改的是磁盘上的仓库，`Runtime` 自己（路径 + 配置）在构造后不再变，
+    /// 所以「写与写互斥」得单独一把锁，而不是把 `runtime` 的写锁当门闩用。
+    write_gate: Mutex<()>,
     /// 源目录 `home/` 的监视器；drop 即停止。换源目录时在 `watch` 里整体重建。
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
@@ -63,14 +71,57 @@ impl AppState {
             }
         };
         AppState {
-            runtime: Mutex::new(Runtime::new(&home, settings, config_error)),
+            runtime: RwLock::new(Arc::new(Runtime::new(&home, settings, config_error))),
+            write_gate: Mutex::new(()),
             watcher: Mutex::new(None),
             home,
         }
     }
 
-    fn runtime(&self) -> MutexGuard<'_, Runtime> {
-        self.runtime.lock().expect("设置状态被毒化")
+    /// 当前配置快照：锁只在这几纳秒里被持着，拿到 `Arc` 就走。
+    ///
+    /// 中毒说明有命令持锁时 panic 过。这里留一行日志、拿回最后写入的内容继续，
+    /// 不让编程错误悄悄退化成「没有仓库」（#31）。
+    fn runtime(&self) -> Arc<Runtime> {
+        match self.runtime.read() {
+            Ok(runtime) => Arc::clone(&runtime),
+            Err(poisoned) => {
+                eprintln!(
+                    "config-sync: 配置快照锁被毒化（有命令持锁时 panic），先按最后写入的配置继续"
+                );
+                Arc::clone(&poisoned.into_inner())
+            }
+        }
+    }
+
+    /// 换配置快照（只有 `save_settings` 用）。
+    fn set_runtime(&self, runtime: Runtime) {
+        match self.runtime.write() {
+            Ok(mut slot) => *slot = Arc::new(runtime),
+            Err(poisoned) => {
+                eprintln!("config-sync: 配置快照锁被毒化（有命令持锁时 panic），仍然换上新配置");
+                *poisoned.into_inner() = Arc::new(runtime);
+            }
+        }
+    }
+
+    /// 写命令的互斥门闩：guard 得活在命令的整个作用域里（`let _gate = …`）。
+    fn write_gate(&self) -> MutexGuard<'_, ()> {
+        match self.write_gate.lock() {
+            Ok(gate) => gate,
+            Err(poisoned) => {
+                eprintln!("config-sync: 写命令门闩被毒化（有一条写命令 panic 过），仍然串行继续");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// 写命令的统一入口：先拿互斥门闩，再取配置快照，整段活儿都在门闩里跑。
+    ///
+    /// 读命令**不**走这里：它们只取一份快照（`runtime()`），不会被长任务排住（#31）。
+    fn write<T>(&self, work: impl FnOnce(&Runtime) -> T) -> T {
+        let _gate = self.write_gate();
+        work(&self.runtime())
     }
 
     /// 按当前源目录（重新）建立文件监视；监视不起来不阻塞启动，只是不能自动刷新。
@@ -95,8 +146,8 @@ fn config_path(home: &Path) -> PathBuf {
 /// 把命令里的阻塞工作挪到 tokio 的 blocking 池（#18）。
 ///
 /// Tauri 的同步命令跑在主线程，core 里一个 `git` 子进程或一次大文件比较就是整窗冻结。
-/// 这里让主线程只等一个 `JoinHandle`：git 与磁盘的等待都在别的线程上。命令体本身
-/// 一行没改（锁粒度也没动，仍是一把 `Mutex<Runtime>`），变的只是它跑在哪条线程上。
+/// 这里让主线程只等一个 `JoinHandle`：git 与磁盘的等待都在别的线程上。锁粒度见
+/// `AppState`：读命令只取一份快照，写命令另有一把互斥门闩（#31）。
 async fn blocking<T, F>(work: F) -> Result<T, CoreError>
 where
     T: Send + 'static,
@@ -163,9 +214,7 @@ async fn has_repo(app: AppHandle) -> bool {
 async fn edit(app: AppHandle, target: String) -> Result<(), CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .runtime()
-            .core
-            .edit(Path::new(&target))
+            .write(|runtime| runtime.core.edit(Path::new(&target)))
     })
     .await
 }
@@ -192,9 +241,7 @@ async fn open_source_dir(app: AppHandle) -> Result<(), CoreError> {
 async fn clone_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
     blocking(move || {
         let state = app.state::<AppState>();
-        // 语句边界是必需的：这把 guard 必须在 `watch()` 之前释放。`watch()` 内部要取
-        // 同一把 `runtime()` 锁，`std::sync::Mutex` 不可重入，拿着 guard 调用就自死锁。
-        state.runtime().core.clone(&remote)?;
+        state.write(|runtime| runtime.core.clone(&remote))?;
         // 克隆出来的 `home/` 现在才存在：重建监视器，别再盯着含 `.git` 的整棵树。
         state.watch(&app);
         Ok(())
@@ -205,19 +252,31 @@ async fn clone_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
 /// 写入或替换源目录仓库的 origin 地址。只动 git 配置，不提交、不写 $HOME。
 #[tauri::command]
 async fn set_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
-    blocking(move || app.state::<AppState>().runtime().core.set_remote(&remote)).await
+    blocking(move || {
+        app.state::<AppState>()
+            .write(|runtime| runtime.core.set_remote(&remote))
+    })
+    .await
 }
 
 /// 把路径（文件或整棵子树）收进源目录；每条路径各自成败，逐条返回。
 #[tauri::command]
 async fn add(app: AppHandle, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome>, CoreError> {
-    blocking(move || app.state::<AppState>().runtime().core.add(&paths)).await
+    blocking(move || {
+        app.state::<AppState>()
+            .write(|runtime| runtime.core.add(&paths))
+    })
+    .await
 }
 
 /// 把路径（文件或整棵子树）从源目录移除；只动源目录里的副本，不碰 `$HOME` 原文件。
 #[tauri::command]
 async fn remove(app: AppHandle, targets: Vec<PathBuf>) -> Result<Vec<RemoveOutcome>, CoreError> {
-    blocking(move || app.state::<AppState>().runtime().core.remove(&targets)).await
+    blocking(move || {
+        app.state::<AppState>()
+            .write(|runtime| runtime.core.remove(&targets))
+    })
+    .await
 }
 
 /// 首次使用向导的候选：固定的一组常见配置文件 + 本机是否存在；勾选后交给 `add`。
@@ -280,7 +339,11 @@ async fn plan_apply(
 /// 「应用」第二步：执行预览里那一份计划，不重新判断动作。
 #[tauri::command]
 async fn execute_apply(app: AppHandle, plan: ApplyPlan) -> Result<Vec<ApplyOutcome>, CoreError> {
-    blocking(move || app.state::<AppState>().runtime().core.execute_apply(&plan)).await
+    blocking(move || {
+        app.state::<AppState>()
+            .write(|runtime| runtime.core.execute_apply(&plan))
+    })
+    .await
 }
 
 /// 现有备份（新的在前）：应用结果页拿最新一份做「撤销这次应用」。
@@ -307,7 +370,11 @@ async fn restore_backup(
     app: AppHandle,
     plan: RestorePlan,
 ) -> Result<Vec<RestoreOutcome>, CoreError> {
-    blocking(move || app.state::<AppState>().runtime().core.restore_backup(&plan)).await
+    blocking(move || {
+        app.state::<AppState>()
+            .write(|runtime| runtime.core.restore_backup(&plan))
+    })
+    .await
 }
 
 #[derive(Serialize)]
@@ -339,20 +406,21 @@ async fn settings_view(app: AppHandle) -> Result<SettingsView, CoreError> {
 async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CoreError> {
     blocking(move || {
         let state = app.state::<AppState>();
-        let io = |message: String| CoreError {
-            kind: ErrorKind::Io,
-            message,
-            stderr: None,
-        };
-        let settings = settings.trimmed();
-        settings.validate(&state.home).map_err(io)?;
-        settings.save(&config_path(&state.home)).map_err(io)?;
-        *state.runtime() = Runtime::new(&state.home, settings, None);
-        // 上一条赋值是个完整语句，guard 在这一行结束时已经释放：`watch()` 内部要取
-        // 同一把 `runtime()` 锁（不可重入），并成一句就自死锁。
-        // 源目录可能换了个地方，监视器跟着换。
-        state.watch(&app);
-        Ok(())
+        // 换配置也是写操作：跟 apply / push 排在同一个队列里，不跟它们抢源目录。
+        state.write(|_| {
+            let io = |message: String| CoreError {
+                kind: ErrorKind::Io,
+                message,
+                stderr: None,
+            };
+            let settings = settings.trimmed();
+            settings.validate(&state.home).map_err(io)?;
+            settings.save(&config_path(&state.home)).map_err(io)?;
+            state.set_runtime(Runtime::new(&state.home, settings, None));
+            // 源目录可能换了个地方，监视器跟着换。
+            state.watch(&app);
+            Ok(())
+        })
     })
     .await
 }
@@ -360,13 +428,17 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CoreErr
 /// 拉取：`fetch` + `merge --ff-only`，只更新源目录，不动任何目标文件。
 #[tauri::command]
 async fn pull(app: AppHandle) -> Result<(), CoreError> {
-    blocking(move || app.state::<AppState>().runtime().core.pull()).await
+    blocking(move || app.state::<AppState>().write(|runtime| runtime.core.pull())).await
 }
 
 /// 推送：硬拦 → `git add -A` → 自动提交 → `git push`，全在 Core 的一个方法里。
 #[tauri::command]
 async fn commit_and_push(app: AppHandle) -> Result<PushOutcome, CoreError> {
-    blocking(move || app.state::<AppState>().runtime().core.commit_and_push()).await
+    blocking(move || {
+        app.state::<AppState>()
+            .write(|runtime| runtime.core.commit_and_push())
+    })
+    .await
 }
 
 /// 冲突解决：按文件二选一（保留本机 / 采用远端），然后重新提交。
@@ -385,9 +457,7 @@ async fn resolve_conflict(app: AppHandle, target: String, side: String) -> Resul
     };
     blocking(move || {
         app.state::<AppState>()
-            .runtime()
-            .core
-            .resolve_conflict(Path::new(&target), side)
+            .write(|runtime| runtime.core.resolve_conflict(Path::new(&target), side))
     })
     .await
 }
@@ -431,10 +501,62 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::blocking;
-    use std::sync::{Arc, Mutex};
+    use super::{AppState, Runtime, blocking};
+    use crate::settings::Settings;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex, RwLock};
     use std::thread::ThreadId;
     use std::time::{Duration, Instant};
+
+    /// 直接构造 `AppState`（字段都是本模块的），不再读 `$HOME`。
+    fn app_state(root: &Path, source_dir: &Path) -> AppState {
+        let settings = Settings {
+            source_dir: source_dir.display().to_string(),
+            ..Settings::default()
+        };
+        AppState {
+            home: root.to_path_buf(),
+            runtime: RwLock::new(Arc::new(Runtime::new(root, settings, None))),
+            write_gate: Mutex::new(()),
+            watcher: Mutex::new(None),
+        }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("跑不起系统 git");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 一个最小的 `AppState`：源目录是真 git 仓库（`refresh` 要跑 `git status`）。
+    fn state_with_repo(root: &Path) -> AppState {
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("home")).unwrap();
+        git_ok(&source, &["init", "-q", "-b", "main"]);
+        git_ok(
+            &source,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        app_state(root, &source)
+    }
 
     /// #18 的断言：长任务必须真的跑在另一条线程上，且不拖住其他命令。
     ///
@@ -493,5 +615,233 @@ mod tests {
                 "快命令等了 {waited:?}，被慢任务挡住了"
             );
         });
+    }
+
+    /// #31 验收 1：写命令持着门闩 400ms 期间，`refresh()` 必须立刻返回。
+    ///
+    /// 改前（所有命令共用一把 `Mutex<Runtime>`）这里是 391.1ms：读命令排在整段写命令
+    /// 后面。现在读命令只取一份快照，门闩完全不碰它。
+    #[test]
+    fn refresh_returns_while_a_long_write_holds_the_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(state_with_repo(root.path()));
+
+        let writer = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                // 写命令就是这条路径：`write()` 里拿门闩 + 取快照，然后在门闩里干长活儿。
+                state.write(|_| std::thread::sleep(Duration::from_millis(400)))
+            })
+        };
+        // 让写命令先开跑，模拟「推送已经在跑」的那一刻。
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let refreshed = state.runtime().core.refresh();
+        let waited = started.elapsed();
+
+        writer.join().unwrap();
+        assert!(refreshed.is_ok(), "refresh 失败：{:?}", refreshed.err());
+        assert!(
+            waited < Duration::from_millis(100),
+            "刷新等了 {waited:?}，仍被写命令排住"
+        );
+    }
+
+    /// #31 验收 2：两个写命令并发时严格互斥——第二个必须等第一个放掉门闩。
+    ///
+    /// `apply` / `push` / `clone` / `save_settings` 全都走 `write()`，所以这里验的就是
+    /// 它们共用的那条路。
+    #[test]
+    fn two_writers_are_mutually_exclusive() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(state_with_repo(root.path()));
+        let epoch = Instant::now();
+        // 每段写命令的 [开始, 结束]；两张表的先后由开始时刻决定。
+        let spans: Arc<Mutex<Vec<(Duration, Duration)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for hold in [Duration::from_millis(200), Duration::from_millis(100)] {
+            let state = Arc::clone(&state);
+            let spans = Arc::clone(&spans);
+            handles.push(std::thread::spawn(move || {
+                state.write(|_| {
+                    let start = epoch.elapsed();
+                    std::thread::sleep(hold);
+                    spans.lock().unwrap().push((start, epoch.elapsed()));
+                })
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut spans = spans.lock().unwrap().clone();
+        spans.sort_by_key(|(start, _)| *start);
+        let [(_, first_end), (second_start, _)] = spans[..] else {
+            panic!("两段写命令没都跑完：{spans:?}");
+        };
+        assert!(
+            second_start >= first_end,
+            "第二个写命令在第一段还没放门闩时就开始跑了：{spans:?}"
+        );
+    }
+
+    /// #31 验收 3：锁中毒是编程错误，必须留日志并按最后写入的状态继续，
+    /// 而不是被 `blocking_or(false, …)` 静默吞成「没有仓库」。
+    #[test]
+    fn poisoned_snapshot_lock_still_serves_the_real_state() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(state_with_repo(root.path()));
+
+        // 让一条「命令」在持锁时 panic：这就是 std 锁中毒的来源。
+        let poisoner = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let _guard = state.runtime.write().unwrap();
+                panic!("模拟命令持锁时 panic");
+            })
+        };
+        assert!(poisoner.join().is_err());
+        assert!(
+            state.runtime.is_poisoned(),
+            "锁没被毒化，这条断言就失去意义了"
+        );
+
+        // 读路径不受影响：拿回的是最后写入的那份配置，不是空 / 默认值。
+        assert_eq!(
+            state.runtime().source_dir,
+            root.path().join("source"),
+            "中毒后读到了错的配置"
+        );
+        // 写路径照旧串行，且能把新配置写进去。
+        state.write(|_| {});
+        state.set_runtime(Runtime::new(root.path(), Settings::default(), None));
+        assert_eq!(
+            state.runtime().settings,
+            Settings::default(),
+            "中毒后写不进新配置"
+        );
+    }
+
+    /// #31 验收 4 的 release 实测：大仓库推送期间 `refresh()` 的耗时。
+    ///
+    /// 手动跑（要造几千个文件、推一次真仓库）：
+    /// `cargo test --release -p config-sync-app bench_refresh_during_push -- --ignored --nocapture`
+    ///
+    /// 只打印数字，不断言墙钟阈值：机器快慢不该让这条测试红。
+    #[test]
+    #[ignore = "release 实测，手动跑"]
+    fn bench_refresh_during_push() {
+        const FILES: usize = 10000;
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let source = root.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git_ok(
+            root.path(),
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
+        );
+        git_ok(&source, &["init", "-q", "-b", "main"]);
+        git_ok(&source, &["config", "user.name", "bench"]);
+        git_ok(&source, &["config", "user.email", "bench@example.com"]);
+        for i in 0..FILES {
+            let dir = source.join(format!("home/.config/bench/d{}", i % 50));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("f{i}.conf")),
+                format!("key{i} = value{i}\n").repeat(8),
+            )
+            .unwrap();
+        }
+        git_ok(&source, &["add", "-A"]);
+        git_ok(&source, &["commit", "-q", "-m", "init"]);
+        git_ok(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git_ok(&source, &["push", "-q", "-u", "origin", "main"]);
+
+        let state = Arc::new(app_state(root.path(), &source));
+        let idle = median_refresh(&state, 5);
+
+        // 改一批文件，让这次推送真有活可干（commit + push 3000 个文件）。
+        for i in 0..FILES {
+            let dir = source.join(format!("home/.config/bench/d{}", i % 50));
+            std::fs::write(
+                dir.join(format!("f{i}.conf")),
+                format!("key{i} = value{i} (updated)\n").repeat(8),
+            )
+            .unwrap();
+        }
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let state = Arc::clone(&state);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let outcome = state.write(|runtime| runtime.core.commit_and_push());
+                let took = started.elapsed();
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                (outcome, took)
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(20));
+        let mut samples = Vec::new();
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let started = Instant::now();
+            let outcome = state.runtime().core.refresh();
+            samples.push(started.elapsed());
+            assert!(outcome.is_ok(), "refresh 失败：{:?}", outcome.err());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (pushed, push_took) = writer.join().unwrap();
+        assert!(pushed.is_ok(), "推送失败：{:?}", pushed.err());
+
+        samples.sort();
+        let median = samples[samples.len() / 2];
+        let slow = samples
+            .iter()
+            .filter(|s| **s > Duration::from_millis(100))
+            .count();
+        println!(
+            "\n#31 bench：{FILES} 个文件 / {:.1} KB",
+            dir_size(&source.join("home")) as f64 / 1024.0
+        );
+        println!("推送本身 {push_took:?}；空闲 refresh 中位数 {idle:?}");
+        println!(
+            "推送期间 refresh：采样 {} 次，中位数 {median:?}，最大 {:?}，>100ms 的 {slow} 次",
+            samples.len(),
+            samples.last().unwrap(),
+        );
+    }
+
+    fn median_refresh(state: &AppState, rounds: usize) -> Duration {
+        let mut samples: Vec<Duration> = (0..rounds)
+            .map(|_| {
+                let started = Instant::now();
+                state.runtime().core.refresh().unwrap();
+                started.elapsed()
+            })
+            .collect();
+        samples.sort();
+        samples[samples.len() / 2]
+    }
+
+    fn dir_size(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .map(|entry| {
+                let entry = entry.unwrap();
+                match entry.file_type().unwrap().is_dir() {
+                    true => dir_size(&entry.path()),
+                    false => entry.metadata().unwrap().len(),
+                }
+            })
+            .sum()
     }
 }
