@@ -537,7 +537,9 @@ async function pushChanges(): Promise<void> {
     const outcome = await invoke<PushOutcome>("commit_and_push");
     const remote = `<code>${escapeHtml(outcome.remote_url)}</code>`;
     if (outcome.committed) {
-      pushReportHtml = `<p class="add-summary">已提交并推送 ${outcome.files} 个文件到 ${remote}：${escapeHtml(
+      // dirty + ahead 同时存在时，这次推送送出去的是「新提交 + 本机已有提交」，两句都说清楚。
+      const also = outcome.existing_commits > 0 ? `，并把本机已有的 ${outcome.existing_commits} 个提交一并推上去` : "";
+      pushReportHtml = `<p class="add-summary">已提交并推送 ${outcome.files} 个文件${also}到 ${remote}：${escapeHtml(
         outcome.message,
       )}</p>`;
     } else if (outcome.existing_commits > 0) {

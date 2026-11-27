@@ -1,5 +1,6 @@
 //! 推送的行为测试：9 条路径规则 + 6 条内容规则逐条硬拦、正常推送、无可提交改动、push 失败，
-//! 以及 ahead-only（工作区干净、只有本地提交）、待推提交里的密钥、无上游的首次推送。
+//! ahead-only（工作区干净、只有本地提交）、待推提交里的密钥（含「加了又删」的历史版本与
+//! 扫描上限）、无上游的首次推送。
 //!
 //! 唯一 seam 是 `Core`，全部用真 git（临时 home + 临时源目录 + 临时裸远端）。
 
@@ -394,4 +395,155 @@ fn a_deleted_remote_tracking_ref_does_not_hide_local_commits() {
     assert!(outcome.existing_commits >= 1, "{outcome:?}");
     assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha(), "本地提交必须推上去");
     assert_eq!(f.git(&["rev-parse", "origin/main"]), f.head_sha(), "推送后跟踪分支恢复");
+}
+
+/// 用 `git fast-import` 一次性造出大量历史形状（逐个 `git commit` 太慢），
+/// 然后 `reset --hard` 让工作区与新的 HEAD 对齐。
+fn fast_import(f: &fixtures::Fixture, script: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(&f.source_dir)
+        .args(["fast-import", "--quiet", "--force"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("启动 git fast-import");
+    child.stdin.take().expect("fast-import 的 stdin").write_all(script.as_bytes()).expect("写 fast-import 脚本");
+    assert!(child.wait().expect("等 fast-import 结束").success(), "fast-import 失败");
+    f.git(&["reset", "--hard", "-q"]);
+}
+
+/// 一个提交只带一个文件，内容各不相同（否则 blob 会被去重成同一个）。
+fn inline_commit_script(paths: &[String]) -> String {
+    let mut script = String::from("commit refs/heads/main\ncommitter c <c@config-sync.invalid> 1 +0000\ndata 1\nb\n");
+    for path in paths {
+        let body = format!("{path}\n");
+        script.push_str(&format!("M 100644 inline {path}\ndata {}\n{body}", body.len()));
+    }
+    script
+}
+
+/// 「加了又删」：提交 A 加进密钥、提交 B 把文件删掉，两者都还没推。
+///
+/// 这时最终 diff 是空的、HEAD 树里也没有这个路径，可 A 的 blob 照样会随这次 push 出去——
+/// 按最终 diff 扫就会把它漏掉（#15 要堵的正是这个洞）。
+#[test]
+fn a_secret_added_and_then_deleted_in_unpushed_commits_is_still_blocked() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    f.write_source("home/token.txt", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+    f.commit_all("local: add the token");
+    std::fs::remove_file(f.source_dir.join("home/token.txt")).expect("删掉刚加的密钥");
+    f.commit_all("local: delete it again");
+    assert!(!f.is_dirty(), "前提：工作区干净，密钥只在待推提交里");
+    assert!(
+        !f.git(&["ls-tree", "-r", "--name-only", "HEAD"]).contains("home/token.txt"),
+        "前提：HEAD 树里已经没有这个路径，最终 diff 里也没有它"
+    );
+
+    let error = f.core().commit_and_push().expect_err("待推提交里的密钥必须拦，删掉也不行");
+
+    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
+    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
+    assert!(error.message.contains("home/token.txt"), "文件没被点名：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+}
+
+/// 加了、删了、又加回来：路径在最终树里，同样必须拦。
+#[test]
+fn a_secret_deleted_and_then_added_back_in_unpushed_commits_is_blocked() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    f.write_source("home/token.txt", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+    f.commit_all("local: add");
+    std::fs::remove_file(f.source_dir.join("home/token.txt")).expect("删掉");
+    f.commit_all("local: delete");
+    f.write_source("home/token.txt", "GITHUB_TOKEN=ghp_fedcba9876543210\n");
+    f.commit_all("local: add back");
+    assert!(!f.is_dirty());
+
+    let error = f.core().commit_and_push().expect_err("加回来的密钥同样要拦");
+
+    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
+    assert!(error.message.contains("home/token.txt"), "文件没被点名：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+}
+
+/// 单个 blob 超过 16 MiB：读内容之前就整次中止，文案点名文件与大小，不「太大就跳过」。
+#[test]
+fn a_blob_over_the_scan_size_limit_aborts_the_push_and_names_the_file() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    f.write_source("home/big.bin", &"x".repeat(16 * 1024 * 1024 + 1));
+    f.commit_all("local: too big");
+    assert!(!f.is_dirty());
+
+    let error = f.core().commit_and_push().expect_err("超过单 blob 上限必须中止");
+
+    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
+    assert!(error.message.contains("home/big.bin"), "文件没被点名：{}", error.message);
+    assert!(error.message.contains("上限 16.0 MiB"), "上限没被点名：{}", error.message);
+    assert!(error.message.contains("git push"), "得告诉用户下一步：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+}
+
+/// 待推提交超过 1000 个：整次中止，文案给出当前值、上限与下一步。
+#[test]
+fn too_many_unpushed_commits_abort_the_push_with_the_numbers() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    let mut script = String::new();
+    for index in 0..1001 {
+        let message = format!("c{index}");
+        script.push_str(&format!(
+            "commit refs/heads/main\ncommitter c <c@config-sync.invalid> {index} +0000\ndata {}\n{message}\n",
+            message.len()
+        ));
+    }
+    fast_import(&f, &script);
+    assert_eq!(f.git(&["rev-list", "--count", "@{u}..HEAD"]), "1001");
+
+    let error = f.core().commit_and_push().expect_err("超过 1000 个待推提交必须中止");
+
+    assert!(error.message.contains("未推送提交数"), "message = {}", error.message);
+    assert!(error.message.contains("1001 个"), "当前值没被点名：{}", error.message);
+    assert!(error.message.contains("上限 1000 个"), "上限没被点名：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+}
+
+/// 待扫的 blob 版本超过 10000 个：同样中止，不扫完就推等于把硬拦关掉。
+#[test]
+fn too_many_unpushed_blobs_abort_the_push_with_the_numbers() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    let paths: Vec<String> = (0..=10_000).map(|index| format!("home/f{index}.txt")).collect();
+    fast_import(&f, &inline_commit_script(&paths));
+
+    let error = f.core().commit_and_push().expect_err("超过 10000 个 blob 版本必须中止");
+
+    assert!(error.message.contains("待扫描的文件版本数"), "message = {}", error.message);
+    assert!(error.message.contains("10001 个"), "当前值没被点名：{}", error.message);
+    assert!(error.message.contains("上限 10000 个"), "上限没被点名：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
 }
