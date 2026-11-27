@@ -42,8 +42,12 @@ pub struct FileDiff {
     pub target: PathBuf,
     /// 该行此刻的状态，决定 diff 比较的是哪两侧。
     pub status: Status,
-    /// unified diff 文本；空字符串表示两侧没有差异。
+    /// unified diff 文本；空字符串表示两侧没有差异，或差异太大被闸门跳过（看 `omitted`）。
     pub text: String,
+    /// 差异太大，没有生成 diff（`text` 为空）：前端显示 `reason` 而不是 diff。
+    pub omitted: bool,
+    /// `omitted` 为真时为什么不算：多大、多少行、上限多少。
+    pub reason: String,
 }
 
 /// 顶部状态条：分支、ahead/behind、未提交改动数。

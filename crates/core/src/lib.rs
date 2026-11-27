@@ -257,18 +257,25 @@ impl Core {
         };
 
         // 超过闸门的一对不在这里算：单文件 diff 也不许因为大文件把整条命令拖死（#17）。
-        let text = if old == new {
-            String::new()
+        let (text, omitted, reason) = if old == new {
+            (String::new(), false, String::new())
         } else if let Some(reason) = diff_gate_reason(&old, &new) {
-            reason
+            // 不算就不算：`text` 留空，原因单独给，不把一句人话塞进 diff 字段（#17 N1）。
+            (String::new(), true, reason)
         } else {
-            unified_diff(&old_label, &new_label, &old, &new)
+            (
+                unified_diff(&old_label, &new_label, &old, &new),
+                false,
+                String::new(),
+            )
         };
 
         Ok(FileDiff {
             target: target.to_path_buf(),
             status,
             text,
+            omitted,
+            reason,
         })
     }
 
@@ -333,7 +340,11 @@ impl Core {
     fn disk(&self, rel: &Path) -> Result<state::Disk, CoreError> {
         let target = self.home.join(rel);
         let target_len = match std::fs::metadata(&target) {
-            Ok(meta) => meta.len(),
+            Ok(meta) if meta.is_file() => meta.len(),
+            // 目录等非普通文件：走原来的读错误路径，错误类型与文案不变（#20 N3）。
+            Ok(_) => std::fs::read(&target)
+                .map(|bytes| bytes.len() as u64)
+                .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(state::Disk::Missing),
             Err(e) => {
                 return Err(CoreError::io(format!(
@@ -421,28 +432,38 @@ fn revision_text(source_dir: &Path, rev: &str, repo_path: &Path) -> String {
     .unwrap_or_default()
 }
 
-/// diff 闸门的两个上限：单侧超过任一值就不再生成 diff。阈值只在这里定义（#17）。
-const DIFF_MAX_BYTES: usize = 256 * 1024;
+/// diff 闸门的两个上限：任一侧超过任一值就不再生成 diff。阈值只在这里定义（#17）。
+pub(crate) const DIFF_MAX_BYTES: usize = 256 * 1024;
 const DIFF_MAX_LINES: usize = 5000;
 
-/// 超闸门的标记：`ApplyItem.diff_omitted` 为真时 `diff` 为空；
-/// 单文件 diff 的 `FileDiff.text` 以它开头，表示「没有算 diff」。
-/// 前端 `src/main.ts` 里有同名字符串，改这里要一起改。
+/// 超闸门时那句原因的固定开头（不靠它判类型，只用来一眼认出）。
 pub const DIFF_TOO_LARGE: &str = "差异过大";
 
-/// 两侧取更大的一侧判闸门；超了返回给人看的原因，没超返回 `None`。
+/// 超闸门的原因。`lines` 为 `None` 表示那一侧压根没读（超字节闸就不读，见 #17 N4）。
+fn too_large_reason(bytes: usize, lines: Option<usize>) -> String {
+    let limit = DIFF_MAX_BYTES / 1024;
+    match lines {
+        Some(lines) => format!(
+            "{DIFF_TOO_LARGE}：最大的一侧 {} KB / {lines} 行，超过 {limit} KB / {DIFF_MAX_LINES} 行的上限，\
+             没有生成 diff；请在编辑器里对比这两个文件",
+            bytes.div_ceil(1024),
+        ),
+        None => format!(
+            "{DIFF_TOO_LARGE}：最大的一侧 {} KB，已超过 {limit} KB 的上限，没有读入内容；\
+             请在编辑器里对比这两个文件",
+            bytes.div_ceil(1024),
+        ),
+    }
+}
+
+/// 字节与行数各自取两侧的最大值再判：字节最宽的那侧不一定是行最多的那侧（#17 B1）。
 fn diff_gate_reason(old: &str, new: &str) -> Option<String> {
-    let widest = if old.len() >= new.len() { old } else { new };
-    let lines = widest.lines().count();
-    if widest.len() <= DIFF_MAX_BYTES && lines <= DIFF_MAX_LINES {
+    let bytes = old.len().max(new.len());
+    let lines = old.lines().count().max(new.lines().count());
+    if bytes <= DIFF_MAX_BYTES && lines <= DIFF_MAX_LINES {
         return None;
     }
-    Some(format!(
-        "{DIFF_TOO_LARGE}：最大的一侧 {} KB / {lines} 行，超过 {} KB / {DIFF_MAX_LINES} 行的上限，\
-         没有生成 diff；请在编辑器里对比这两个文件",
-        widest.len().div_ceil(1024),
-        DIFF_MAX_BYTES / 1024,
-    ))
+    Some(too_large_reason(bytes, Some(lines)))
 }
 
 /// 两侧相同就是空串（前端显示「没有差异」），否则是带 `---/+++` 头的 unified diff。
