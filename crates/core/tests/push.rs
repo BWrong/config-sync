@@ -6,7 +6,7 @@
 
 mod fixtures;
 
-use config_sync_core::{Core, CoreError, ErrorKind, PushOutcome};
+use config_sync_core::{Config, Core, CoreError, ErrorKind, PushOutcome};
 
 /// `(规则原文, 命中路径, 近似但不该命中的路径)`；路径都是仓库内相对路径。
 const PATH_RULES: &[(&str, &str, &str)] = &[
@@ -1225,5 +1225,102 @@ fn an_oversized_staged_version_aborts_the_push_too() {
     assert!(
         !f.remote.join("refs/heads/main").exists(),
         "远端不该收到任何东西"
+    );
+}
+
+/// #44-1：`ensure_branch` 在扫描之前跑，所以「尺寸闸门中止」时源目录其实已经换到设置的
+/// 分支了。中止文案必须把这件事说出来——否则用户看到「推送被拒」，却不知道工作区不在
+/// 原来的分支上。
+#[test]
+fn an_abort_after_switching_branches_says_which_branch_it_switched_to() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    // 设置的分支 trunk 上有一个自带超大文件的未推提交：切过去之后扫描才会中止。
+    f.git(&["switch", "-q", "-c", "trunk"]);
+    write_oversized(&f, "home/big.log", "clean\n");
+    f.commit_all("config-sync: 1 files");
+    f.git(&["switch", "-q", "main"]);
+
+    let error = Core::new(
+        &f.home,
+        &f.source_dir,
+        Config {
+            branch: "trunk".to_string(),
+            editor_command: String::new(),
+        },
+    )
+    .commit_and_push()
+    .expect_err("trunk 上的超大 blob 必须让这次推送中止");
+
+    assert!(error.message.contains(GATE_TEXT), "{}", error.message);
+    assert_eq!(
+        f.git(&["branch", "--show-current"]),
+        "trunk",
+        "分支确实切了"
+    );
+    assert!(
+        error.message.contains("已从 main 切到 trunk"),
+        "中止文案必须交代分支已经切到 trunk：{}",
+        error.message
+    );
+}
+
+/// #44-2：工作区版本的闸门看路径**自身**的尺寸（`symlink_metadata`），不跟随软链接。
+/// 受管目录里指向外部 20 MiB 文件的软链接：git 只会把链接自身（目标路径字符串）存进
+/// 仓库，所以不该以链接路径报超限。
+#[cfg(unix)]
+#[test]
+fn a_symlink_is_gated_by_its_own_size_not_by_its_target() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+
+    // 受管目录之外的 20 MiB 文件：谁都不该因为它的尺寸拒绝这次推送。
+    let outside = f.path("outside-big.log");
+    std::fs::File::create(&outside)
+        .expect("建外部大文件")
+        .set_len(20 * 1024 * 1024)
+        .expect("拉长到 20 MiB");
+    std::os::unix::fs::symlink(&outside, f.source_dir.join("home/link.log")).expect("建软链接");
+
+    let outcome = f
+        .core()
+        .commit_and_push()
+        .expect("软链接按链接自身判尺寸，目标再大也不该报超限");
+    assert!(outcome.committed, "{outcome:?}");
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
+
+    // 推上去的就是链接自身（目标路径那串文本），不是那 20 MiB。
+    let pushed = f.git(&["cat-file", "-s", "HEAD:home/link.log"]);
+    assert!(
+        pushed.parse::<u64>().expect("blob 尺寸") < 1024,
+        "仓库里该是链接自身那一小段文本，实际 {pushed} 字节"
+    );
+}
+
+/// #44-4：大文件同时命中路径规则时，用户先看到的该是「这类文件本就不该进仓库」。
+/// 路径规则与尺寸闸门都拦，先后只决定文案。
+#[test]
+fn a_path_rule_hit_is_reported_before_the_size_gate() {
+    let f = fixtures::Fixture::new();
+    write_oversized(&f, "home/.aws/credentials", "clean\n");
+
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("路径规则也必须整次中止");
+
+    assert!(
+        error.message.contains("推送被拒绝") && error.message.contains("路径规则"),
+        "必须先报路径规则：{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("上限"),
+        "不该先走尺寸闸门的文案：{}",
+        error.message
     );
 }
