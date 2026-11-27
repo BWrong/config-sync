@@ -132,15 +132,20 @@ impl Core {
         // 推送目标必须显式写出来：裸 `git push` 服从 `push.default`，配成 `matching` 时
         // 会把远端已有的同名分支一起推上去，而那些分支不在本次扫描范围内。
         // `--no-follow-tags` 同理，堵住 `push.followTags=true` 顺手推 tag。
-        let push: Vec<&str> = match target.upstream.as_deref() {
-            Some(upstream) => vec![
-                "push",
-                "--no-follow-tags",
-                remote_of(upstream),
-                &target.branch,
-            ],
+        //
+        // 远端与分支都取自上游配置，不是本地分支名：`git branch -m` 之后本地叫 `trunk` 而
+        // 上游是 `origin/main` 时，拿本地名当 refspec 会在远端凭空建出 `trunk`，`origin/main`
+        // 永不前进，`ahead` 基准也没动过——每次点推送都报「已推了 1 个本机已有提交」。
+        let refspec = target
+            .push_to
+            .as_ref()
+            .map(|route| format!("HEAD:{}", route.remote_ref));
+        let push: Vec<&str> = match (&target.push_to, refspec.as_deref()) {
+            (Some(route), Some(refspec)) => {
+                vec!["push", "--no-follow-tags", route.remote.as_str(), refspec]
+            }
             // 第一次推送没有上游，顺手建立跟踪（拉取那边靠它判断能否 fetch）。
-            None => vec!["push", "--no-follow-tags", "-u", "origin", &target.branch],
+            _ => vec!["push", "--no-follow-tags", "-u", "origin", &target.branch],
         };
         git::run(&self.source_dir, &push).map_err(|e| CoreError {
             message: if committed {
@@ -174,22 +179,30 @@ impl Core {
 /// 推送目标的现状：当前分支、上游、待推提交数，以及硬拦扫待推提交时的比较基准。
 struct PushTarget {
     branch: String,
-    /// 上游跟踪分支（如 `origin/main`）；`None` = 还没建立跟踪。
-    upstream: Option<String>,
+    /// 显式 refspec 的两半；`None` = 没有上游，走 `-u origin <branch>`。
+    push_to: Option<PushRoute>,
     /// 推送前已有、尚未推到远端的提交数。
     ahead: u32,
     /// `ahead` 那些提交从哪算起；`None` = 没有可比基准，整个 HEAD 树都要扫。
     scan_base: Option<String>,
 }
 
+/// 送到哪里：远端名 + 那个远端上的 ref 名，两者都来自上游配置。
+struct PushRoute {
+    remote: String,
+    remote_ref: String,
+}
+
 impl PushTarget {
     fn read(source_dir: &Path) -> Result<Self, CoreError> {
-        // 一次 `for-each-ref` 同时拿到当前分支与它的上游（`*` 标出当前分支）。
+        // 一次 `for-each-ref` 同时拿到当前分支、它的上游，以及推送目标的两半
+        // （`*` 标出当前分支）。本地分支名与上游分支名可以不同，所以远端名与远端 ref
+        // 只能从上游配置读，不能拿本地名拼。
         let refs = git::run(
             source_dir,
             &[
                 "for-each-ref",
-                "--format=%(HEAD)%09%(refname:short)%09%(upstream:short)",
+                "--format=%(HEAD)%09%(refname:short)%09%(upstream:short)%09%(upstream:remotename)%09%(upstream:remoteref)",
                 "refs/heads/",
             ],
         )?;
@@ -203,9 +216,17 @@ impl PushTarget {
                 .next()
                 .filter(|up| !up.is_empty())
                 .map(str::to_string);
-            Some((branch, upstream))
+            let remote = fields.next().unwrap_or_default();
+            let remote_ref = fields.next().unwrap_or_default();
+            // 上游指向本地分支（`branch.<b>.remote = .`）时 remote 是 `.`：那也照样推 `.`，
+            // 因为扫描基准就是那个本地分支，二者必须同一个来源。
+            let push_to = (!remote.is_empty() && !remote_ref.is_empty()).then(|| PushRoute {
+                remote: remote.to_string(),
+                remote_ref: remote_ref.to_string(),
+            });
+            Some((branch, upstream, push_to))
         });
-        let (branch, upstream) = match found {
+        let (branch, upstream, push_to) = match found {
             Some(found) => found,
             // 空仓库（还没有第一个提交）时 `refs/heads` 是空的，只能单独问一次分支名。
             None => {
@@ -217,7 +238,7 @@ impl PushTarget {
                         stderr: None,
                     });
                 }
-                (branch, None)
+                (branch, None, None)
             }
         };
 
@@ -237,7 +258,7 @@ impl PushTarget {
 
         Ok(PushTarget {
             branch,
-            upstream,
+            push_to,
             ahead,
             scan_base,
         })
@@ -566,13 +587,6 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn remote_of(upstream: &str) -> &str {
-    match upstream.split_once('/') {
-        Some((remote, _)) if !remote.is_empty() => remote,
-        _ => "origin",
-    }
-}
-
 fn repo_str(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -697,10 +711,10 @@ fn cat_file(source_dir: &Path, flag: &str, specs: &[String]) -> Result<Vec<u8>, 
     Ok(out.stdout)
 }
 
-/// `--batch` 的输出按查询顺序一组：`<sha> <type> <size>\n<内容>\n`。
+/// `--batch` 的输出按查询顺序一组：`<sha> <type> <size>\n<内容>\n`（缺对象是 `<spec> missing`）。
 ///
-/// 查询串只包含索引 / HEAD 里确实存在的 blob sha，所以每一组都必须解析成功；
-/// 解析不了就整次报错，不猜偏移、也不把剩余项当「没内容」（那是静默漏扫）。
+/// 与 `cat_file_meta` 同一套口径：回显的 oid 必须就是查询的 spec，`missing` 点名 oid 报错；
+/// 其余解析不了就整次报错，不猜偏移、也不把剩余项当「没内容」（那是静默漏扫）。
 fn parse_batch(bytes: &[u8], specs: &[String]) -> Result<HashMap<String, String>, CoreError> {
     let mut contents = HashMap::with_capacity(specs.len());
     let mut pos = 0;
@@ -711,9 +725,18 @@ fn parse_batch(bytes: &[u8], specs: &[String]) -> Result<HashMap<String, String>
             .ok_or_else(|| batch_parse_error(spec))?;
         let header = String::from_utf8_lossy(&bytes[pos..pos + header_end]);
         pos += header_end + 1;
-        let size = header
-            .rsplit_once(' ')
-            .and_then(|(_, size)| size.parse::<usize>().ok())
+        let mut fields = header.split(' ');
+        let oid = fields.next().unwrap_or_default();
+        if oid != spec {
+            return Err(batch_parse_error(&format!("查询「{spec}」回了「{oid}」")));
+        }
+        let kind = fields.next().unwrap_or_default();
+        if kind == "missing" {
+            return Err(missing_object(spec));
+        }
+        let size = fields
+            .next()
+            .and_then(|size| size.parse::<usize>().ok())
             .ok_or_else(|| batch_parse_error(spec))?;
         let end = pos.checked_add(size).filter(|end| *end <= bytes.len());
         let end = end.ok_or_else(|| batch_parse_error(spec))?;
@@ -721,7 +744,11 @@ fn parse_batch(bytes: &[u8], specs: &[String]) -> Result<HashMap<String, String>
             spec.clone(),
             String::from_utf8_lossy(&bytes[pos..end]).into_owned(),
         );
-        pos = end + 1; // 内容后面跟一字节分隔符。
+        // 内容后面跟一字节分隔符；顺手卡上界，少给一个字节也不至于越界 panic。
+        pos = end
+            .checked_add(1)
+            .filter(|pos| *pos <= bytes.len())
+            .ok_or_else(|| batch_parse_error(spec))?;
     }
     Ok(contents)
 }
@@ -788,5 +815,49 @@ mod tests {
             .expect_err("missing 必须报错，不能当没内容可扫");
 
         assert!(error.message.contains(&oid), "点名 oid：{}", error.message);
+    }
+
+    /// `--batch` 那边也回 `missing`：同样点名 oid，不说「解析失败」这种查不出病因的话。
+    #[test]
+    fn a_missing_blob_in_batch_output_names_the_oid() {
+        let oid = "a".repeat(40);
+        let error = parse_batch(
+            format!("{oid} missing\n").as_bytes(),
+            std::slice::from_ref(&oid),
+        )
+        .expect_err("missing 必须报错");
+
+        assert!(error.message.contains(&oid), "点名 oid：{}", error.message);
+    }
+
+    /// 回显的 oid 不是查询的那个：整批对不上，宁可中止也不能错位记内容。
+    #[test]
+    fn a_batch_echo_that_does_not_match_the_query_is_an_error() {
+        let spec = "a".repeat(40);
+        let other = "b".repeat(40);
+        let error = parse_batch(
+            format!("{other} blob 1\nX\n").as_bytes(),
+            std::slice::from_ref(&spec),
+        )
+        .expect_err("对不上必须报错");
+
+        assert!(
+            error.message.contains(&spec) && error.message.contains(&other),
+            "两边都要点名：{}",
+            error.message
+        );
+    }
+
+    /// 内容后面少一个分隔字节（理论上不会发生）：越界也要报错，不许 panic。
+    #[test]
+    fn a_batch_output_without_the_separator_after_content_is_an_error() {
+        let spec = "c".repeat(40);
+        let error = parse_batch(
+            format!("{spec} blob 1\nX").as_bytes(),
+            std::slice::from_ref(&spec),
+        )
+        .expect_err("少了尾分隔符必须报错");
+
+        assert!(error.message.contains("无法解析"), "{}", error.message);
     }
 }

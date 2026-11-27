@@ -993,3 +993,69 @@ fn a_missing_object_in_the_unpushed_range_aborts_the_scan() {
         "缺对象时什么都不能推"
     );
 }
+
+/// 本地分支名和上游分支名可以不一样（`git branch -m` 之后很常见）。推送必须送到**上游那个
+/// 分支**：拿本地名拼 refspec 会在远端凭空建出同名分支，`origin/main` 永不前进，`ahead`
+/// 基准也没动过——于是每次点推送都报「已推了 1 个本机已有提交」。
+#[test]
+fn a_renamed_local_branch_still_pushes_to_its_upstream_branch() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+
+    // 本地改名 trunk，上游仍是 origin/main。
+    f.git(&["branch", "-m", "main", "trunk"]);
+    f.git(&["branch", "--set-upstream-to=origin/main", "trunk"]);
+    f.write_source("home/.zshrc", "export A=2\n");
+
+    let outcome = f.core().commit_and_push().expect("推送应当成功");
+    assert!(outcome.committed, "{outcome:?}");
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        f.head_sha(),
+        "远端 main 必须前进"
+    );
+    assert_eq!(
+        f.git_remote(&["for-each-ref", "--format=%(refname:short)", "refs/heads/"]),
+        "main",
+        "远端不许凭空多出 trunk"
+    );
+
+    // 上游已经跟上，再点一次必须什么都不用推（不许每次都说「推了 1 个已有提交」）。
+    let again = f.core().commit_and_push().expect("再点一次不该报错");
+    assert!(!again.committed, "{again:?}");
+    assert_eq!(again.existing_commits, 0, "{again:?}");
+}
+
+/// 上游指向本地分支（`branch.main.remote = .`）时，推送目标也必须是那个本地分支：
+/// 扫描基准是它，送出去的就得是它。
+#[test]
+fn a_local_branch_upstream_is_where_the_push_goes() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+
+    f.git(&["branch", "mirror"]);
+    f.git(&["branch", "--set-upstream-to=mirror", "main"]);
+    let origin_before = f.git_remote(&["rev-parse", "main"]);
+
+    f.write_source("home/.zshrc", "export A=2\n");
+    let outcome = f.core().commit_and_push().expect("推送应当成功");
+
+    assert!(outcome.committed, "{outcome:?}");
+    assert_eq!(
+        f.git(&["rev-parse", "mirror"]),
+        f.head_sha(),
+        "本地 mirror 必须前进"
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        origin_before,
+        "上游是本地分支时，origin 不该收到东西"
+    );
+
+    let again = f.core().commit_and_push().expect("再点一次不该报错");
+    assert_eq!(again.existing_commits, 0, "{again:?}");
+}

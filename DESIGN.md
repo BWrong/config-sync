@@ -76,7 +76,7 @@ branch = "main"
 2. **添加**：只从文件选择器来（不接受粘贴路径），路径相对 `$HOME` 推导源目录位置。首次使用时向导可列出候选（`.zshrc`、`.gitconfig`、`.config/*`、`.ssh/config` 等）勾选，**但不做成常驻推荐**——避免把 history、私钥塞进仓库。
    **移除**与它对称：只删源目录里的副本，`$HOME` 下的原文件保持原样，删除作为待提交的改动留在 git 里。
 3. **推送前硬拦**（命中即拒绝，无"强行继续"）：
-   - 扫描范围：工作区 ∪ 暂存区 ∪ 待推提交。待推提交按 `@{u}..HEAD`（无上游时 `origin/<branch>..HEAD`；`origin/<branch>` 也不存在时扫整棵 `HEAD` 树）里**出现过的每一个版本**扫，包含已删除路径的历史版本——"先加后删"的密钥同样会随这次 push 送出去。推送时显式给出远端与分支（`git push --no-follow-tags <remote> <branch>`），不让 `push.default=matching` / `push.followTags` 把没扫过的分支或 tag 一起送出去。
+   - 扫描范围：工作区 ∪ 暂存区 ∪ 待推提交。待推提交按 `@{u}..HEAD`（无上游时 `origin/<branch>..HEAD`；`origin/<branch>` 也不存在时扫整棵 `HEAD` 树）里**出现过的每一个版本**扫，包含已删除路径的历史版本——"先加后删"的密钥同样会随这次 push 送出去。推送时显式给出远端与分支（`git push --no-follow-tags <remote> HEAD:<上游分支>`，两者都取自上游配置，本地分支改过名也一样），不让 `push.default=matching` / `push.followTags` 把没扫过的分支或 tag 一起送出去；tag 因此需要手动 `git push --tags`。
    - 待推内容有上限（未推送提交 1000 个、去重 blob 版本 10000 个、累计 256 MiB、单个 blob 16 MiB）：超限整次中止并说明是哪一项与怎么办，不跳过、不静默放行——扫不完就推等于把硬拦关掉。
    - 路径黑名单：`**/id_rsa`、`**/id_ed25519*`、`**/.ssh/id_*`、`**/*.pem`、`**/*.p12`、`**/.netrc`、`**/*_history`、`**/credentials*`、`**/.aws/credentials`
    - 内容正则：`-----BEGIN [A-Z ]*PRIVATE KEY-----`、`ghp_`、`github_pat_`、`AKIA`、`xox[baprs]-`、`sk-[A-Za-z0-9_-]{16,}`（16 位以上才算命中，避免误伤普通文本）
