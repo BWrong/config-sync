@@ -1,0 +1,50 @@
+name: ci
+
+# PR 与 push 上跑测试、格式、clippy 和前端 build。
+# 出包（Tauri / dmg）仍只由 release.yml 的 v* tag 触发，这里不打包。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    # 与 release.yml 同环境：Tauri 在 Linux 上还要额外装 webkit2gtk，macOS runner 自带。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: swatinem/rust-cache@v2
+
+      - run: cargo test --workspace
+
+      # 历史代码从没跑过 rustfmt（crates/core 下约 30 个文件会被重排），先只报告不拦合并。
+      # 等这些文件的并行改动落地后跑一次 `cargo fmt --all`，再删掉 continue-on-error。
+      - run: cargo fmt --all --check
+        continue-on-error: true
+
+      # 先不带 `-D warnings`：历史 clippy 告警还没清完，清完了再收紧成门禁。
+      - run: cargo clippy --workspace
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # 与 release.yml 一致
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
