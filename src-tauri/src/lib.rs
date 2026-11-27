@@ -12,7 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use config_sync_core::{
     AddOutcome, ApplyOutcome, ApplyPlan, ApplySummary, Candidate, Core, CoreError, ErrorKind,
-    FileDiff, InventoryEntry, PushOutcome, RemoveOutcome, RepoStatus,
+    FileDiff, PushOutcome, Refresh, RemoveOutcome,
 };
 use serde::Serialize;
 use settings::Settings;
@@ -92,14 +92,10 @@ fn config_path(home: &Path) -> PathBuf {
     settings::app_dir(home).join("config.toml")
 }
 
+/// 一次刷新：清单 + 状态条。两半出自同一份 git 事实，所以只跑一次 `git status`（#19）。
 #[tauri::command]
-fn inventory(state: State<'_, AppState>) -> Result<Vec<InventoryEntry>, CoreError> {
-    state.runtime().core.inventory()
-}
-
-#[tauri::command]
-fn repo_status(state: State<'_, AppState>) -> Result<RepoStatus, CoreError> {
-    state.runtime().core.repo_status()
+fn refresh(state: State<'_, AppState>) -> Result<Refresh, CoreError> {
+    state.runtime().core.refresh()
 }
 
 /// 点开一行时的 unified diff；比较哪两侧由 Core 按该行状态决定。
@@ -299,8 +295,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            inventory,
-            repo_status,
+            refresh,
             diff,
             edit,
             has_repo,

@@ -41,6 +41,12 @@ interface RepoStatus {
   dirty: number;
 }
 
+/** 与 Core 的 `Refresh` 一一对应：清单与状态条出自同一次 `git status`。 */
+interface Refresh {
+  entries: InventoryEntry[];
+  status: RepoStatus;
+}
+
 /** 与 Core 的 `PushOutcome` 一一对应。 */
 interface PushOutcome {
   /** false = 这次没有产生新的自动提交（可能只推了已有提交）。 */
@@ -751,17 +757,38 @@ function applyReport(outcomes: ApplyOutcome[]): string {
   return `<p class="apply-summary">已写 ${written} 个文件${failed ? ` · ${failed} 个没有写` : ""}</p>${notes.length ? `<ul class="apply-notes">${notes.join("")}</ul>` : ""}`;
 }
 
+/** 清单页的整体刷新：同一时刻只跑一次。
+ *
+ * 切回窗口、编辑器保存后的 watch 事件经常叠在一起，以前会并发跑两遍 `refresh`，
+ * 两次的返回还可能后发先至。叠着的那次改为在跑完后补一次，不另开一条。
+ */
+let refreshing: Promise<void> | null = null;
+let refreshQueued = false;
 async function renderInventory(): Promise<void> {
+  if (refreshing) {
+    refreshQueued = true;
+    await refreshing;
+    return;
+  }
+  refreshing = renderInventoryOnce().finally(() => {
+    refreshing = null;
+  });
+  await refreshing;
+  if (refreshQueued) {
+    refreshQueued = false;
+    await renderInventory();
+  }
+}
+
+async function renderInventoryOnce(): Promise<void> {
   try {
     // 有未确认的计划时，整个页面就是预览页：这一屏不写盘。
     if (applyPlan) {
       renderApplyPreview();
       return;
     }
-    const [entries, status] = await Promise.all([
-      invoke<InventoryEntry[]>("inventory"),
-      invoke<RepoStatus>("repo_status"),
-    ]);
+    // 清单和状态条出自同一次 git status，后端一次全给（#19）。
+    const { entries, status } = await invoke<Refresh>("refresh");
     app.innerHTML = `
       ${statusBar(status)}
       ${pendingHint(status)}
@@ -1155,7 +1182,12 @@ async function startListening(): Promise<void> {
   // 编辑器保存、外部改动源目录都会推一条；没有刷新按钮。
   await listen("inventory-changed", () => void renderInventory());
   // 源目录之外的 git 改动（在终端里 commit）没有监视事件，从终端切回来时补一次。
-  window.addEventListener("focus", () => void renderInventory());
+  // 只 debounce 这一条：切窗口会连发多次；watch 事件后端已经去抖过，不必再等。
+  let focusTimer: number | undefined;
+  window.addEventListener("focus", () => {
+    window.clearTimeout(focusTimer);
+    focusTimer = window.setTimeout(() => void renderInventory(), 250);
+  });
 }
 
 async function boot(): Promise<void> {

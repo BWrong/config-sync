@@ -142,3 +142,23 @@ fn a_deletion_that_is_committed_but_not_pushed_stays_listed() {
     f.push();
     assert!(core.inventory().unwrap().is_empty());
 }
+
+#[test]
+fn refresh_carries_inventory_and_status_from_one_read() {
+    let (f, core) = core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    // 远端多一个提交（behind=1）、本地多一个未跟踪文件（dirty=1）、目标内容不同。
+    f.advance_remote("home/.zshrc", "export A=1\nexport B=9\n");
+    f.write_source("home/.gitconfig", "[user]\n\tname = 测试\n");
+    f.write_home(".zshrc", "export A=2\n");
+
+    let refresh = core.refresh().unwrap();
+    assert_eq!(refresh.entries, core.inventory().unwrap());
+    assert_eq!(refresh.status, core.repo_status().unwrap());
+    assert_eq!(refresh.status.branch, "main");
+    assert_eq!((refresh.status.ahead, refresh.status.behind), (0, 1));
+    assert_eq!(refresh.status.dirty, 1);
+    assert_eq!(refresh.entries.len(), 2);
+}

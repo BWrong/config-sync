@@ -24,7 +24,7 @@ pub use apply::{
 pub use config::Config;
 pub use editor::Attempt;
 pub use error::{CoreError, ErrorKind};
-pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
+pub use inventory::{FileDiff, InventoryEntry, Refresh, RepoStatus, Status};
 pub use onboarding::Candidate;
 pub use push::PushOutcome;
 pub use remove::{RemoveOutcome, RemoveResult};
@@ -152,8 +152,27 @@ impl Core {
 
     /// 受管文件的完整列表。完全没有受管文件时返回空集合（不是错误）。
     pub fn inventory(&self) -> Result<Vec<InventoryEntry>, CoreError> {
-        let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);
         let facts = state::GitFacts::read(&self.source_dir)?;
+        self.entries(&facts)
+    }
+
+    /// 顶部状态条：分支、ahead/behind、未提交改动数。
+    pub fn repo_status(&self) -> Result<RepoStatus, CoreError> {
+        self.status(&state::GitFacts::read(&self.source_dir)?)
+    }
+
+    /// 一次刷新要的两半（清单 + 状态条），同一份 git 事实算出来：
+    /// 前端原来分两次 IPC 各跑一遍 git，现在一次 IPC、一份 `git status`（#19）。
+    pub fn refresh(&self) -> Result<Refresh, CoreError> {
+        let facts = state::GitFacts::read(&self.source_dir)?;
+        let entries = self.entries(&facts)?;
+        let status = self.status(&facts)?;
+        Ok(Refresh { entries, status })
+    }
+
+    /// 清单主体：全部受管路径 × 磁盘比较 × git 事实。
+    fn entries(&self, facts: &state::GitFacts) -> Result<Vec<InventoryEntry>, CoreError> {
+        let mirror_root = self.source_dir.join(paths::MIRROR_ROOT);
         let mut entries = Vec::new();
 
         let (mut rels, skipped_symlinks) = paths::managed_relative_paths(&mirror_root)?;
@@ -196,7 +215,7 @@ impl Core {
             } else {
                 self.disk(rel.as_path())?
             };
-            let status = state::derive(disk, &repo_path(&rel), &facts);
+            let status = state::derive(disk, &repo_path(&rel), facts);
             entries.push(InventoryEntry {
                 source,
                 target,
@@ -444,8 +463,9 @@ impl Core {
     }
 
     /// 顶部状态条：分支、ahead/behind、未提交改动数。
-    pub fn repo_status(&self) -> Result<RepoStatus, CoreError> {
-        let branch = git::run(&self.source_dir, &["branch", "--show-current"])?;
+    /// 状态条那一半：分支、ahead/behind、未提交改动数，全部取自同一份 git 事实。
+    fn status(&self, facts: &state::GitFacts) -> Result<RepoStatus, CoreError> {
+        let branch = facts.branch();
         if branch.is_empty() {
             return Err(CoreError {
                 kind: ErrorKind::Git,
@@ -454,18 +474,13 @@ impl Core {
             });
         }
 
-        let dirty = git::run(&self.source_dir, &["status", "--porcelain"])?
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count() as u32;
-
-        let (behind, ahead) = git::ahead_behind(&self.source_dir);
+        let (ahead, behind) = facts.ahead_behind();
 
         Ok(RepoStatus {
-            branch,
+            branch: branch.to_string(),
             ahead,
             behind,
-            dirty,
+            dirty: facts.dirty_count(),
         })
     }
 }

@@ -58,6 +58,13 @@ pub struct RepoStatus {
     pub branch: String,
     pub ahead: u32,
     pub behind: u32,
-    /// `git status --porcelain` 的行数（含未跟踪文件）。
+    /// 未提交改动的路径数（含未跟踪文件；未跟踪目录里的每个文件各算一条）。
     pub dirty: u32,
+}
+
+/// 一次刷新的全部结果：清单 + 状态条，同一份 git 事实算出，一次 IPC 带走（#19）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Refresh {
+    pub entries: Vec<InventoryEntry>,
+    pub status: RepoStatus,
 }
