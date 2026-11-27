@@ -30,6 +30,11 @@ const KEEP_DAYS: i64 = 30;
 
 const MANIFEST: &str = "manifest.json";
 const FILES: &str = "files";
+/// 清单落盘节奏：第一项之后每记这么多项落一次盘（不是每项）。
+/// 落一次盘 = 整份清单序列化 + 临时文件 + rename，逐项落就是 O(N²) 写入；
+/// 按批落把写入次数压到 `N / 64 + 1`，代价是应用中途崩掉时最后不到 64 项没有记录
+/// （见 `Snapshot::push`）。
+const MANIFEST_FLUSH_EVERY: usize = 64;
 
 /// 一次应用的清单：撤销只看它。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,10 +156,13 @@ pub(crate) struct Origin {
     mode: Option<u32>,
 }
 
-/// 一次应用写盘前的快照目录。`execute_apply` 每写一项前 `save`，最后 `commit` 落清单。
+/// 一次应用写盘前的快照目录。`execute_apply` 每写一项前 `save`，按批落清单，最后 `commit` 再落一次。
 pub(crate) struct Snapshot {
     dir: PathBuf,
     manifest: BackupManifest,
+    /// 落盘次数：只有测试看得见（逐项落盘的回归靠它计数）。
+    #[cfg(test)]
+    flushes: std::cell::Cell<usize>,
 }
 
 impl Snapshot {
@@ -193,6 +201,8 @@ impl Snapshot {
                 created_at: now.to_rfc3339(),
                 entries: Vec::new(),
             },
+            #[cfg(test)]
+            flushes: std::cell::Cell::new(0),
         })
     }
 
@@ -257,9 +267,14 @@ impl Snapshot {
             written_len,
             result,
         });
-        // 每记一项就落一次盘：应用中途崩掉、或最后一次落清单失败时，已经写成的项
-        // 仍然可撤销（清单里就是它们）。
-        let _ = self.write_manifest();
+        // 按批落盘：第一项落一次（应用确实写过东西了，清单就该在盘上），之后每
+        // `MANIFEST_FLUSH_EVERY` 项落一次，最后 `commit` 必然再落一次。
+        // 崩溃窗口：进程死在两次落盘之间时，最后不到 64 项已经写进目标但没记进清单，
+        // 这部分撤销不了（备份原文仍在 `files/` 里，可手动恢复）；其余项都可撤销。
+        let recorded = self.manifest.entries.len();
+        if recorded == 1 || recorded.is_multiple_of(MANIFEST_FLUSH_EVERY) {
+            let _ = self.write_manifest();
+        }
     }
 
     pub(crate) fn record_written(
@@ -284,6 +299,8 @@ impl Snapshot {
     }
 
     fn write_manifest(&self) -> Result<(), String> {
+        #[cfg(test)]
+        self.flushes.set(self.flushes.get() + 1);
         let path = self.dir.join(MANIFEST);
         let json = serde_json::to_string_pretty(&self.manifest)
             .map_err(|e| format!("生成备份清单失败：{e}"))?;
@@ -843,9 +860,9 @@ mod tests {
         );
     }
 
-    /// 应用中途崩掉也不会丢「哪些已经写了」：每记一项就落一次盘，不等到最后。
+    /// 第一项就落盘：应用刚写过东西，清单就该在盘上，进程此时崩掉也还有撤销记录。
     #[test]
-    fn every_recorded_entry_is_on_disk_before_commit() {
+    fn the_first_recorded_entry_is_on_disk_before_commit() {
         let (_tmp, home, source, target) = world();
         let snapshot = snapshot_with_one_write(&home, &source, &target);
 
@@ -856,6 +873,70 @@ mod tests {
             text.contains("written_len"),
             "清单里要存下写入长度（指纹之外的第二种比对）：{text}"
         );
+    }
+
+    /// 落盘节奏：N 项只按批落盘，不是每项一次。逐项落一次 = 整份清单序列化 + rename 各 N 次，
+    /// 累计写入量 O(N²)（全部应用上千项时是几百 MB 写放大）。
+    #[test]
+    fn manifest_flushes_are_batched_not_one_per_entry() {
+        let (_tmp, home, source, _target) = world();
+        let mut snapshot = Snapshot::create(&home, &source).unwrap();
+        let n = MANIFEST_FLUSH_EVERY * 3 + 8;
+        for i in 0..n {
+            snapshot.record_failed(&home.join(format!(".file-{i}")), None, "没写成".to_string());
+        }
+
+        let flushes = snapshot.flushes.get();
+        assert!(
+            flushes <= n / MANIFEST_FLUSH_EVERY + 1,
+            "{n} 项只该按落盘周期落盘，实际落了 {flushes} 次（逐项落盘就是 {n} 次）"
+        );
+        assert!(
+            flushes >= 2,
+            "一项都不落盘的话，应用中途崩掉就一点记录都没有：{flushes}"
+        );
+    }
+
+    /// 崩溃窗口：不 `commit`（进程在应用中途死掉）时，盘上的清单停在最后一个落盘点，
+    /// 之后最多 `MANIFEST_FLUSH_EVERY - 1` 项没记进去。交付说明里写的就是这个窗口。
+    #[test]
+    fn a_crash_mid_apply_leaves_the_manifest_at_the_last_flush_point() {
+        let (_tmp, home, source, _target) = world();
+        let mut snapshot = Snapshot::create(&home, &source).unwrap();
+        let tail = MANIFEST_FLUSH_EVERY / 2;
+        let n = MANIFEST_FLUSH_EVERY + tail;
+        for i in 0..n {
+            snapshot.record_failed(&home.join(format!(".file-{i}")), None, "没写成".to_string());
+        }
+
+        // 进程到这里死掉：不再 commit，盘上只剩最后一次落盘的那份。
+        let text = std::fs::read_to_string(snapshot.dir.join(MANIFEST)).expect("清单在盘上");
+        let on_disk: BackupManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            on_disk.entries.len(),
+            MANIFEST_FLUSH_EVERY,
+            "盘上停在最后一个落盘点"
+        );
+        assert_eq!(
+            n - on_disk.entries.len(),
+            tail,
+            "丢掉的是落盘点之后的尾巴，不能超过一个落盘周期"
+        );
+    }
+
+    /// 结束时必然落一次盘：就算中间一次都没落（或被删了），`commit` 也自己写。
+    #[test]
+    fn commit_always_writes_the_manifest_at_the_end() {
+        let (_tmp, home, source, target) = world();
+        let snapshot = snapshot_with_one_write(&home, &source, &target);
+        let manifest = snapshot.dir.join(MANIFEST);
+        std::fs::remove_file(&manifest).unwrap();
+
+        let (summary, warning) = snapshot.commit();
+
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(summary.written, 1);
+        assert!(manifest.is_file(), "commit 必须自己再落一次清单");
     }
 
     /// 没有 `manifest.json` 的半截备份（应用写到一半崩了）也要按 mtime 清掉，

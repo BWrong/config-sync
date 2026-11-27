@@ -104,7 +104,7 @@ impl AppState {
     /// 所以同样排进写队列，而不是当读命令放行。
     fn write<T>(&self, work: impl FnOnce(&WriteScope<'_>) -> T) -> T {
         let scope = WriteScope {
-            runtime: &self.runtime,
+            snapshot: &self.runtime,
             _gate: self.write_gate(),
         };
         work(&scope)
@@ -155,23 +155,30 @@ fn write_runtime(slot: &RwLock<Arc<Runtime>>, runtime: Runtime) {
 ///
 /// 存在的理由是 `set_runtime`：换配置快照会换掉整份 `Runtime`，必须与写命令串行。
 /// 把它做成只有 `write()` 造得出来的句柄上的方法，而不是 `AppState` 上的一个普通 `fn`，
-/// 将来就没法绕过门闩直接换（#34）。
+/// 正常路径就绕不过门闩（#34）。
+///
+/// 这是约定，不是类型保证：`write_runtime` 是本模块的自由函数、`AppState.runtime`
+/// 字段本模块内可达，同文件代码仍能跳过门闩直接换快照（#38）。真要堵死得把字段和
+/// `write_runtime` 收进子模块，只暴露 `AppState::runtime()` 与 `WriteScope::set_runtime`。
 ///
 /// 它刻意只交配置快照这一块、不交 `&AppState`：`AppState::write()` / `write_gate()`
 /// 会再锁一次门闩，而 `Mutex` 不可重入，写闭包里调到就是自锁。窄结构从类型上堵住这条缝（#36）。
 struct WriteScope<'a> {
-    runtime: &'a RwLock<Arc<Runtime>>,
+    /// 配置快照那把锁。别自己 `.write()`：取快照用 `runtime()`，换快照用 `set_runtime()`
+    /// （日志与中毒处理都在 `read_runtime` / `write_runtime` 里）。同线程先持写锁再调
+    /// `runtime()` 会自死锁——`RwLock` 写锁不重入（#38）。
+    snapshot: &'a RwLock<Arc<Runtime>>,
     _gate: MutexGuard<'a, ()>,
 }
 
 impl WriteScope<'_> {
     fn runtime(&self) -> Arc<Runtime> {
-        read_runtime(self.runtime)
+        read_runtime(self.snapshot)
     }
 
     /// 换配置快照（只有 `save_settings` 用）。
     fn set_runtime(&self, runtime: Runtime) {
-        write_runtime(self.runtime, runtime);
+        write_runtime(self.snapshot, runtime);
     }
 }
 
