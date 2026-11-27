@@ -1066,12 +1066,12 @@ fn a_local_branch_upstream_falls_back_to_origin_and_the_configured_branch() {
     assert_eq!(again.existing_commits, 0, "{again:?}");
 }
 
-/// 单个文件版本的内容扫描闸门 = `MAX_BLOB_BYTES`（16 MiB，与待推 blob 一侧同一口径）；
-/// 这里造「刚好超过闸门」的文件。
-const SCAN_GATE: u64 = 16 * 1024 * 1024 + 1;
+/// 单个文件版本的内容扫描闸门 = `MAX_BLOB_BYTES`（16 MiB，与待推 blob 一侧同一口径）。
+/// 这里造 20 MiB 的稀疏文件：只真写开头那段内容，其余靠 `set_len` 拉长，不真写 20 MiB。
+const OVERSIZED_BYTES: u64 = 20 * 1024 * 1024;
+/// 闸门在失败文案里的样子（`human_bytes` 的固定格式）。
+const GATE_TEXT: &str = "16.0 MiB";
 
-/// 造一个刚超过闸门的稀疏文件：只真写开头那段内容，其余靠 `set_len` 拉长，
-/// 不真写 16 MiB 字节。内容里有密钥，用来证明闸门确实挡掉了内容扫描。
 fn write_oversized(f: &fixtures::Fixture, rel_path: &str, content: &str) {
     use std::io::Write;
 
@@ -1079,69 +1079,78 @@ fn write_oversized(f: &fixtures::Fixture, rel_path: &str, content: &str) {
     std::fs::create_dir_all(path.parent().expect("必有父目录")).expect("建父目录");
     let mut file = std::fs::File::create(&path).expect("建大文件");
     file.write_all(content.as_bytes()).expect("写前缀");
-    file.set_len(SCAN_GATE).expect("拉长到闸门之上");
+    file.set_len(OVERSIZED_BYTES).expect("拉长到闸门之上");
 }
 
-/// 超过闸门的 dirty 文件不做内容扫描：整份读入 + 全文正则那条路被闸门挡掉。
-/// 这是有意的行为变更（见 `push.rs` 的闸门注释与 PR 说明）。
+/// 超过闸门的 dirty 文件不做内容扫描，但**不是跳过**：整次中止，文案点名文件与两个尺寸。
+/// 跳过就等于大文件里的密钥照推——DESIGN 规则 3 明禁「超限跳过」。
 #[test]
-fn an_oversized_dirty_file_is_not_scanned_for_content() {
+fn an_oversized_dirty_file_aborts_the_push_with_the_gate_message() {
     let f = fixtures::Fixture::new();
     write_oversized(&f, "home/big.log", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
 
-    let outcome = f
+    let error = f
         .core()
         .commit_and_push()
-        .expect("超大文件不该走内容扫描，也就不该被内容正则拦");
+        .expect_err("超过闸门必须整次中止，不能跳过内容扫描");
 
-    assert!(outcome.committed, "{outcome:?}");
-    assert_eq!(outcome.files, 1);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
-}
-
-/// 闸门只挡内容规则：路径规则照旧命中，且命中文案里不许出现内容规则——
-/// 出现了就说明这台老路还在读整份内容。
-#[test]
-fn an_oversized_dirty_file_still_hits_path_rules() {
-    let f = fixtures::Fixture::new();
-    write_oversized(
-        &f,
-        "home/.ssh/id_rsa",
-        "GITHUB_TOKEN=ghp_0123456789abcdef\n",
-    );
-
-    let error = assert_blocked(&f, &f.core());
     assert!(
-        error.message.contains("**/id_rsa"),
-        "路径规则必须照旧命中：{}",
+        error.message.contains("home/big.log"),
+        "必须点名文件：{}",
         error.message
     );
     assert!(
-        !error.message.contains("ghp_"),
-        "超大文件不该进内容扫描：{}",
+        error.message.contains("20.0 MiB") && error.message.contains(GATE_TEXT),
+        "必须给出当前大小与上限：{}",
         error.message
     );
     assert!(
-        error.message.contains("命中 2 条安全规则"),
-        "只该有路径规则这两条（`**/id_rsa` 与 `**/.ssh/id_*`）：{}",
+        error.message.contains("推送被拒绝"),
+        "与待推内容超限同一套固定文案：{}",
         error.message
+    );
+    assert_eq!(
+        f.git(&["diff", "--cached", "--name-only"]),
+        "",
+        "中止后一个文件都不许进暂存区"
+    );
+    assert!(
+        !f.git_try(&["rev-parse", "--verify", "HEAD"]),
+        "中止后不许留下提交"
+    );
+    assert!(
+        !f.remote.join("refs/heads/main").exists(),
+        "中止后远端不该收到任何东西"
     );
 }
 
-/// 暂存区里超过闸门的版本同样不读内容：工作区那份改成小小的一份干净内容，
-/// 就只剩暂存区的大版本——闸门必须也把它挡在内容扫描之外。
+/// 暂存区里超过闸门的版本同样整次中止：工作区那份改成小小的一份干净内容，
+/// 就只剩暂存区的大版本——闸门必须也在这里 fail-closed。
 #[test]
-fn an_oversized_staged_version_is_not_scanned_for_content() {
+fn an_oversized_staged_version_aborts_the_push_too() {
     let f = fixtures::Fixture::new();
     write_oversized(&f, "home/big.log", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
     f.git(&["add", "-A"]);
     f.write_source("home/big.log", "clean now\n");
 
-    let outcome = f
+    let error = f
         .core()
         .commit_and_push()
-        .expect("暂存区里超过闸门的版本不该被内容正则拦");
+        .expect_err("暂存区里超过闸门的版本也必须整次中止");
 
-    assert!(outcome.committed, "{outcome:?}");
-    assert_eq!(outcome.files, 1);
+    assert!(
+        error.message.contains("暂存区文件「home/big.log」")
+            && error.message.contains("20.0 MiB")
+            && error.message.contains(GATE_TEXT),
+        "必须点名暂存区文件与两个尺寸：{}",
+        error.message
+    );
+    assert!(
+        !f.git_try(&["rev-parse", "--verify", "HEAD"]),
+        "不许留下提交"
+    );
+    assert!(
+        !f.remote.join("refs/heads/main").exists(),
+        "远端不该收到任何东西"
+    );
 }
