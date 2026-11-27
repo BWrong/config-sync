@@ -26,10 +26,12 @@ interface FileDiff {
   status: Status;
   /** unified diff 文本，空串 = 两侧没有差异，或太大被闸门跳过（看 omitted）。 */
   text: string;
-  /** 差异太大，没有生成 diff：显示 reason，而不是当 diff 渲染。 */
+  /** 差异太大（或读不进），没有生成 diff：显示 reason，而不是当 diff 渲染。 */
   omitted: boolean;
-  /** omitted 为真时为什么不算：多大、多少行、上限多少。 */
+  /** omitted 为真、或被截断时为什么：多大、多少行、上限多少。 */
   reason: string;
+  /** 差异超过按需上限，text 里只是前若干行：在 diff 上面显示 reason。 */
+  truncated: boolean;
 }
 
 interface RepoStatus {
@@ -446,6 +448,14 @@ function removeReport(outcomes: RemoveOutcome[]): string {
   }`;
 }
 
+/** diff 的展示：两侧相同就明说，截断了就把截断说明放在上面（#17 S2）。 */
+function diffHtml(diff: FileDiff): string {
+  if (diff.omitted) return `<p class="diff-hint">${escapeHtml(diff.reason)}</p>`;
+  const hint = diff.truncated ? `<p class="diff-hint">${escapeHtml(diff.reason)}</p>` : "";
+  if (!diff.text) return hint || `<p class="diff-hint">两侧内容相同，没有差异。</p>`;
+  return `${hint}<pre class="diff-text">${diffLines(diff.text)}</pre>`;
+}
+
 /** 点行展开该文件的 diff；diff 由 Core 生成，这里只按行着色。 */
 async function toggleDiff(row: HTMLLIElement): Promise<void> {
   const head = row.querySelector<HTMLButtonElement>(".row-head")!;
@@ -464,11 +474,7 @@ async function toggleDiff(row: HTMLLIElement): Promise<void> {
   slot.innerHTML = `<p class="diff-hint">正在读取差异…</p>`;
   try {
     const diff = await invoke<FileDiff>("diff", { target: row.dataset.target });
-    slot.innerHTML = diff.omitted
-      ? `<p class="diff-hint">${escapeHtml(diff.reason)}</p>`
-      : diff.text
-        ? `<pre class="diff-text">${diffLines(diff.text)}</pre>`
-        : `<p class="diff-hint">两侧内容相同，没有差异。</p>`;
+    slot.innerHTML = diffHtml(diff);
   } catch (error) {
     slot.innerHTML = errorPanel(error);
   }
@@ -649,6 +655,17 @@ ${SETTINGS_BUTTON}
     </main>`;
 
   app.querySelector<HTMLButtonElement>("[data-cancel-apply]")?.addEventListener("click", () => void cancelApply());
+  app.querySelectorAll<HTMLElement>("[data-apply-diff]").forEach((hint) => {
+    hint.addEventListener("click", async () => {
+      hint.textContent = "正在读取差异…";
+      try {
+        const diff = await invoke<FileDiff>("diff", { target: hint.dataset.applyDiff });
+        hint.outerHTML = diffHtml(diff);
+      } catch (error) {
+        hint.outerHTML = errorPanel(error);
+      }
+    });
+  });
   app.querySelector<HTMLButtonElement>(".confirm-apply")?.addEventListener("click", () => void confirmApply());
   app.querySelector<HTMLButtonElement>(".cancel-apply")?.addEventListener("click", () => void cancelApply());
   bindSettingsEntry();
@@ -664,7 +681,10 @@ function applyItemHtml(item: ApplyItem): string {
   const diff = item.diff
     ? `<pre class="apply-diff">${diffLines(item.diff)}</pre>`
     : item.diff_omitted
-      ? `<p class="apply-reason">${escapeHtml(item.diff_reason)}</p>`
+      ? // 预览不预生成，但点一下仍能拿到内容（#17 S2）。
+        `<p class="apply-reason" role="button" tabindex="0" data-apply-diff="${escapeHtml(
+          item.target,
+        )}" title="${escapeHtml(item.diff_reason)}">差异过大，点击查看</p>`
       : "";
   // 跳过项不写一句话，只在路径前面放个图标，说明留给悬停。
   const hint = item.skip_reason ? SKIP_HINT[item.skip_reason] : null;

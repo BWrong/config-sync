@@ -459,11 +459,11 @@ fn files_over_the_diff_gate_are_not_previewed_as_diffs() {
         big.diff_reason
     );
 
-    // 按需的单文件 diff 走同一道闸门：给原因、不给文本，也不靠 text 嗅探（#17 N1）。
+    // 预览不预生成，但显式点开仍要给内容：6000 行没过按需闸门（#17 S2）。
     let diff = core.diff(&target).unwrap();
-    assert!(diff.omitted, "{diff:?}");
-    assert_eq!(diff.text, "", "超闸门时 text 必须留空");
-    assert!(diff.reason.starts_with(DIFF_TOO_LARGE), "{}", diff.reason);
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(!diff.truncated, "{diff:?}");
+    assert!(diff.text.contains("+key_05999 = value"), "{}", diff.text);
 }
 
 #[test]
@@ -504,10 +504,11 @@ fn the_line_gate_counts_the_line_heaviest_side_not_the_byte_widest_one() {
         item.diff_reason
     );
 
-    // 单文件 diff 同一口径。
+    // 单文件 diff 走按需闸门（宽得多）：20000 行没超，照样给 diff（#17 S2）。
     let diff = core.diff(&target).unwrap();
-    assert!(diff.omitted, "{diff:?}");
-    assert!(diff.reason.contains("20000 行"), "{}", diff.reason);
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(!diff.truncated, "{diff:?}");
+    assert!(diff.text.contains("+k19999="), "{}", diff.text.len());
 }
 
 #[test]

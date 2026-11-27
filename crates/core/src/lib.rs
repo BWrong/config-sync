@@ -238,45 +238,67 @@ impl Core {
         let (old_label, old, new_label, new) = match status {
             Status::PendingCommit | Status::Conflict => (
                 format!("HEAD:{repo}"),
-                revision_text(&self.source_dir, "HEAD", &repo_path),
+                Ok(revision_text(&self.source_dir, "HEAD", &repo_path)),
                 source.display().to_string(),
-                read_text(&source),
+                diff_side(&source),
             ),
             Status::PendingPull => (
                 format!("HEAD:{repo}"),
-                revision_text(&self.source_dir, "HEAD", &repo_path),
+                Ok(revision_text(&self.source_dir, "HEAD", &repo_path)),
                 format!("@{{u}}:{repo}"),
-                revision_text(&self.source_dir, "@{u}", &repo_path),
+                Ok(revision_text(&self.source_dir, "@{u}", &repo_path)),
             ),
             _ => (
                 target.display().to_string(),
-                read_text(target),
+                diff_side(target),
                 source.display().to_string(),
-                read_text(&source),
+                diff_side(&source),
             ),
         };
 
-        // 超过闸门的一对不在这里算：单文件 diff 也不许因为大文件把整条命令拖死（#17）。
-        let (text, omitted, reason) = if old == new {
-            (String::new(), false, String::new())
-        } else if let Some(reason) = diff_gate_reason(&old, &new) {
-            // 不算就不算：`text` 留空，原因单独给，不把一句人话塞进 diff 字段（#17 N1）。
-            (String::new(), true, reason)
-        } else {
-            (
-                unified_diff(&old_label, &new_label, &old, &new),
-                false,
-                String::new(),
-            )
-        };
-
-        Ok(FileDiff {
+        let done = |text: String, omitted: bool, truncated: bool, reason: String| FileDiff {
             target: target.to_path_buf(),
             status,
             text,
             omitted,
             reason,
-        })
+            truncated,
+        };
+
+        let (old, new) = match (old, new) {
+            (Ok(old), Ok(new)) => (old, new),
+            // 读不进就别假装没差异：明说「无法在此预览」，并留编辑器里的退路（#17 S2）。
+            (Err(why), _) | (_, Err(why)) => {
+                return Ok(done(
+                    String::new(),
+                    true,
+                    false,
+                    format!("{DIFF_UNREADABLE}：{why}；请在编辑器里对比这两个文件"),
+                ));
+            }
+        };
+
+        if old == new {
+            return Ok(done(String::new(), false, false, String::new()));
+        }
+
+        // 显式点开的 diff 走按需闸门：比预览宽得多，超过也只截断、不整体拒绝（#17 S2）。
+        let bytes = old.len().max(new.len());
+        let lines = old.lines().count().max(new.lines().count());
+        if bytes <= DIFF_ONDEMAND_MAX_BYTES && lines <= DIFF_ONDEMAND_MAX_LINES {
+            return Ok(done(
+                unified_diff(&old_label, &new_label, &old, &new),
+                false,
+                false,
+                String::new(),
+            ));
+        }
+        Ok(done(
+            unified_diff(&old_label, &new_label, &head_lines(&old), &head_lines(&new)),
+            false,
+            true,
+            format!("已截断：仅显示前 {DIFF_TRUNCATE_LINES} 行（共 {lines} 行）"),
+        ))
     }
 
     /// 打开一行的源文件（受管副本，绝不是 `$HOME` 里的目标文件）要用的尝试序列；不执行进程。
@@ -417,10 +439,34 @@ fn inside(path: &Path, home: &Path) -> Option<PathBuf> {
 }
 
 /// 读文件成文本；不存在（目标缺失、新文件没有 HEAD 版本）按空内容。
-fn read_text(path: &Path) -> String {
-    std::fs::read(path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+/// 显式 diff 的一侧：读不进就给出原因，而不是假装空文件。
+///
+/// 只有「读不进」（读取失败、非 UTF-8、超过硬上限）才走这条错误路；
+/// 文件不存在仍按空内容算，因为新增/删除的一侧本来就没有内容（#17 S2）。
+fn diff_side(path: &Path) -> Result<String, String> {
+    let len = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(_) => 0,
+    };
+    if len > DIFF_HARD_MAX_BYTES {
+        return Err(format!(
+            "文件有 {} MB，超过 {} MB 的硬上限，没有读进内存",
+            len.div_ceil(1024 * 1024),
+            DIFF_HARD_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes =
+        std::fs::read(path).map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| format!("{} 不是 UTF-8 文本", path.display()))
+}
+
+/// 前 `DIFF_TRUNCATE_LINES` 行：截断后的 diff 只算这一段。
+fn head_lines(text: &str) -> String {
+    text.lines()
+        .take(DIFF_TRUNCATE_LINES)
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 /// `git show <rev>:<路径>`；该版本里没有这个文件时按空内容（新增/删除的一侧）。
@@ -432,12 +478,26 @@ fn revision_text(source_dir: &Path, rev: &str, repo_path: &Path) -> String {
     .unwrap_or_default()
 }
 
-/// diff 闸门的两个上限：任一侧超过任一值就不再生成 diff。阈值只在这里定义（#17）。
+/// 预览侧的闸门：清单里每一项都要算 diff，所以压得低，超了就不预生成（#17）。
 pub(crate) const DIFF_MAX_BYTES: usize = 256 * 1024;
 const DIFF_MAX_LINES: usize = 5000;
 
+/// 显式「点击查看」侧的闸门：用户主动点开一个文件，比预览宽两个数量级。
+/// 超过它也不算全量，只算前 `DIFF_TRUNCATE_LINES` 行并说明截断（#17 S2）。
+const DIFF_ONDEMAND_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DIFF_ONDEMAND_MAX_LINES: usize = 100_000;
+
+/// 超过按需闸门时保留的行数。
+const DIFF_TRUNCATE_LINES: usize = 5000;
+
+/// 显式 diff 的硬上限：再大就不读进内存，直接说「无法在此预览」。
+const DIFF_HARD_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// 超闸门时那句原因的固定开头（不靠它判类型，只用来一眼认出）。
 pub const DIFF_TOO_LARGE: &str = "差异过大";
+
+/// 读不进（非 UTF-8 / 超硬上限 / IO 失败）时那句原因的固定开头。
+pub const DIFF_UNREADABLE: &str = "无法在此预览";
 
 /// 超闸门的原因。`lines` 为 `None` 表示那一侧压根没读（超字节闸就不读，见 #17 N4）。
 fn too_large_reason(bytes: usize, lines: Option<usize>) -> String {

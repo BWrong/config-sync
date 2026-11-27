@@ -4,7 +4,7 @@ mod fixtures;
 
 use std::path::Path;
 
-use config_sync_core::Status;
+use config_sync_core::{DIFF_UNREADABLE, Status};
 
 #[test]
 fn diff_between_target_and_source_for_a_pending_row() {
@@ -99,4 +99,76 @@ fn diff_of_a_path_outside_home_is_an_error() {
 
     let error = core.diff(Path::new("/etc/hosts")).unwrap_err();
     assert!(error.message.contains("不在"), "{}", error.message);
+}
+
+#[test]
+fn a_diff_over_the_ondemand_gate_is_truncated_not_refused() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 12 万行（约 2.4MB）：字节没过 4MB，但行数过了 10 万（按需闸门，见 core 的 DIFF_ONDEMAND_*）。
+    let body: String = (0..120_000)
+        .map(|i| format!("key_{i:06} = value\n"))
+        .collect();
+    f.write_source("home/big.conf", &body);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home("big.conf", "old\n");
+
+    let diff = core.diff(&target).unwrap();
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(diff.truncated, "{diff:?}");
+    assert!(
+        diff.reason.contains("已截断"),
+        "截断要有标记：{}",
+        diff.reason
+    );
+    assert!(
+        diff.reason.contains("共 120000 行"),
+        "截断要报总行数：{}",
+        diff.reason
+    );
+    // 内容真的给了，但只有前 5000 行的 diff，不是 12 万行。
+    assert!(diff.text.contains("+key_004999 = value"), "{}", diff.text);
+    assert!(!diff.text.contains("+key_005000 = value"), "{}", diff.text);
+    assert!(
+        diff.text.lines().count() < 6000,
+        "{}",
+        diff.text.lines().count()
+    );
+}
+
+#[test]
+fn a_target_that_is_not_utf8_says_it_cannot_be_previewed_here() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.home.join(".zshrc");
+    std::fs::write(&target, [0xff_u8, 0xfe, 0x00, 0x01]).unwrap();
+
+    let diff = core.diff(&target).unwrap();
+    assert!(diff.omitted, "{diff:?}");
+    assert_eq!(diff.text, "");
+    assert!(diff.reason.starts_with(DIFF_UNREADABLE), "{}", diff.reason);
+    // 退路要留着：让用户去编辑器里对比。
+    assert!(diff.reason.contains("编辑器"), "{}", diff.reason);
+}
+
+#[test]
+fn a_target_over_the_hard_cap_is_not_read_into_memory() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.home.join(".zshrc");
+    // 超过 64MB 的硬上限：不读进内存，直接说没法在这里预览（#17 S2）。
+    std::fs::write(&target, vec![b'a'; 64 * 1024 * 1024 + 1]).unwrap();
+
+    let diff = core.diff(&target).unwrap();
+    assert!(diff.omitted, "{diff:?}");
+    assert_eq!(diff.text, "");
+    assert!(diff.reason.starts_with(DIFF_UNREADABLE), "{}", diff.reason);
+    assert!(diff.reason.contains("64 MB"), "{}", diff.reason);
 }

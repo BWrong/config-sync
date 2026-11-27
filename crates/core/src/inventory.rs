@@ -44,10 +44,12 @@ pub struct FileDiff {
     pub status: Status,
     /// unified diff 文本；空字符串表示两侧没有差异，或差异太大被闸门跳过（看 `omitted`）。
     pub text: String,
-    /// 差异太大，没有生成 diff（`text` 为空）：前端显示 `reason` 而不是 diff。
+    /// 差异太大（或读不进），没有生成 diff（`text` 为空）：前端显示 `reason` 而不是 diff。
     pub omitted: bool,
-    /// `omitted` 为真时为什么不算：多大、多少行、上限多少。
+    /// `omitted` 或不截断时为什么：多大、多少行、上限多少，或「已截断」的说明。
     pub reason: String,
+    /// 差异超过按需上限，`text` 里只是前若干行：前端在 diff 上面显示 `reason`。
+    pub truncated: bool,
 }
 
 /// 顶部状态条：分支、ahead/behind、未提交改动数。
