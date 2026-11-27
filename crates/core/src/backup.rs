@@ -33,7 +33,8 @@ const FILES: &str = "files";
 /// 清单落盘节奏：第一项之后每记这么多项落一次盘（不是每项）。
 /// 落一次盘 = 整份清单序列化 + 临时文件 + rename，逐项落就是 O(N²) 写入；
 /// 按批落把写入次数压到 `N / 64 + 1`，代价是应用中途崩掉时最后不到 64 项没有记录
-/// （见 `Snapshot::push`）。
+/// （见 `Snapshot::push`）。这个「不到 64」窗口的前提是每一批都落盘成功；没落成的批次
+/// 记在 `Snapshot::flush_failures` 里，由 `commit` 当警告带出去，实际窗口会更大。
 const MANIFEST_FLUSH_EVERY: usize = 64;
 
 /// 一次应用的清单：撤销只看它。
@@ -42,7 +43,16 @@ pub struct BackupManifest {
     /// 目录名，也是 `list_backups` 里的 id。
     pub id: String,
     pub created_at: String,
+    /// 清单是否落到了 `commit()` 那一次。批次落盘写下的只是半截清单：进程在此之后死掉，
+    /// 盘上这一份就停在那个落盘点（`false`），之后写到目标的项撤销不到。
+    /// 老清单没有这个字段，默认按完整算（那时只在结束时落一次，有清单就是落完了）。
+    #[serde(default = "complete_by_default")]
+    pub complete: bool,
     pub entries: Vec<BackupEntry>,
+}
+
+fn complete_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +89,8 @@ pub struct BackupSummary {
     pub written: usize,
     /// 没写成几项（撤销时不管）。
     pub failed: usize,
+    /// 清单是否落到了 `commit()` 那一次：`false` 说明进程死在应用中途，这份备份可能不完整。
+    pub complete: bool,
 }
 
 /// 撤销计划：预览展示它，执行也执行它。
@@ -86,6 +98,9 @@ pub struct BackupSummary {
 pub struct RestorePlan {
     pub backup: String,
     pub created_at: String,
+    /// 同 `BackupSummary::complete`：`false` 时预览要提示这份备份可能不完整。
+    #[serde(default)]
+    pub complete: bool,
     pub items: Vec<RestoreItem>,
 }
 
@@ -160,6 +175,8 @@ pub(crate) struct Origin {
 pub(crate) struct Snapshot {
     dir: PathBuf,
     manifest: BackupManifest,
+    /// 批次落盘失败的次数：不能吞掉，`commit()` 的警告要能说清这一档。
+    flush_failures: usize,
     /// 落盘次数：只有测试看得见（逐项落盘的回归靠它计数）。
     #[cfg(test)]
     flushes: std::cell::Cell<usize>,
@@ -199,8 +216,10 @@ impl Snapshot {
             manifest: BackupManifest {
                 id,
                 created_at: now.to_rfc3339(),
+                complete: false,
                 entries: Vec::new(),
             },
+            flush_failures: 0,
             #[cfg(test)]
             flushes: std::cell::Cell::new(0),
         })
@@ -271,9 +290,12 @@ impl Snapshot {
         // `MANIFEST_FLUSH_EVERY` 项落一次，最后 `commit` 必然再落一次。
         // 崩溃窗口：进程死在两次落盘之间时，最后不到 64 项已经写进目标但没记进清单，
         // 这部分撤销不了（备份原文仍在 `files/` 里，可手动恢复）；其余项都可撤销。
+        // 这个「不到 64」的前提是这一批落盘成功了：没落成的批次要计数，由 `commit` 带出去。
         let recorded = self.manifest.entries.len();
-        if recorded == 1 || recorded.is_multiple_of(MANIFEST_FLUSH_EVERY) {
-            let _ = self.write_manifest();
+        if (recorded == 1 || recorded.is_multiple_of(MANIFEST_FLUSH_EVERY))
+            && self.write_manifest().is_err()
+        {
+            self.flush_failures += 1;
         }
     }
 
@@ -312,8 +334,20 @@ impl Snapshot {
     ///
     /// 返回值第二项是清单写失败的原因：那次应用已经写完盘了，所以这不叫失败，叫「这次备份
     /// 撤销不了」，由调用方当警告带回去。
-    pub(crate) fn commit(self) -> (BackupSummary, Option<String>) {
-        let warning = self.write_manifest().err();
+    pub(crate) fn commit(mut self) -> (BackupSummary, Option<String>) {
+        // 最后一次落盘：只有它落下去了，盘上才是完整清单（`complete` 标记也在这里翻成 true）。
+        self.manifest.complete = true;
+        let warning = match (self.write_manifest().err(), self.flush_failures) {
+            // 最后一次落成了 = 盘上是一份完整清单，中途批次失败没有留下后果：不报。
+            // 报了前端会把「有警告」当成「清单没落盘」，白关掉一个本来能用的撤销入口。
+            (None, _) => None,
+            (Some(error), 0) => Some(error),
+            (Some(error), failures) => Some(format!(
+                "{error}；另外有 {failures} 次批次落盘失败：清单可能停在更早的落盘点，\
+                 未记清单的项会多于 {} 项",
+                MANIFEST_FLUSH_EVERY - 1
+            )),
+        };
 
         // 保留策略是「还好」，清不掉不影响这次应用的结果。
         let _ = prune(
@@ -338,6 +372,7 @@ impl Snapshot {
                     .count(),
                 id: self.manifest.id,
                 created_at: self.manifest.created_at,
+                complete: self.manifest.complete,
             },
             warning,
         )
@@ -381,6 +416,7 @@ impl Core {
                     .iter()
                     .filter(|entry| matches!(entry.result, BackupResult::Failed { .. }))
                     .count(),
+                complete: manifest.complete,
                 id: manifest.id,
                 created_at: manifest.created_at,
             })
@@ -548,6 +584,7 @@ impl Core {
         Ok(RestorePlan {
             backup: manifest.id,
             created_at: manifest.created_at,
+            complete: manifest.complete,
             items,
         })
     }
@@ -921,6 +958,107 @@ mod tests {
             n - on_disk.entries.len(),
             tail,
             "丢掉的是落盘点之后的尾巴，不能超过一个落盘周期"
+        );
+        assert!(
+            !on_disk.complete,
+            "没有 commit 的清单是半截的：撤销预览要能提示「可能不完整」"
+        );
+    }
+
+    /// 批次落盘失败不能吞：最后一次也没落成时，警告要说清「另外有几次没落成」。
+    #[test]
+    fn batch_flush_failures_are_counted_in_the_commit_warning() {
+        let (_tmp, home, source, _target) = world();
+        let mut snapshot = Snapshot::create(&home, &source).unwrap();
+        // 第一项那一批是成功的（清单已经在盘上）。
+        snapshot.record_failed(&home.join(".a"), None, "没写成".to_string());
+
+        // 把清单路径换成一个目录：之后每一次落盘（批次与 commit）都 rename 不上去。
+        let manifest = snapshot.dir.join(MANIFEST);
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        for i in 0..MANIFEST_FLUSH_EVERY - 1 {
+            snapshot.record_failed(&home.join(format!(".file-{i}")), None, "没写成".to_string());
+        }
+        assert_eq!(snapshot.flush_failures, 1, "走到一个落盘点，失败一次");
+
+        let (_, warning) = snapshot.commit();
+
+        let warning = warning.expect("最后一次也没落成，必须带一条警告回去");
+        assert!(
+            warning.contains("1 次批次落盘失败"),
+            "警告要说清另外有几次批次落盘失败：{warning}"
+        );
+    }
+
+    /// 批次失败后最后一次落成了 = 盘上是完整清单，撤销照常可用：这时不该报警告，
+    /// 否则前端会把「有警告」当成「清单没落盘」，关掉一个本来能用的撤销入口。
+    #[test]
+    fn a_recovered_batch_failure_does_not_warn_because_the_last_write_is_complete() {
+        let (_tmp, home, source, _target) = world();
+        let mut snapshot = Snapshot::create(&home, &source).unwrap();
+        snapshot.record_failed(&home.join(".a"), None, "没写成".to_string());
+
+        let manifest = snapshot.dir.join(MANIFEST);
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        for i in 0..MANIFEST_FLUSH_EVERY - 1 {
+            snapshot.record_failed(&home.join(format!(".file-{i}")), None, "没写成".to_string());
+        }
+        assert_eq!(snapshot.flush_failures, 1);
+
+        // 空间回来了：最后一次落盘成功。
+        std::fs::remove_dir(&manifest).unwrap();
+        let (summary, warning) = snapshot.commit();
+
+        assert!(warning.is_none(), "最后一次落成了就不该报警告：{warning:?}");
+        assert_eq!(summary.written, 0);
+        assert!(summary.complete, "commit 落成之后就是一份完整备份");
+    }
+
+    /// 应用中途崩掉留下的半截清单（只有批次落盘那几项）：`list_backups` 与撤销预览
+    /// 都要能看出「这份备份可能不完整」，否则它和一次正常备份长得一模一样。
+    #[test]
+    fn a_backup_left_by_a_crash_is_flagged_incomplete() {
+        let (_tmp, home, source, target) = world();
+        let mut snapshot = Snapshot::create(&home, &source).unwrap();
+        let origin = snapshot.save(&home, &target).unwrap();
+        let len = std::fs::metadata(&target).unwrap().len();
+        snapshot.record_written(
+            &target,
+            origin,
+            crate::apply::digest(b"export A=1\n"),
+            Some(len),
+        );
+        // 进程到这里死掉：不再 commit。
+        drop(snapshot);
+
+        let core = Core::new(&home, &source, crate::Config::default());
+        let backups = core.list_backups().unwrap();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(!backups[0].complete, "半截清单必须标成不完整");
+
+        let plan = core.plan_restore_backup(&backups[0].id).unwrap();
+        assert!(!plan.complete, "撤销预览也要能看到这份备份不完整");
+    }
+
+    /// 老清单没有 `complete` 字段：按完整算（那时只在结束时落一次，有清单就是落完了）。
+    #[test]
+    fn an_old_manifest_without_the_flag_reads_as_complete() {
+        let (_tmp, home, source, _target) = world();
+        let core = Core::new(&home, &source, crate::Config::default());
+        let id = "20200101-000000";
+        let dir = home.join(BACKUP_ROOT).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST),
+            format!(r#"{{"id":"{id}","created_at":"x","entries":[]}}"#),
+        )
+        .unwrap();
+
+        assert!(
+            core.read_manifest(id).unwrap().complete,
+            "没有标记的老清单不能被当成半截备份"
         );
     }
 

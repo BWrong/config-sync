@@ -77,6 +77,7 @@ fn undo_restores_three_overwritten_files_with_their_contents_and_modes() {
     let backups = core.list_backups().unwrap();
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert_eq!((backups[0].written, backups[0].failed), (3, 0));
+    assert!(backups[0].complete, "跑完 commit 的备份是一份完整备份");
     let id = backups[0].id.clone();
     assert_eq!(mode_of(&root.join(&id)), 0o700, "单次备份目录也必须是 0700");
 
