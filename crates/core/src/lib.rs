@@ -37,6 +37,7 @@ pub use remove::{RemoveOutcome, RemoveResult};
 pub use resolve::Side;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -48,10 +49,23 @@ pub struct Core {
     caches: Caches,
 }
 
-/// 上次逐行比较磁盘时的两侧 `(长度, mtime)` 与结论：两侧都没动就不读内容（#42-1）。
+/// 一侧文件在某一刻的「廉价身份」：长度 + mtime + ctime + inode。
+///
+/// ctime 是关键：用户态改不回去，`cp -p` / `rsync -a` / `tar -xpf` / 显式 `set_modified`
+/// 这类「连 mtime 一起还原」的恢复都会动它，所以只保留 mtime 骗不过这一关（#42-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    mtime: SystemTime,
+    ctime: i64,
+    ctime_nsec: i64,
+    ino: u64,
+}
+
+/// 上次逐行比较磁盘时的两侧身份与结论：两侧都没动就不读内容（#42-1）。
 struct DiskStamp {
-    target: (u64, SystemTime),
-    source: (u64, SystemTime),
+    target: Stamp,
+    source: Stamp,
     disk: state::Disk,
 }
 
@@ -656,8 +670,12 @@ impl Core {
     /// 先比长度：不相等直接不同，相等才读内容（#20）。两侧 `(长度, mtime)` 都没变时
     /// 直接沿用上次的结论，一个字节都不读（#42-1）。
     ///
-    /// shortcut: 判「没变」只看 `(长度, mtime)`，同一时间粒度内等长改写会被当成没变；
-    /// 它只跳过读内容，结论仍只有 Same / Differs 两档，下游判等不变。
+    /// shortcut: 判「没变」看的是 `(长度, mtime, ctime, inode)` 这一组廉价事实，不是内容。
+    /// 现实里能骗过它的向量只有「连 ctime 都还原」的那一档：`cp -p` / `rsync -a` /
+    /// `tar -xpf` / 显式 `set_modified` 会保留 mtime，但 ctime 用户态改不回去，进程写文件
+    /// 也一定把 ctime 推到当刻——所以「保留 mtime 的恢复」这条路是关死的；同一个文件被
+    /// 原地等长改写、且改动落在同一个时间粒度内又被下一次刷新前 ctime 抹平，才可能漏。
+    /// 漏了也只是跳过读内容，结论仍只有 Same / Differs 两档，下游判等不变。
     fn disk(&self, rel: &Path) -> Result<state::Disk, CoreError> {
         let target = self.home.join(rel);
         let (target_len, target_stamp) = match std::fs::metadata(&target) {
@@ -786,8 +804,14 @@ impl Core {
 }
 
 /// 两侧 `(长度, mtime)`：拿不到 mtime（少见）就 `None`，调用方退回老实读内容。
-fn stamp(meta: &std::fs::Metadata) -> Option<(u64, SystemTime)> {
-    meta.modified().ok().map(|mtime| (meta.len(), mtime))
+fn stamp(meta: &std::fs::Metadata) -> Option<Stamp> {
+    meta.modified().ok().map(|mtime| Stamp {
+        len: meta.len(),
+        mtime,
+        ctime: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+        ino: meta.ino(),
+    })
 }
 
 /// 两侧长度已确认相等时，读内容比字节（错误文案与判等口径不变）。
@@ -1080,16 +1104,49 @@ mod tests {
         assert_eq!(
             DISK_READS.load(Ordering::Relaxed),
             first,
-            "两侧 (长度, mtime) 都没变就不该再读内容"
+            "两侧身份 (长度, mtime, ctime, inode) 都没变就不该再读内容"
         );
 
-        // 等长改写（只有 mtime 变）：短路必须失效，判等仍按内容算。
+        // 等长改写（只有时间戳变）：短路必须失效，判等仍按内容算。
         std::fs::write(home.join(rel), "export B=1\n").unwrap();
         assert_eq!(core.disk(rel).unwrap(), state::Disk::Differs);
         assert_eq!(
             DISK_READS.load(Ordering::Relaxed),
             first + 2,
             "mtime 变了就得重读两侧"
+        );
+
+        // 「保留 mtime 的恢复」这一档：`cp -p` / `rsync -a` / `tar -xpf` 干的就是这件事。
+        // 长度一样、mtime 还被显式改回原值，只有 ctime 会在用户态之外被推走——短路必须失效，
+        // 否则用旧备份覆盖回去会被当成「没变」。
+        let stamp = std::fs::metadata(home.join(rel))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::write(home.join(rel), "export A=1\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(home.join(rel))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(home.join(rel))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp,
+            "mtime 已经还原成原值，这一档只能靠 ctime 认出来"
+        );
+        assert_eq!(
+            core.disk(rel).unwrap(),
+            state::Disk::Same,
+            "mtime 还原但内容确实换回了源侧那份，按内容判仍是 Same"
+        );
+        assert_eq!(
+            DISK_READS.load(Ordering::Relaxed),
+            first + 4,
+            "ctime 变了就必须重读，不许吃缓存"
         );
     }
 

@@ -123,6 +123,12 @@ fn a_deleted_mirror_file_stays_listed_as_pending_commit() {
 }
 
 #[test]
+/// 排序口径的回归保护（#42-5）。
+///
+/// 旧的 `binary_search` + `Vec::insert` 本来就升序，这条用例**不**是新旧实现的判别器：
+/// #42-5 的毛病是每次插入搬一次尾巴（O(D×N) 的指针搬移），是成本不是顺序。改成排序后
+/// 一把线性归并，代价是 O(D log D + N)，顺序语义必须和原来一样——这条用例钉的就是这个
+/// 「一样」（含插在两条留下的中间，而不是追加到末尾），性能本身没在这里测。
 fn deleted_rows_keep_their_alphabetical_place_between_the_surviving_ones() {
     let (f, core) = core();
     for (rel, content) in [
@@ -135,7 +141,7 @@ fn deleted_rows_keep_their_alphabetical_place_between_the_surviving_ones() {
     }
     f.commit_all("config-sync: 3 files");
 
-    // 只删中间那一条：清单里它得回到自己那一格，而不是被追加到末尾。
+    // 只删中间那一条：归并后它得回到自己那一格，而不是被追加到末尾。
     core.remove(&[f.home.join(".zshenv")]).unwrap();
 
     let names: Vec<String> = core
