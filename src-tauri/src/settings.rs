@@ -41,8 +41,9 @@ impl Settings {
     /// 解析失败返回人话错误，**不**覆盖磁盘上那份文件——坏文件留给人看。
     pub fn load_or_create(path: &Path) -> Result<Settings, String> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text)
-                .map_err(|e| format!("{} 解析失败：{e}", path.display())),
+            Ok(text) => {
+                toml::from_str(&text).map_err(|e| format!("{} 解析失败：{e}", path.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let settings = Settings::default();
                 settings.save(path)?;
@@ -122,7 +123,10 @@ impl Settings {
 
     /// 注入 Core 的那份设置（不含 `source_dir`）。
     pub fn core_config(&self) -> Config {
-        Config { branch: self.branch.clone(), editor_command: self.editor_command.clone() }
+        Config {
+            branch: self.branch.clone(),
+            editor_command: self.editor_command.clone(),
+        }
     }
 }
 
@@ -147,7 +151,10 @@ mod tests {
         assert_eq!(loaded, Settings::default());
         assert_eq!(loaded.source_dir, "~/.local/share/config-sync");
         assert!(path.exists(), "首次启动要把默认 config.toml 落盘");
-        assert_eq!(Settings::load_or_create(&path).expect("读回"), Settings::default());
+        assert_eq!(
+            Settings::load_or_create(&path).expect("读回"),
+            Settings::default()
+        );
     }
 
     #[test]
@@ -167,7 +174,10 @@ mod tests {
         assert_eq!(Settings::load_or_create(&path).expect("读回"), settings);
         assert_eq!(
             settings.core_config(),
-            Config { branch: "trunk".to_string(), editor_command: "code -w {}".to_string() }
+            Config {
+                branch: "trunk".to_string(),
+                editor_command: "code -w {}".to_string()
+            }
         );
     }
 
@@ -175,13 +185,23 @@ mod tests {
     fn tilde_expands_against_home_and_absolute_paths_stay_put() {
         let home = Path::new("/Users/someone");
         for (raw, expected) in [
-            ("~/.local/share/config-sync", "/Users/someone/.local/share/config-sync"),
+            (
+                "~/.local/share/config-sync",
+                "/Users/someone/.local/share/config-sync",
+            ),
             ("~", "/Users/someone"),
             ("~/dotfiles/config", "/Users/someone/dotfiles/config"),
             ("/opt/config-sync", "/opt/config-sync"),
         ] {
-            let settings = Settings { source_dir: raw.to_string(), ..Settings::default() };
-            assert_eq!(settings.resolved_source_dir(home), PathBuf::from(expected), "{raw}");
+            let settings = Settings {
+                source_dir: raw.to_string(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                settings.resolved_source_dir(home),
+                PathBuf::from(expected),
+                "{raw}"
+            );
         }
     }
 
@@ -189,21 +209,31 @@ mod tests {
     fn source_dir_must_be_an_existing_directory() {
         let home = tempfile::tempdir().expect("临时 home");
 
-        let missing = Settings { source_dir: "~/missing".to_string(), ..Settings::default() };
-        let err = missing.validate(home.path()).expect_err("不存在的源目录必须报错");
+        let missing = Settings {
+            source_dir: "~/missing".to_string(),
+            ..Settings::default()
+        };
+        let err = missing
+            .validate(home.path())
+            .expect_err("不存在的源目录必须报错");
         assert!(err.contains("不存在"), "{err}");
         assert!(err.contains("missing"), "错误里要有解析后的路径：{err}");
 
         let file = home.path().join("a-file");
         std::fs::write(&file, "x").expect("写文件");
-        let not_a_dir =
-            Settings { source_dir: file.display().to_string(), ..Settings::default() };
+        let not_a_dir = Settings {
+            source_dir: file.display().to_string(),
+            ..Settings::default()
+        };
         let err = not_a_dir.validate(home.path()).expect_err("文件不是源目录");
         assert!(err.contains("不是目录"), "{err}");
 
         let dir = home.path().join("dotfiles");
         std::fs::create_dir(&dir).expect("建目录");
-        let ok = Settings { source_dir: "~/dotfiles".to_string(), ..Settings::default() };
+        let ok = Settings {
+            source_dir: "~/dotfiles".to_string(),
+            ..Settings::default()
+        };
         assert_eq!(ok.validate(home.path()), Ok(()));
     }
 
@@ -211,16 +241,31 @@ mod tests {
     fn editor_command_is_optional_but_non_empty_must_carry_the_placeholder() {
         let home = tempfile::tempdir().expect("临时 home");
 
-        let base = Settings { source_dir: "~".to_string(), ..Settings::default() };
+        let base = Settings {
+            source_dir: "~".to_string(),
+            ..Settings::default()
+        };
 
         let empty = base.clone();
-        assert_eq!(empty.validate(home.path()), Ok(()), "留空表示用系统默认方式打开");
+        assert_eq!(
+            empty.validate(home.path()),
+            Ok(()),
+            "留空表示用系统默认方式打开"
+        );
 
-        let with_placeholder = Settings { editor_command: "code -w {}".to_string(), ..base.clone() };
+        let with_placeholder = Settings {
+            editor_command: "code -w {}".to_string(),
+            ..base.clone()
+        };
         assert_eq!(with_placeholder.validate(home.path()), Ok(()));
 
-        let no_placeholder = Settings { editor_command: "code -w".to_string(), ..base };
-        let err = no_placeholder.validate(home.path()).expect_err("没有 {} 收不到路径");
+        let no_placeholder = Settings {
+            editor_command: "code -w".to_string(),
+            ..base
+        };
+        let err = no_placeholder
+            .validate(home.path())
+            .expect_err("没有 {} 收不到路径");
         assert!(err.contains("{}"), "{err}");
     }
 
@@ -228,15 +273,24 @@ mod tests {
     fn validate_rejects_empty_or_relative_source_dir_and_empty_branch() {
         let home = tempfile::tempdir().expect("临时 home");
 
-        let empty = Settings { source_dir: "  ".to_string(), ..Settings::default() };
+        let empty = Settings {
+            source_dir: "  ".to_string(),
+            ..Settings::default()
+        };
         assert!(empty.validate(home.path()).is_err(), "空源目录");
 
-        let relative = Settings { source_dir: "dotfiles".to_string(), ..Settings::default() };
+        let relative = Settings {
+            source_dir: "dotfiles".to_string(),
+            ..Settings::default()
+        };
         let err = relative.validate(home.path()).expect_err("相对路径不接受");
         assert!(err.contains("绝对路径"), "{err}");
 
-        let no_branch =
-            Settings { source_dir: "~".to_string(), branch: " ".to_string(), ..Settings::default() };
+        let no_branch = Settings {
+            source_dir: "~".to_string(),
+            branch: " ".to_string(),
+            ..Settings::default()
+        };
         let err = no_branch.validate(home.path()).expect_err("空分支");
         assert!(err.contains("分支"), "{err}");
     }

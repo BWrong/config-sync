@@ -12,12 +12,17 @@ fn core_with(f: &Fixture, editor_command: &str) -> Core {
     Core::new(
         &f.home,
         &f.source_dir,
-        Config { branch: "main".to_string(), editor_command: editor_command.to_string() },
+        Config {
+            branch: "main".to_string(),
+            editor_command: editor_command.to_string(),
+        },
     )
 }
 
 fn text(plan: &[config_sync_core::Attempt]) -> Vec<(String, Vec<String>, bool)> {
-    plan.iter().map(|a| (a.program.clone(), a.args.clone(), a.wait)).collect()
+    plan.iter()
+        .map(|a| (a.program.clone(), a.args.clone(), a.wait))
+        .collect()
 }
 
 #[test]
@@ -34,11 +39,18 @@ fn placeholder_becomes_the_source_path_and_a_path_with_spaces_stays_one_argument
         text(&plan),
         vec![(
             "code".to_string(),
-            vec!["-w".to_string(), "--goto".to_string(), source.display().to_string()],
+            vec![
+                "-w".to_string(),
+                "--goto".to_string(),
+                source.display().to_string()
+            ],
             false
         )]
     );
-    assert_ne!(source, target, "编辑的是源目录里的副本，不是 $HOME 里的目标文件");
+    assert_ne!(
+        source, target,
+        "编辑的是源目录里的副本，不是 $HOME 里的目标文件"
+    );
 }
 
 #[test]
@@ -70,7 +82,9 @@ fn editor_command_without_the_placeholder_is_a_config_error() {
     let source = f.write_source("home/.zshrc", "export A=1\n");
     let core = core_with(&f, "code -w");
 
-    let error = core.edit_plan(&f.home.join(".zshrc")).expect_err("缺 {} 拿不到路径");
+    let error = core
+        .edit_plan(&f.home.join(".zshrc"))
+        .expect_err("缺 {} 拿不到路径");
 
     assert_eq!(error.kind, ErrorKind::Io);
     assert!(error.message.contains("{}"), "{}", error.message);
@@ -83,7 +97,9 @@ fn editor_command_that_is_only_a_placeholder_is_rejected() {
     f.write_source("home/.zshrc", "export A=1\n");
     let core = core_with(&f, "{}");
 
-    let error = core.edit_plan(&f.home.join(".zshrc")).expect_err("没有程序名可执行");
+    let error = core
+        .edit_plan(&f.home.join(".zshrc"))
+        .expect_err("没有程序名可执行");
     assert!(error.message.contains("程序名"), "{}", error.message);
 }
 
@@ -94,7 +110,9 @@ fn missing_source_file_is_reported_instead_of_opening_an_empty_path() {
 
     // `$HOME` 里有、源目录里没有：清单已过期，不能把空路径交给编辑器。
     f.write_home(".zshrc", "export A=1\n");
-    let error = core.edit_plan(&f.home.join(".zshrc")).expect_err("源文件不存在");
+    let error = core
+        .edit_plan(&f.home.join(".zshrc"))
+        .expect_err("源文件不存在");
 
     assert!(error.message.contains("不存在"), "{}", error.message);
 }
@@ -104,7 +122,9 @@ fn paths_outside_home_are_rejected() {
     let f = Fixture::new();
     let core = core_with(&f, "");
 
-    let error = core.edit_plan(&f.path("elsewhere/.zshrc")).expect_err("不在 $HOME 下没有受管文件");
+    let error = core
+        .edit_plan(&f.path("elsewhere/.zshrc"))
+        .expect_err("不在 $HOME 下没有受管文件");
 
     assert!(error.message.contains("不在"), "{}", error.message);
 }

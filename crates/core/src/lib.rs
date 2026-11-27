@@ -18,7 +18,6 @@ pub mod resolve;
 mod state;
 
 pub use add::{AddOutcome, AddResult};
-pub use remove::{RemoveOutcome, RemoveResult};
 pub use apply::{
     ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary, SkipReason,
 };
@@ -28,6 +27,7 @@ pub use error::{CoreError, ErrorKind};
 pub use inventory::{FileDiff, InventoryEntry, RepoStatus, Status};
 pub use onboarding::Candidate;
 pub use push::PushOutcome;
+pub use remove::{RemoveOutcome, RemoveResult};
 pub use resolve::Side;
 
 use std::collections::HashSet;
@@ -42,7 +42,11 @@ pub struct Core {
 impl Core {
     /// `home` 是镜像布局的根（目标文件根），`source_dir` 是 git 工作区。
     pub fn new(home: impl Into<PathBuf>, source_dir: impl Into<PathBuf>, config: Config) -> Self {
-        Core { home: home.into(), source_dir: source_dir.into(), config }
+        Core {
+            home: home.into(),
+            source_dir: source_dir.into(),
+            config,
+        }
     }
 
     /// 源目录里是否已经有一个 git 仓库。
@@ -74,7 +78,10 @@ impl Core {
             }
         } else {
             std::fs::create_dir_all(&self.source_dir).map_err(|e| {
-                CoreError::io(format!("创建源目录 {} 失败：{e}", self.source_dir.display()))
+                CoreError::io(format!(
+                    "创建源目录 {} 失败：{e}",
+                    self.source_dir.display()
+                ))
             })?;
         }
 
@@ -152,15 +159,15 @@ impl Core {
         let (mut rels, skipped_symlinks) = paths::managed_relative_paths(&mirror_root)?;
         if skipped_symlinks > 0 {
             // C2：符号链接被跳过 → 提示而非无声丢失；清单仍返回（用户可自行处理）。
-            eprintln!(
-                "config-sync: 跳过 {skipped_symlinks} 个符号链接（v1 不支持符号链接语义）"
-            );
+            eprintln!("config-sync: 跳过 {skipped_symlinks} 个符号链接（v1 不支持符号链接语义）");
         }
         // 删掉的文件在磁盘上已经没有了，但 git 里还挂着这桩删除（未提交，或已提交未推送）：
         // 不列出来的话，清单上根本看不见「待提交」和「待推送」的删除。
         let mut deleted = HashSet::new();
         for path in facts.dirty_paths().chain(facts.push_deleted_paths()) {
-            let Ok(rel) = path.strip_prefix(paths::MIRROR_ROOT) else { continue };
+            let Ok(rel) = path.strip_prefix(paths::MIRROR_ROOT) else {
+                continue;
+            };
             // 磁盘上真没有才算删除；符号链接在这里也不收（C2 的跳过口径一致）。
             if std::fs::symlink_metadata(mirror_root.join(rel)).is_ok() {
                 continue;
@@ -178,9 +185,18 @@ impl Core {
             let target = self.home.join(&rel);
             let gone = deleted.contains(&rel);
             // 已经删掉的行没有源文件可比，磁盘侧按「无可比对象」算；状态由 git 事实定。
-            let disk = if gone { state::Disk::Missing } else { self.disk(rel.as_path())? };
+            let disk = if gone {
+                state::Disk::Missing
+            } else {
+                self.disk(rel.as_path())?
+            };
             let status = state::derive(disk, &repo_path(&rel), &facts);
-            entries.push(InventoryEntry { source, target, status, deleted: gone });
+            entries.push(InventoryEntry {
+                source,
+                target,
+                status,
+                deleted: gone,
+            });
         }
 
         Ok(entries)
@@ -206,7 +222,11 @@ impl Core {
         let repo = repo_path.display().to_string();
         let facts = state::GitFacts::read(&self.source_dir)?;
         // 源文件已经被删（待提交的删除）时没有可比的一侧，磁盘侧按「无可比对象」算。
-        let disk = if source.is_file() { self.disk(rel)? } else { state::Disk::Missing };
+        let disk = if source.is_file() {
+            self.disk(rel)?
+        } else {
+            state::Disk::Missing
+        };
         let status = state::derive(disk, &repo_path, &facts);
 
         let (old_label, old, new_label, new) = match status {
@@ -288,7 +308,10 @@ impl Core {
             return Some(rel);
         }
         // 选择器与终端常给出带符号链接的路径（macOS 上 /tmp、/var 都是软链）：按真实路径再试一次。
-        inside(&expanded.canonicalize().ok()?, &self.home.canonicalize().ok()?)
+        inside(
+            &expanded.canonicalize().ok()?,
+            &self.home.canonicalize().ok()?,
+        )
     }
 
     fn disk(&self, rel: &Path) -> Result<state::Disk, CoreError> {
@@ -297,7 +320,10 @@ impl Core {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(state::Disk::Missing),
             Err(e) => {
-                return Err(CoreError::io(format!("读取 {} 失败：{e}", target.display())))
+                return Err(CoreError::io(format!(
+                    "读取 {} 失败：{e}",
+                    target.display()
+                )));
             }
         };
 
@@ -305,7 +331,11 @@ impl Core {
         let source_bytes = std::fs::read(&source)
             .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
 
-        Ok(if source_bytes == target_bytes { state::Disk::Same } else { state::Disk::Differs })
+        Ok(if source_bytes == target_bytes {
+            state::Disk::Same
+        } else {
+            state::Disk::Differs
+        })
     }
 
     /// 顶部状态条：分支、ahead/behind、未提交改动数。
@@ -326,7 +356,12 @@ impl Core {
 
         let (behind, ahead) = git::ahead_behind(&self.source_dir);
 
-        Ok(RepoStatus { branch, ahead, behind, dirty })
+        Ok(RepoStatus {
+            branch,
+            ahead,
+            behind,
+            dirty,
+        })
     }
 }
 
@@ -347,12 +382,18 @@ fn inside(path: &Path, home: &Path) -> Option<PathBuf> {
 
 /// 读文件成文本；不存在（目标缺失、新文件没有 HEAD 版本）按空内容。
 fn read_text(path: &Path) -> String {
-    std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default()
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 /// `git show <rev>:<路径>`；该版本里没有这个文件时按空内容（新增/删除的一侧）。
 fn revision_text(source_dir: &Path, rev: &str, repo_path: &Path) -> String {
-    git::run(source_dir, &["show", &format!("{rev}:{}", repo_path.display())]).unwrap_or_default()
+    git::run(
+        source_dir,
+        &["show", &format!("{rev}:{}", repo_path.display())],
+    )
+    .unwrap_or_default()
 }
 
 /// 两侧相同就是空串（前端显示「没有差异」），否则是带 `---/+++` 头的 unified diff。

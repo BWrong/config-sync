@@ -62,7 +62,10 @@ const CONTENT_RULES: &[&str] = &[
 ];
 
 static CONTENT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    CONTENT_RULES.iter().map(|rule| Regex::new(rule).expect("内容规则是合法正则")).collect()
+    CONTENT_RULES
+        .iter()
+        .map(|rule| Regex::new(rule).expect("内容规则是合法正则"))
+        .collect()
 });
 
 /// 一次推送的结果，供状态条显示。
@@ -93,7 +96,12 @@ impl Core {
         // 一份 GitFacts 同时喂给硬拦与「有没有改动」，不重复跑 `git status`。
         let facts = state::GitFacts::read(&self.source_dir)?;
         let target = PushTarget::read(&self.source_dir)?;
-        let hits = scan(&self.source_dir, &facts, target.scan_base.as_deref(), target.ahead)?;
+        let hits = scan(
+            &self.source_dir,
+            &facts,
+            target.scan_base.as_deref(),
+            target.ahead,
+        )?;
         if !hits.is_empty() {
             return Err(blocked_error(&hits));
         }
@@ -114,8 +122,10 @@ impl Core {
                 "config-sync: {files} files ({})",
                 chrono::Local::now().format("%Y-%m-%d %H:%M")
             );
-            git::run(&self.source_dir, &["commit", "-m", &message])
-                .map_err(|e| CoreError { message: format!("自动提交「{message}」失败"), ..e })?;
+            git::run(&self.source_dir, &["commit", "-m", &message]).map_err(|e| CoreError {
+                message: format!("自动提交「{message}」失败"),
+                ..e
+            })?;
             committed = true;
         }
 
@@ -181,7 +191,10 @@ impl PushTarget {
                 return None;
             }
             let branch = fields.next()?.to_string();
-            let upstream = fields.next().filter(|up| !up.is_empty()).map(str::to_string);
+            let upstream = fields
+                .next()
+                .filter(|up| !up.is_empty())
+                .map(str::to_string);
             Some((branch, upstream))
         });
         let (branch, upstream) = match found {
@@ -214,7 +227,12 @@ impl PushTarget {
             .or_else(|| count_commits(source_dir, "HEAD"))
             .unwrap_or(0);
 
-        Ok(PushTarget { branch, upstream, ahead, scan_base })
+        Ok(PushTarget {
+            branch,
+            upstream,
+            ahead,
+            scan_base,
+        })
     }
 }
 
@@ -233,7 +251,11 @@ fn push_base(source_dir: &Path, branch: &str, upstream: Option<&str>) -> Option<
 }
 
 fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
-    git::run(source_dir, &["rev-list", "--count", rev]).ok()?.trim().parse().ok()
+    git::run(source_dir, &["rev-list", "--count", rev])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// `git add -A` 之后暂存区里的文件数 = 本次提交涉及的文件数。
@@ -279,7 +301,12 @@ fn scan(
         check_path_rules(&mut hits, &mut seen, &repo_path);
         // 工作区版本读磁盘；二进制按有损 UTF-8 读，不影响正则。
         if let Ok(bytes) = std::fs::read(source_dir.join(path)) {
-            check_content_rules(&mut hits, &mut seen, &repo_path, &String::from_utf8_lossy(&bytes));
+            check_content_rules(
+                &mut hits,
+                &mut seen,
+                &repo_path,
+                &String::from_utf8_lossy(&bytes),
+            );
         }
     }
 
@@ -338,7 +365,15 @@ fn pending_blobs(
     // `-z` 的 raw 输出才是 NUL 结尾的完整路径。
     let raw = git::run(
         source_dir,
-        &["log", "--raw", "-z", "--no-abbrev", "-r", "--pretty=format:%H", &range],
+        &[
+            "log",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "-r",
+            "--pretty=format:%H",
+            &range,
+        ],
     )?;
     let paths = parse_raw_paths(&raw);
 
@@ -356,13 +391,19 @@ fn pending_blobs(
     let mut seen_blob: HashSet<String> = HashSet::new();
     let mut total: u64 = 0;
     for (oid, listed_path) in objects {
-        let Some((kind, size)) = metas.get(&oid) else { continue };
+        let Some((kind, size)) = metas.get(&oid) else {
+            continue;
+        };
         if kind != "blob" || !seen_blob.insert(oid.clone()) {
             continue;
         }
         // 优先用 raw diff 给的完整路径；没有 diff 记录（如 merge 带进来的内容）才退回 rev-list 的。
         let path = paths.get(&oid).cloned().unwrap_or(listed_path);
-        let path = if path.is_empty() { "（路径未知）".to_string() } else { path };
+        let path = if path.is_empty() {
+            "（路径未知）".to_string()
+        } else {
+            path
+        };
         if *size > MAX_BLOB_BYTES {
             return Err(over_limit(
                 format!("单个文件版本「{path}」占"),
@@ -429,7 +470,9 @@ fn parse_raw_paths(raw: &str) -> HashMap<String, String> {
     for token in raw.split('\0') {
         // 提交 sha 头部与它的第一条 diff 记录在同一个 NUL 段里，拆掉头部。
         let token = match token.split_once('\n') {
-            Some((head, rest)) if is_oid(head) && (rest.is_empty() || rest.starts_with(':')) => rest,
+            Some((head, rest)) if is_oid(head) && (rest.is_empty() || rest.starts_with(':')) => {
+                rest
+            }
             _ => token,
         };
         if let Some((sha, skip)) = pending.as_mut() {
@@ -437,13 +480,19 @@ fn parse_raw_paths(raw: &str) -> HashMap<String, String> {
                 *skip -= 1;
                 continue;
             }
-            path_of.entry(sha.clone()).or_insert_with(|| token.to_string());
+            path_of
+                .entry(sha.clone())
+                .or_insert_with(|| token.to_string());
             pending = None;
             continue;
         }
-        let Some(fields) = token.strip_prefix(':') else { continue };
+        let Some(fields) = token.strip_prefix(':') else {
+            continue;
+        };
         let fields: Vec<&str> = fields.split(' ').collect();
-        let (Some(new_sha), Some(status)) = (fields.get(3), fields.get(4)) else { continue };
+        let (Some(new_sha), Some(status)) = (fields.get(3), fields.get(4)) else {
+            continue;
+        };
         if !is_oid(new_sha) || new_sha.bytes().all(|byte| byte == b'0') {
             continue;
         }
@@ -569,7 +618,11 @@ fn record(
     path: &str,
 ) {
     if seen.insert((rule, path.to_string())) {
-        hits.push(Hit { kind, rule, path: path.to_string() });
+        hits.push(Hit {
+            kind,
+            rule,
+            path: path.to_string(),
+        });
     }
 }
 
@@ -648,7 +701,10 @@ fn parse_batch(bytes: &[u8], specs: &[String]) -> Result<HashMap<String, String>
             .ok_or_else(|| batch_parse_error(spec))?;
         let end = pos.checked_add(size).filter(|end| *end <= bytes.len());
         let end = end.ok_or_else(|| batch_parse_error(spec))?;
-        contents.insert(spec.clone(), String::from_utf8_lossy(&bytes[pos..end]).into_owned());
+        contents.insert(
+            spec.clone(),
+            String::from_utf8_lossy(&bytes[pos..end]).into_owned(),
+        );
         pos = end + 1; // 内容后面跟一字节分隔符。
     }
     Ok(contents)

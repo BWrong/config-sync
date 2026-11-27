@@ -66,17 +66,18 @@ impl Core {
         }
 
         if source.is_dir() {
-            std::fs::remove_dir_all(&source).map_err(|e| {
-                CoreError::io(format!("删除 {} 失败：{e}", source.display()))
-            })?;
+            std::fs::remove_dir_all(&source)
+                .map_err(|e| CoreError::io(format!("删除 {} 失败：{e}", source.display())))?;
         } else {
-            std::fs::remove_file(&source).map_err(|e| {
-                CoreError::io(format!("删除 {} 失败：{e}", source.display()))
-            })?;
+            std::fs::remove_file(&source)
+                .map_err(|e| CoreError::io(format!("删除 {} 失败：{e}", source.display())))?;
         }
         prune_empty_parents(source.parent());
 
-        out.push(RemoveOutcome { target, result: RemoveResult::Removed });
+        out.push(RemoveOutcome {
+            target,
+            result: RemoveResult::Removed,
+        });
         Ok(())
     }
 }
@@ -84,8 +85,13 @@ impl Core {
 /// 从 `dir` 向上清理空目录，直到遇见镜像根 `home/`（该层本身不删，也不向上）。
 fn prune_empty_parents(mut dir: Option<&Path>) {
     while let Some(d) = dir {
-        if d.file_name().map(|n| n != paths::MIRROR_ROOT).unwrap_or(false) {
-            let Ok(mut entries) = std::fs::read_dir(d) else { return };
+        if d.file_name()
+            .map(|n| n != paths::MIRROR_ROOT)
+            .unwrap_or(false)
+        {
+            let Ok(mut entries) = std::fs::read_dir(d) else {
+                return;
+            };
             if entries.next().is_some() {
                 return; // 非空，停。
             }

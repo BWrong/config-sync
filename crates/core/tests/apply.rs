@@ -11,7 +11,10 @@ use config_sync_core::{
 };
 
 fn written(target: &Path) -> ApplyOutcome {
-    ApplyOutcome { target: target.to_path_buf(), result: ApplyResult::Written }
+    ApplyOutcome {
+        target: target.to_path_buf(),
+        result: ApplyResult::Written,
+    }
 }
 
 fn item<'a>(plan: &'a ApplyPlan, target: &Path) -> &'a ApplyItem {
@@ -55,15 +58,28 @@ fn the_plan_classifies_missing_differing_and_identical_targets() {
         let item = item(&plan, target);
         assert_eq!(item.action, action, "{}", target.display());
         assert!(!item.reason.is_empty(), "{} 没有原因", target.display());
-        assert!(item.diff.contains(hint), "{} 的 diff：{}", target.display(), item.diff);
+        assert!(
+            item.diff.contains(hint),
+            "{} 的 diff：{}",
+            target.display(),
+            item.diff
+        );
     }
     // 覆盖项同时给出被替换掉的旧内容。
-    assert!(item(&plan, &differs).diff.contains("-name = other"), "{}", item(&plan, &differs).diff);
+    assert!(
+        item(&plan, &differs).diff.contains("-name = other"),
+        "{}",
+        item(&plan, &differs).diff
+    );
 
     // 批量摘要与动作一一对应。
     assert_eq!(
         plan.summary(),
-        ApplySummary { create: 1, overwrite: 1, skip: 1 }
+        ApplySummary {
+            create: 1,
+            overwrite: 1,
+            skip: 1
+        }
     );
 }
 
@@ -90,7 +106,10 @@ fn overwriting_replaces_the_old_bytes_completely() {
     let f = fixtures::Fixture::new();
     let core = f.core();
     let target = committed(&f, ".zshrc", "export NEW=1\n");
-    f.write_home(".zshrc", "export OLD=1\nexport LONG_TAIL=2\n# 比源文件更长的旧内容\n");
+    f.write_home(
+        ".zshrc",
+        "export OLD=1\nexport LONG_TAIL=2\n# 比源文件更长的旧内容\n",
+    );
 
     let plan = core.plan_apply(None).unwrap();
     assert_eq!(item(&plan, &target).action, ApplyAction::Overwrite);
@@ -112,7 +131,14 @@ fn an_identical_file_is_a_skip_item_with_a_reason_and_execution_writes_nothing()
     assert_eq!(skip.action, ApplyAction::Skip);
     assert!(skip.reason.contains("一致"), "{}", skip.reason);
     assert_eq!(skip.diff, "");
-    assert_eq!(plan.summary(), ApplySummary { create: 0, overwrite: 0, skip: 1 });
+    assert_eq!(
+        plan.summary(),
+        ApplySummary {
+            create: 0,
+            overwrite: 0,
+            skip: 1
+        }
+    );
 
     assert!(core.execute_apply(&plan).unwrap().is_empty());
     assert_eq!(f.read_home(".zshrc"), "export A=1\n");
@@ -153,7 +179,11 @@ fn rows_that_still_need_a_commit_or_a_conflict_decision_are_skipped_with_reasons
     let plan = core.plan_apply(None).unwrap();
     let pending_commit = item(&plan, &uncommitted);
     assert_eq!(pending_commit.action, ApplyAction::Skip);
-    assert!(pending_commit.reason.contains("提交"), "{}", pending_commit.reason);
+    assert!(
+        pending_commit.reason.contains("提交"),
+        "{}",
+        pending_commit.reason
+    );
     let conflict = item(&plan, &conflicted);
     assert_eq!(conflict.action, ApplyAction::Skip);
     assert!(conflict.reason.contains("冲突"), "{}", conflict.reason);
@@ -262,8 +292,11 @@ fn the_plan_drives_the_write_so_preview_and_result_agree() {
     f.write_home("skipped.conf", "same\n");
 
     let plan = core.plan_apply(None).unwrap();
-    let before: Vec<Option<Vec<u8>>> =
-        plan.items.iter().map(|item| std::fs::read(&item.target).ok()).collect();
+    let before: Vec<Option<Vec<u8>>> = plan
+        .items
+        .iter()
+        .map(|item| std::fs::read(&item.target).ok())
+        .collect();
 
     core.execute_apply(&plan).unwrap();
 
@@ -274,12 +307,21 @@ fn the_plan_drives_the_write_so_preview_and_result_agree() {
         let source = std::fs::read(f.source_dir.join("home").join(rel)).unwrap();
         match planned.action {
             ApplyAction::Create => {
-                assert_eq!(before[index], None, "{} 计划是新建", planned.target.display());
+                assert_eq!(
+                    before[index],
+                    None,
+                    "{} 计划是新建",
+                    planned.target.display()
+                );
                 assert_eq!(std::fs::read(&planned.target).unwrap(), source);
                 created += 1;
             }
             ApplyAction::Overwrite => {
-                assert!(before[index].is_some(), "{} 计划是覆盖", planned.target.display());
+                assert!(
+                    before[index].is_some(),
+                    "{} 计划是覆盖",
+                    planned.target.display()
+                );
                 assert_eq!(std::fs::read(&planned.target).unwrap(), source);
                 overwritten += 1;
             }

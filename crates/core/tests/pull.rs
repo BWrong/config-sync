@@ -32,7 +32,11 @@ fn pull_fast_forwards_and_leaves_the_real_files_alone() {
 
     // $HOME 一个字节都没动：拉取只更新源目录，应用要用户另行点。
     assert_eq!(f.read_home(".zshrc"), "export A=1\n");
-    assert_eq!(only_status(&core), Status::Pending, "拉取后该行应变成待应用");
+    assert_eq!(
+        only_status(&core),
+        Status::Pending,
+        "拉取后该行应变成待应用"
+    );
 
     // 状态条：拉完 behind 归零。
     let status = core.repo_status().expect("读取状态条");
@@ -44,7 +48,10 @@ fn failure(core: &Core) -> CoreError {
     let error = core.pull().expect_err("这一步必须拒绝拉取");
     assert_eq!(error.kind, ErrorKind::Git, "失败种类：{error:?}");
     assert!(
-        error.stderr.as_deref().is_some_and(|stderr| !stderr.is_empty()),
+        error
+            .stderr
+            .as_deref()
+            .is_some_and(|stderr| !stderr.is_empty()),
         "git 的原始 stderr 必须被保留：{error:?}"
     );
     error
@@ -65,19 +72,32 @@ fn pull_refuses_to_create_a_merge_commit_and_leaves_the_source_dir_clean() {
     let head = f.head_sha();
 
     let error = failure(&core);
-    assert!(error.message.contains("需要手动处理"), "message = {}", error.message);
+    assert!(
+        error.message.contains("需要手动处理"),
+        "message = {}",
+        error.message
+    );
     let stderr = error.stderr.unwrap();
-    assert!(stderr.contains("Not possible to fast-forward"), "stderr = {stderr}");
+    assert!(
+        stderr.contains("Not possible to fast-forward"),
+        "stderr = {stderr}"
+    );
 
     assert_eq!(f.head_sha(), head, "被拒后 HEAD 不许动");
     assert!(!f.is_dirty(), "被拒后源目录必须干净");
-    assert!(!f.source_dir.join(".git/MERGE_HEAD").exists(), "不许留下半合并状态");
+    assert!(
+        !f.source_dir.join(".git/MERGE_HEAD").exists(),
+        "不许留下半合并状态"
+    );
     assert_eq!(f.git(&["rev-list", "--count", "--merges", "HEAD"]), "0");
 
     // 远端仍领先，.zshrc 那一行保持待拉取（本地新增的 .tmux.conf 也在这个集合里，
     // 是 t03 的 `HEAD..@{u}` 反向差分不分方向导致的，与本票无关）。
     let entries = core.inventory().expect("读取清单");
-    let zshrc = entries.iter().find(|e| e.target.ends_with(".zshrc")).expect("有 .zshrc 行");
+    let zshrc = entries
+        .iter()
+        .find(|e| e.target.ends_with(".zshrc"))
+        .expect("有 .zshrc 行");
     assert_eq!(zshrc.status, Status::PendingPull, "远端仍领先，状态不变");
 }
 
@@ -90,9 +110,16 @@ fn pull_reports_missing_upstream_with_gits_own_words() {
     // 没 push 过，因此没有上游分支。
 
     let error = failure(&core);
-    assert!(error.message.contains("上游分支"), "message = {}", error.message);
+    assert!(
+        error.message.contains("上游分支"),
+        "message = {}",
+        error.message
+    );
     let stderr = error.stderr.unwrap();
-    assert!(stderr.contains("no upstream configured"), "stderr = {stderr}");
+    assert!(
+        stderr.contains("no upstream configured"),
+        "stderr = {stderr}"
+    );
 }
 
 #[test]
@@ -104,7 +131,11 @@ fn pull_reports_missing_remote_with_gits_own_words() {
     f.git(&["remote", "remove", "origin"]);
 
     let error = failure(&core);
-    assert!(error.message.contains("没有配置远端"), "message = {}", error.message);
+    assert!(
+        error.message.contains("没有配置远端"),
+        "message = {}",
+        error.message
+    );
     let stderr = error.stderr.unwrap();
     assert!(stderr.contains("No such remote"), "stderr = {stderr}");
 }
@@ -120,8 +151,15 @@ fn pull_reports_an_unreachable_remote_with_the_original_stderr() {
     f.git(&["remote", "set-url", "origin", &missing]);
 
     let error = failure(&core);
-    assert!(error.message.contains("取回最新提交"), "message = {}", error.message);
+    assert!(
+        error.message.contains("取回最新提交"),
+        "message = {}",
+        error.message
+    );
     let stderr = error.stderr.unwrap();
-    assert!(stderr.contains("does not appear to be a git repository"), "stderr = {stderr}");
+    assert!(
+        stderr.contains("does not appear to be a git repository"),
+        "stderr = {stderr}"
+    );
     assert!(!f.is_dirty(), "fetch 失败后源目录必须干净");
 }

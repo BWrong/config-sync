@@ -11,14 +11,34 @@ use config_sync_core::{Core, CoreError, ErrorKind, PushOutcome};
 /// `(规则原文, 命中路径, 近似但不该命中的路径)`；路径都是仓库内相对路径。
 const PATH_RULES: &[(&str, &str, &str)] = &[
     ("**/id_rsa", "home/.ssh/id_rsa", "home/id_rsa_backup"),
-    ("**/id_ed25519*", "home/.ssh/id_ed25519.pub", "home/keys/not_id_ed25519"),
-    ("**/.ssh/id_*", "home/.ssh/id_ecdsa", "home/config/id_custom"),
-    ("**/*.pem", "home/certs/server.pem", "home/certs/server.pemx"),
+    (
+        "**/id_ed25519*",
+        "home/.ssh/id_ed25519.pub",
+        "home/keys/not_id_ed25519",
+    ),
+    (
+        "**/.ssh/id_*",
+        "home/.ssh/id_ecdsa",
+        "home/config/id_custom",
+    ),
+    (
+        "**/*.pem",
+        "home/certs/server.pem",
+        "home/certs/server.pemx",
+    ),
     ("**/*.p12", "home/certs/dev.p12", "home/certs/dev.p12x"),
     ("**/.netrc", "home/.netrc", "home/.netrc2"),
     ("**/*_history", "home/.zsh_history", "home/history"),
-    ("**/credentials*", "home/.config/gcloud/credentials.json", "home/.config/gcloud/credential.json"),
-    ("**/.aws/credentials", "home/.aws/credentials", "home/.aws/config"),
+    (
+        "**/credentials*",
+        "home/.config/gcloud/credentials.json",
+        "home/.config/gcloud/credential.json",
+    ),
+    (
+        "**/.aws/credentials",
+        "home/.aws/credentials",
+        "home/.aws/config",
+    ),
 ];
 
 /// `(规则原文, 命中内容, 近似但不该命中的内容)`。
@@ -28,11 +48,31 @@ const CONTENT_RULES: &[(&str, &str, &str)] = &[
         "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n",
         "-----BEGIN PUBLIC KEY-----\nMIIBIjAN\n",
     ),
-    ("ghp_", "GITHUB_TOKEN=ghp_0123456789abcdef\n", "GITHUB_TOKEN=ghpx_0123456789abcdef\n"),
-    ("github_pat_", "token=github_pat_11ABCDEFG\n", "token=github_patX11ABCDEFG\n"),
-    ("AKIA", "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n", "aws_access_key_id = AKIBIOSFODNN7EXAMPLE\n"),
-    (r"xox[baprs]-", "slack=xoxb-1234567890-abcdef\n", "slack=xoxz-1234567890-abcdef\n"),
-    ("sk-", "openai=sk-proj-abcdef1234567890abcdef\n", "openai=sk_proj_abcdef123456\n"),
+    (
+        "ghp_",
+        "GITHUB_TOKEN=ghp_0123456789abcdef\n",
+        "GITHUB_TOKEN=ghpx_0123456789abcdef\n",
+    ),
+    (
+        "github_pat_",
+        "token=github_pat_11ABCDEFG\n",
+        "token=github_patX11ABCDEFG\n",
+    ),
+    (
+        "AKIA",
+        "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n",
+        "aws_access_key_id = AKIBIOSFODNN7EXAMPLE\n",
+    ),
+    (
+        r"xox[baprs]-",
+        "slack=xoxb-1234567890-abcdef\n",
+        "slack=xoxz-1234567890-abcdef\n",
+    ),
+    (
+        "sk-",
+        "openai=sk-proj-abcdef1234567890abcdef\n",
+        "openai=sk_proj_abcdef123456\n",
+    ),
 ];
 
 fn head_message(f: &fixtures::Fixture) -> String {
@@ -42,8 +82,12 @@ fn head_message(f: &fixtures::Fixture) -> String {
 /// 固定格式 `config-sync: N files (YYYY-MM-DD HH:MM)`；时间只校验形状（时区由系统给）。
 fn assert_message_shape(message: &str, files: usize) {
     let prefix = format!("config-sync: {files} files (");
-    let rest = message.strip_prefix(&prefix).unwrap_or_else(|| panic!("message 前缀不对：{message}"));
-    let stamp = rest.strip_suffix(')').unwrap_or_else(|| panic!("message 缺右括号：{message}"));
+    let rest = message
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("message 前缀不对：{message}"));
+    let stamp = rest
+        .strip_suffix(')')
+        .unwrap_or_else(|| panic!("message 缺右括号：{message}"));
     assert_eq!(stamp.len(), 16, "时间必须是 YYYY-MM-DD HH:MM：{stamp}");
     for (i, c) in stamp.chars().enumerate() {
         let ok = match i {
@@ -59,15 +103,29 @@ fn assert_message_shape(message: &str, files: usize) {
 /// 命中硬拦的共用断言：整次拒绝、文案指向 v0.3 加密、暂存区为空、远端什么都没收到。
 fn assert_blocked(f: &fixtures::Fixture, core: &Core) -> CoreError {
     let error = core.commit_and_push().expect_err("命中硬拦必须整次拒绝");
-    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
+    assert!(
+        error.message.contains("推送被拒绝"),
+        "message = {}",
+        error.message
+    );
     assert!(
         error.message.contains("加密在 v0.3 提供"),
         "文案必须固定指向 v0.3 加密：{}",
         error.message
     );
-    assert_eq!(f.git(&["diff", "--cached", "--name-only"]), "", "命中后一个文件都不许进暂存区");
-    assert!(!f.git_try(&["rev-parse", "--verify", "HEAD"]), "命中后不许留下提交");
-    assert!(!f.remote.join("refs/heads/main").exists(), "命中后远端不该收到任何东西");
+    assert_eq!(
+        f.git(&["diff", "--cached", "--name-only"]),
+        "",
+        "命中后一个文件都不许进暂存区"
+    );
+    assert!(
+        !f.git_try(&["rev-parse", "--verify", "HEAD"]),
+        "命中后不许留下提交"
+    );
+    assert!(
+        !f.remote.join("refs/heads/main").exists(),
+        "命中后远端不该收到任何东西"
+    );
     error
 }
 
@@ -77,8 +135,16 @@ fn every_path_rule_blocks_the_whole_push_and_names_the_rule_and_file() {
         let f = fixtures::Fixture::new();
         f.write_source(hit, "hello\n");
         let error = assert_blocked(&f, &f.core());
-        assert!(error.message.contains(rule), "规则 {rule} 没被点名：{}", error.message);
-        assert!(error.message.contains(hit), "文件 {hit} 没被点名：{}", error.message);
+        assert!(
+            error.message.contains(rule),
+            "规则 {rule} 没被点名：{}",
+            error.message
+        );
+        assert!(
+            error.message.contains(hit),
+            "文件 {hit} 没被点名：{}",
+            error.message
+        );
     }
 }
 
@@ -88,8 +154,16 @@ fn every_content_rule_blocks_the_whole_push_and_names_the_rule_and_file() {
         let f = fixtures::Fixture::new();
         f.write_source("home/.zshrc", hit);
         let error = assert_blocked(&f, &f.core());
-        assert!(error.message.contains(rule), "规则 {rule} 没被点名：{}", error.message);
-        assert!(error.message.contains("home/.zshrc"), "文件没被点名：{}", error.message);
+        assert!(
+            error.message.contains(rule),
+            "规则 {rule} 没被点名：{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("home/.zshrc"),
+            "文件没被点名：{}",
+            error.message
+        );
     }
 }
 
@@ -99,14 +173,20 @@ fn near_misses_are_not_blocked_and_the_push_goes_through() {
     for (_, _, near_miss) in PATH_RULES {
         f.write_source(near_miss, "hello\n");
     }
-    let near_miss_contents: String =
-        CONTENT_RULES.iter().map(|(_, _, near_miss)| format!("{near_miss}")).collect();
+    let near_miss_contents: String = CONTENT_RULES
+        .iter()
+        .map(|(_, _, near_miss)| format!("{near_miss}"))
+        .collect();
     f.write_source("home/.zshrc", &near_miss_contents);
 
     let outcome = f.core().commit_and_push().expect("近似样例不该被拦");
 
     assert_eq!(outcome.files as usize, PATH_RULES.len() + 1);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha(), "远端必须收到这次提交");
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        f.head_sha(),
+        "远端必须收到这次提交"
+    );
 }
 
 /// 硬拦看的是「工作区 ∪ 暂存区」：内容只在暂存区里也必须拦。
@@ -117,10 +197,23 @@ fn a_secret_that_only_lives_in_the_index_is_blocked_too() {
     f.git(&["add", "-A"]);
     f.write_source("home/.zshrc", "clean now\n");
 
-    let error = f.core().commit_and_push().expect_err("暂存区里的密钥也必须拦");
-    assert!(error.message.contains("ghp_"), "message = {}", error.message);
-    assert!(!f.git_try(&["rev-parse", "--verify", "HEAD"]), "不许留下提交");
-    assert!(!f.remote.join("refs/heads/main").exists(), "远端不该收到任何东西");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("暂存区里的密钥也必须拦");
+    assert!(
+        error.message.contains("ghp_"),
+        "message = {}",
+        error.message
+    );
+    assert!(
+        !f.git_try(&["rev-parse", "--verify", "HEAD"]),
+        "不许留下提交"
+    );
+    assert!(
+        !f.remote.join("refs/heads/main").exists(),
+        "远端不该收到任何东西"
+    );
 }
 
 #[test]
@@ -136,17 +229,28 @@ fn push_commits_with_the_fixed_message_and_lands_on_the_remote() {
 
     assert!(outcome.committed, "有改动时必须自动提交：{outcome:?}");
     assert_eq!(outcome.files, 3);
-    assert_eq!(outcome.existing_commits, 0, "空仓库的第一次推送没有已有提交：{outcome:?}");
+    assert_eq!(
+        outcome.existing_commits, 0,
+        "空仓库的第一次推送没有已有提交：{outcome:?}"
+    );
     assert_eq!(outcome.remote_url, f.remote_url());
     assert_message_shape(&outcome.message, 3);
-    assert_eq!(head_message(&f), outcome.message, "本地提交 message 必须一致");
+    assert_eq!(
+        head_message(&f),
+        outcome.message,
+        "本地提交 message 必须一致"
+    );
     // 裸远端真的收到这个提交（第一次推送顺带建立上游跟踪）。
     assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
     assert_eq!(f.git_remote(&["log", "-1", "--pretty=%s"]), outcome.message);
     assert!(!f.is_dirty(), "提交后源目录必须干净");
 
     let status = core.repo_status().expect("读取状态条");
-    assert_eq!((status.ahead, status.behind, status.dirty), (0, 0, 0), "推送后 ahead 归零");
+    assert_eq!(
+        (status.ahead, status.behind, status.dirty),
+        (0, 0, 0),
+        "推送后 ahead 归零"
+    );
 
     // 第二次：已有上游时照常推。
     f.write_source("home/.zshrc", "export A=2\n");
@@ -165,7 +269,10 @@ fn nothing_to_push_is_a_plain_result_not_an_empty_commit() {
     f.push();
     let before = f.head_sha();
 
-    let outcome = f.core().commit_and_push().expect("没有可提交的改动不是错误");
+    let outcome = f
+        .core()
+        .commit_and_push()
+        .expect("没有可提交的改动不是错误");
 
     assert!(!outcome.committed, "{outcome:?}");
     assert_eq!(outcome.files, 0);
@@ -188,14 +295,21 @@ fn a_push_rejected_by_the_remote_is_reported_with_gits_own_words() {
     let error = f.core().commit_and_push().expect_err("非快进必须失败");
 
     assert_eq!(error.kind, ErrorKind::Git, "{error:?}");
-    assert!(error.message.contains("已自动提交"), "提交成功必须如实说：{}", error.message);
+    assert!(
+        error.message.contains("已自动提交"),
+        "提交成功必须如实说：{}",
+        error.message
+    );
     let stderr = error.stderr.expect("必须保留 git 原始 stderr");
     assert!(
         stderr.contains("rejected") || stderr.contains("non-fast-forward"),
         "stderr = {stderr}"
     );
     // 本地提交留下了（可接受的终态），远端一个字节没动。
-    assert!(head_message(&f).starts_with("config-sync: 1 files ("), "本地提交应保留");
+    assert!(
+        head_message(&f).starts_with("config-sync: 1 files ("),
+        "本地提交应保留"
+    );
     assert!(!f.is_dirty());
     assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before);
 }
@@ -214,20 +328,38 @@ fn ahead_only_push_sends_existing_commits_without_making_a_new_one() {
 
     let core = f.core();
     let before = f.head_sha();
-    assert_eq!(core.repo_status().expect("读状态条").ahead, 2, "两个本地提交还没推");
+    assert_eq!(
+        core.repo_status().expect("读状态条").ahead,
+        2,
+        "两个本地提交还没推"
+    );
 
     let outcome = core.commit_and_push().expect("有本地提交时推送应成功");
 
-    assert!(!outcome.committed, "没有可提交的改动，不许空提交：{outcome:?}");
+    assert!(
+        !outcome.committed,
+        "没有可提交的改动，不许空提交：{outcome:?}"
+    );
     assert_eq!(outcome.files, 0);
-    assert_eq!(outcome.existing_commits, 2, "要如实报出推了几个已有提交：{outcome:?}");
+    assert_eq!(
+        outcome.existing_commits, 2,
+        "要如实报出推了几个已有提交：{outcome:?}"
+    );
     assert_eq!(outcome.remote_url, f.remote_url());
     assert_eq!(f.head_sha(), before, "只推已有提交，不产生新提交");
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), before, "远端必须收到这些提交");
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        before,
+        "远端必须收到这些提交"
+    );
     assert_eq!(f.git_remote(&["show", "main:home/.zshrc"]), "export A=2");
 
     let status = core.repo_status().expect("读状态条");
-    assert_eq!((status.ahead, status.dirty), (0, 0), "推送后 ahead 必须归零");
+    assert_eq!(
+        (status.ahead, status.dirty),
+        (0, 0),
+        "推送后 ahead 必须归零"
+    );
 }
 
 /// 待推提交里的密钥同样硬拦：这些提交会被这次 push 一起送到远端。
@@ -243,13 +375,36 @@ fn a_secret_in_an_unpushed_commit_blocks_the_push_and_names_the_file() {
     f.commit_all("local: oops");
     assert!(!f.is_dirty(), "前提：工作区干净，密钥只在已提交的提交里");
 
-    let error = f.core().commit_and_push().expect_err("待推提交里的密钥也必须拦");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("待推提交里的密钥也必须拦");
 
-    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
-    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
-    assert!(error.message.contains("home/.zshrc"), "文件没被点名：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
-    assert_eq!(f.git(&["rev-list", "--count", "@{u}..HEAD"]), "1", "本地提交原样保留，没有新提交");
+    assert!(
+        error.message.contains("推送被拒绝"),
+        "message = {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("ghp_"),
+        "规则没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/.zshrc"),
+        "文件没被点名：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
+    assert_eq!(
+        f.git(&["rev-list", "--count", "@{u}..HEAD"]),
+        "1",
+        "本地提交原样保留，没有新提交"
+    );
 }
 
 /// 待推提交里新增的私钥路径也按路径规则拦（内容本身可以完全无害）。
@@ -265,11 +420,26 @@ fn a_private_key_path_in_an_unpushed_commit_is_blocked_by_the_path_rule() {
     f.commit_all("local: key");
     assert!(!f.is_dirty(), "前提：工作区干净");
 
-    let error = f.core().commit_and_push().expect_err("待推提交里的私钥路径也必须拦");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("待推提交里的私钥路径也必须拦");
 
-    assert!(error.message.contains("**/id_rsa"), "规则没被点名：{}", error.message);
-    assert!(error.message.contains("home/.ssh/id_rsa"), "文件没被点名：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert!(
+        error.message.contains("**/id_rsa"),
+        "规则没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/.ssh/id_rsa"),
+        "文件没被点名：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
 }
 
 /// 没有上游、只有本地提交：首次推送用 `-u origin <branch>` 建立跟踪，之后拉取认得上游。
@@ -279,13 +449,22 @@ fn a_first_push_without_upstream_establishes_tracking() {
     f.write_source("home/.zshrc", "export A=1\n");
     f.commit_all("local: first");
     let core = f.core();
-    assert!(!f.git_try(&["rev-parse", "--abbrev-ref", "@{u}"]), "前提：还没有上游");
+    assert!(
+        !f.git_try(&["rev-parse", "--abbrev-ref", "@{u}"]),
+        "前提：还没有上游"
+    );
 
-    let outcome = core.commit_and_push().expect("没有上游时首次推送应建立跟踪");
+    let outcome = core
+        .commit_and_push()
+        .expect("没有上游时首次推送应建立跟踪");
 
     assert!(!outcome.committed, "{outcome:?}");
     assert_eq!(outcome.existing_commits, 1, "{outcome:?}");
-    assert_eq!(f.git(&["rev-parse", "--abbrev-ref", "@{u}"]), "origin/main", "必须建立跟踪");
+    assert_eq!(
+        f.git(&["rev-parse", "--abbrev-ref", "@{u}"]),
+        "origin/main",
+        "必须建立跟踪"
+    );
     assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
     assert_eq!(core.repo_status().expect("读状态条").ahead, 0);
     core.pull().expect("建立跟踪后拉取必须能识别上游");
@@ -297,11 +476,17 @@ fn a_first_push_with_local_changes_commits_and_sets_tracking() {
     let f = fixtures::Fixture::new();
     f.write_source("home/.zshrc", "export A=1\n");
 
-    let outcome = f.core().commit_and_push().expect("首次推送应提交并建立跟踪");
+    let outcome = f
+        .core()
+        .commit_and_push()
+        .expect("首次推送应提交并建立跟踪");
 
     assert!(outcome.committed, "{outcome:?}");
     assert_eq!(outcome.files, 1);
-    assert_eq!(outcome.existing_commits, 0, "这次推送没有已有提交：{outcome:?}");
+    assert_eq!(
+        outcome.existing_commits, 0,
+        "这次推送没有已有提交：{outcome:?}"
+    );
     assert_eq!(f.git(&["rev-parse", "--abbrev-ref", "@{u}"]), "origin/main");
     assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
     assert_message_shape(&outcome.message, 1);
@@ -315,8 +500,16 @@ fn a_secret_in_a_path_containing_a_newline_is_blocked_in_the_workspace() {
 
     let error = assert_blocked(&f, &f.core());
 
-    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
-    assert!(error.message.contains("home/bad\nname.txt"), "文件没被点名：{}", error.message);
+    assert!(
+        error.message.contains("ghp_"),
+        "规则没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/bad\nname.txt"),
+        "文件没被点名：{}",
+        error.message
+    );
 }
 
 /// 同一个路径，密钥只留在暂存区（工作区已经改干净）也必须拦。
@@ -327,13 +520,34 @@ fn a_secret_in_a_path_containing_a_newline_is_blocked_in_the_index() {
     f.git(&["add", "-A"]);
     f.write_source("home/bad\nname.txt", "clean now\n");
 
-    let error = f.core().commit_and_push().expect_err("暂存区里的密钥也必须拦");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("暂存区里的密钥也必须拦");
 
-    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
-    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
-    assert!(error.message.contains("home/bad\nname.txt"), "文件没被点名：{}", error.message);
-    assert!(!f.git_try(&["rev-parse", "--verify", "HEAD"]), "不许留下提交");
-    assert!(!f.remote.join("refs/heads/main").exists(), "远端不该收到任何东西");
+    assert!(
+        error.message.contains("推送被拒绝"),
+        "message = {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("ghp_"),
+        "规则没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/bad\nname.txt"),
+        "文件没被点名：{}",
+        error.message
+    );
+    assert!(
+        !f.git_try(&["rev-parse", "--verify", "HEAD"]),
+        "不许留下提交"
+    );
+    assert!(
+        !f.remote.join("refs/heads/main").exists(),
+        "远端不该收到任何东西"
+    );
 }
 
 /// 待推提交里、路径带换行的文件同样扫得到。
@@ -349,11 +563,26 @@ fn a_secret_in_an_unpushed_commit_under_a_path_with_a_newline_is_blocked() {
     f.commit_all("local: oops");
     assert!(!f.is_dirty(), "前提：工作区干净，密钥只在已提交的提交里");
 
-    let error = f.core().commit_and_push().expect_err("待推提交里的密钥也必须拦");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("待推提交里的密钥也必须拦");
 
-    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
-    assert!(error.message.contains("home/bad\nname.txt"), "文件没被点名：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert!(
+        error.message.contains("ghp_"),
+        "规则没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/bad\nname.txt"),
+        "文件没被点名：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
 }
 
 /// 没有上游、但远端已有同名分支且已同步：ahead 必须是 0，既不谎报「推了已有提交」，
@@ -365,16 +594,26 @@ fn a_repo_without_upstream_whose_remote_is_already_in_sync_reports_nothing_and_p
     f.commit_all("local: first");
     // 手动推一次但不建跟踪：本地仍没有上游，远端已有同名分支。
     f.git(&["push", "origin", "main"]);
-    assert!(!f.git_try(&["rev-parse", "--abbrev-ref", "@{u}"]), "前提：仍没有上游");
+    assert!(
+        !f.git_try(&["rev-parse", "--abbrev-ref", "@{u}"]),
+        "前提：仍没有上游"
+    );
     std::fs::rename(&f.remote, f.path("remote.offline.git")).expect("把远端挪走");
     let before = f.head_sha();
 
     let outcome = f.core().commit_and_push().expect("远端已同步时不该报错");
 
     assert!(!outcome.committed, "{outcome:?}");
-    assert_eq!(outcome.existing_commits, 0, "远端已同步就不许谎报已有提交：{outcome:?}");
+    assert_eq!(
+        outcome.existing_commits, 0,
+        "远端已同步就不许谎报已有提交：{outcome:?}"
+    );
     assert_eq!(f.head_sha(), before, "不许空提交");
-    assert_eq!(f.git(&["rev-parse", "origin/main"]), before, "远端跟踪分支原样不动");
+    assert_eq!(
+        f.git(&["rev-parse", "origin/main"]),
+        before,
+        "远端跟踪分支原样不动"
+    );
 }
 
 /// 上游配置还在、远端跟踪分支却被删了：算不出 ahead 也不能当成「没有需要推送的改动」。
@@ -387,14 +626,28 @@ fn a_deleted_remote_tracking_ref_does_not_hide_local_commits() {
     f.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
     f.write_source("home/.zshrc", "export A=2\n");
     f.commit_all("local: second");
-    assert!(!f.is_dirty(), "前提：工作区干净，要让推进去只能靠 ahead 判断");
+    assert!(
+        !f.is_dirty(),
+        "前提：工作区干净，要让推进去只能靠 ahead 判断"
+    );
 
-    let outcome = f.core().commit_and_push().expect("算不出 ahead 也不能当成没事可做");
+    let outcome = f
+        .core()
+        .commit_and_push()
+        .expect("算不出 ahead 也不能当成没事可做");
 
     assert!(!outcome.committed, "{outcome:?}");
     assert!(outcome.existing_commits >= 1, "{outcome:?}");
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha(), "本地提交必须推上去");
-    assert_eq!(f.git(&["rev-parse", "origin/main"]), f.head_sha(), "推送后跟踪分支恢复");
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        f.head_sha(),
+        "本地提交必须推上去"
+    );
+    assert_eq!(
+        f.git(&["rev-parse", "origin/main"]),
+        f.head_sha(),
+        "推送后跟踪分支恢复"
+    );
 }
 
 /// 用 `git fast-import` 一次性造出大量历史形状（逐个 `git commit` 太慢），
@@ -409,17 +662,30 @@ fn fast_import(f: &fixtures::Fixture, script: &str) {
         .stdin(Stdio::piped())
         .spawn()
         .expect("启动 git fast-import");
-    child.stdin.take().expect("fast-import 的 stdin").write_all(script.as_bytes()).expect("写 fast-import 脚本");
-    assert!(child.wait().expect("等 fast-import 结束").success(), "fast-import 失败");
+    child
+        .stdin
+        .take()
+        .expect("fast-import 的 stdin")
+        .write_all(script.as_bytes())
+        .expect("写 fast-import 脚本");
+    assert!(
+        child.wait().expect("等 fast-import 结束").success(),
+        "fast-import 失败"
+    );
     f.git(&["reset", "--hard", "-q"]);
 }
 
 /// 一个提交只带一个文件，内容各不相同（否则 blob 会被去重成同一个）。
 fn inline_commit_script(paths: &[String]) -> String {
-    let mut script = String::from("commit refs/heads/main\ncommitter c <c@config-sync.invalid> 1 +0000\ndata 1\nb\n");
+    let mut script = String::from(
+        "commit refs/heads/main\ncommitter c <c@config-sync.invalid> 1 +0000\ndata 1\nb\n",
+    );
     for path in paths {
         let body = format!("{path}\n");
-        script.push_str(&format!("M 100644 inline {path}\ndata {}\n{body}", body.len()));
+        script.push_str(&format!(
+            "M 100644 inline {path}\ndata {}\n{body}",
+            body.len()
+        ));
     }
     script
 }
@@ -442,16 +708,36 @@ fn a_secret_added_and_then_deleted_in_unpushed_commits_is_still_blocked() {
     f.commit_all("local: delete it again");
     assert!(!f.is_dirty(), "前提：工作区干净，密钥只在待推提交里");
     assert!(
-        !f.git(&["ls-tree", "-r", "--name-only", "HEAD"]).contains("home/token.txt"),
+        !f.git(&["ls-tree", "-r", "--name-only", "HEAD"])
+            .contains("home/token.txt"),
         "前提：HEAD 树里已经没有这个路径，最终 diff 里也没有它"
     );
 
-    let error = f.core().commit_and_push().expect_err("待推提交里的密钥必须拦，删掉也不行");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("待推提交里的密钥必须拦，删掉也不行");
 
-    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
-    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
-    assert!(error.message.contains("home/token.txt"), "文件没被点名：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert!(
+        error.message.contains("推送被拒绝"),
+        "message = {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("ghp_"),
+        "规则没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/token.txt"),
+        "文件没被点名：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
 }
 
 /// 加了、删了、又加回来：路径在最终树里，同样必须拦。
@@ -471,11 +757,26 @@ fn a_secret_deleted_and_then_added_back_in_unpushed_commits_is_blocked() {
     f.commit_all("local: add back");
     assert!(!f.is_dirty());
 
-    let error = f.core().commit_and_push().expect_err("加回来的密钥同样要拦");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("加回来的密钥同样要拦");
 
-    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
-    assert!(error.message.contains("home/token.txt"), "文件没被点名：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert!(
+        error.message.contains("ghp_"),
+        "规则没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/token.txt"),
+        "文件没被点名：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
 }
 
 /// 单个 blob 超过 16 MiB：读内容之前就整次中止，文案点名文件与大小，不「太大就跳过」。
@@ -491,13 +792,36 @@ fn a_blob_over_the_scan_size_limit_aborts_the_push_and_names_the_file() {
     f.commit_all("local: too big");
     assert!(!f.is_dirty());
 
-    let error = f.core().commit_and_push().expect_err("超过单 blob 上限必须中止");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("超过单 blob 上限必须中止");
 
-    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
-    assert!(error.message.contains("home/big.bin"), "文件没被点名：{}", error.message);
-    assert!(error.message.contains("上限 16.0 MiB"), "上限没被点名：{}", error.message);
-    assert!(error.message.contains("git push"), "得告诉用户下一步：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert!(
+        error.message.contains("推送被拒绝"),
+        "message = {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("home/big.bin"),
+        "文件没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("上限 16.0 MiB"),
+        "上限没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("git push"),
+        "得告诉用户下一步：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
 }
 
 /// 待推提交超过 1000 个：整次中止，文案给出当前值、上限与下一步。
@@ -520,12 +844,31 @@ fn too_many_unpushed_commits_abort_the_push_with_the_numbers() {
     fast_import(&f, &script);
     assert_eq!(f.git(&["rev-list", "--count", "@{u}..HEAD"]), "1001");
 
-    let error = f.core().commit_and_push().expect_err("超过 1000 个待推提交必须中止");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("超过 1000 个待推提交必须中止");
 
-    assert!(error.message.contains("未推送提交数"), "message = {}", error.message);
-    assert!(error.message.contains("1001 个"), "当前值没被点名：{}", error.message);
-    assert!(error.message.contains("上限 1000 个"), "上限没被点名：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert!(
+        error.message.contains("未推送提交数"),
+        "message = {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("1001 个"),
+        "当前值没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("上限 1000 个"),
+        "上限没被点名：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
 }
 
 /// 待扫的 blob 版本超过 10000 个：同样中止，不扫完就推等于把硬拦关掉。
@@ -537,13 +880,34 @@ fn too_many_unpushed_blobs_abort_the_push_with_the_numbers() {
     f.push();
     let remote_before = f.git_remote(&["rev-parse", "main"]);
 
-    let paths: Vec<String> = (0..=10_000).map(|index| format!("home/f{index}.txt")).collect();
+    let paths: Vec<String> = (0..=10_000)
+        .map(|index| format!("home/f{index}.txt"))
+        .collect();
     fast_import(&f, &inline_commit_script(&paths));
 
-    let error = f.core().commit_and_push().expect_err("超过 10000 个 blob 版本必须中止");
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("超过 10000 个 blob 版本必须中止");
 
-    assert!(error.message.contains("待扫描的文件版本数"), "message = {}", error.message);
-    assert!(error.message.contains("10001 个"), "当前值没被点名：{}", error.message);
-    assert!(error.message.contains("上限 10000 个"), "上限没被点名：{}", error.message);
-    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert!(
+        error.message.contains("待扫描的文件版本数"),
+        "message = {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("10001 个"),
+        "当前值没被点名：{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("上限 10000 个"),
+        "上限没被点名：{}",
+        error.message
+    );
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端不该收到任何东西"
+    );
 }

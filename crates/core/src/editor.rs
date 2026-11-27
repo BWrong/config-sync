@@ -25,9 +25,7 @@ impl Attempt {
 
     /// 真正拉起进程。编辑器不等退出；`open` 等退出码，好决定要不要回退。
     pub(crate) fn run(&self) -> Result<(), CoreError> {
-        let started = |e: std::io::Error| {
-            CoreError::io(format!("启动 {} 失败：{e}", self.program))
-        };
+        let started = |e: std::io::Error| CoreError::io(format!("启动 {} 失败：{e}", self.program));
 
         if !self.wait {
             let spawned = match self.command().spawn() {
@@ -79,7 +77,10 @@ mod tests {
 
     #[test]
     fn login_path_skips_banner_noise_and_rejects_empty_output() {
-        assert_eq!(login_path(b"banner\n/usr/local/bin:/usr/bin"), Some("/usr/local/bin:/usr/bin".to_string()));
+        assert_eq!(
+            login_path(b"banner\n/usr/local/bin:/usr/bin"),
+            Some("/usr/local/bin:/usr/bin".to_string())
+        );
         assert_eq!(login_path(b""), None);
         assert_eq!(login_path(b"welcome\n  \n"), None);
     }
@@ -113,8 +114,16 @@ pub fn plan(editor_command: &str, path: &Path) -> Result<Vec<Attempt>, CoreError
     let editor = editor_command.trim();
     if editor.is_empty() {
         return Ok(vec![
-            Attempt { program: "open".to_string(), args: vec![target.clone()], wait: true },
-            Attempt { program: "open".to_string(), args: vec!["-t".to_string(), target], wait: true },
+            Attempt {
+                program: "open".to_string(),
+                args: vec![target.clone()],
+                wait: true,
+            },
+            Attempt {
+                program: "open".to_string(),
+                args: vec!["-t".to_string(), target],
+                wait: true,
+            },
         ]);
     }
 
@@ -138,5 +147,9 @@ pub fn plan(editor_command: &str, path: &Path) -> Result<Vec<Attempt>, CoreError
     }
 
     let program = words.remove(0);
-    Ok(vec![Attempt { program, args: words, wait: false }])
+    Ok(vec![Attempt {
+        program,
+        args: words,
+        wait: false,
+    }])
 }

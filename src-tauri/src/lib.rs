@@ -132,8 +132,15 @@ fn open_source_dir(state: State<'_, AppState>) -> Result<(), CoreError> {
 }
 
 #[tauri::command]
-fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreError> {
-    state.runtime().core.clone(&remote)
+fn clone_remote(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    remote: String,
+) -> Result<(), CoreError> {
+    state.runtime().core.clone(&remote)?;
+    // 克隆出来的 `home/` 现在才存在：重建监视器，别再盯着含 `.git` 的整棵树。
+    state.watch(&app);
+    Ok(())
 }
 
 /// 写入或替换源目录仓库的 origin 地址。只动 git 配置，不提交、不写 $HOME。
@@ -150,7 +157,10 @@ fn add(state: State<'_, AppState>, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome
 
 /// 把路径（文件或整棵子树）从源目录移除；只动源目录里的副本，不碰 `$HOME` 原文件。
 #[tauri::command]
-fn remove(state: State<'_, AppState>, targets: Vec<PathBuf>) -> Result<Vec<RemoveOutcome>, CoreError> {
+fn remove(
+    state: State<'_, AppState>,
+    targets: Vec<PathBuf>,
+) -> Result<Vec<RemoveOutcome>, CoreError> {
     state.runtime().core.remove(&targets)
 }
 
@@ -169,8 +179,11 @@ fn onboarding_done(state: State<'_, AppState>) -> bool {
 /// 标记向导已完成：只写 app 配置目录里的标记，不碰源目录，也不进 git。
 #[tauri::command]
 fn finish_onboarding(state: State<'_, AppState>) -> Result<(), CoreError> {
-    onboarding::mark_done(&state.home)
-        .map_err(|message| CoreError { kind: ErrorKind::Io, message, stderr: None })
+    onboarding::mark_done(&state.home).map_err(|message| CoreError {
+        kind: ErrorKind::Io,
+        message,
+        stderr: None,
+    })
 }
 
 #[derive(Serialize)]
@@ -227,7 +240,11 @@ fn save_settings(
     app: AppHandle,
     settings: Settings,
 ) -> Result<(), CoreError> {
-    let io = |message: String| CoreError { kind: ErrorKind::Io, message, stderr: None };
+    let io = |message: String| CoreError {
+        kind: ErrorKind::Io,
+        message,
+        stderr: None,
+    };
     let settings = settings.trimmed();
     settings.validate(&state.home).map_err(io)?;
     settings.save(&config_path(&state.home)).map_err(io)?;
@@ -259,9 +276,18 @@ fn resolve_conflict(
     let side = match side.as_str() {
         "ours" => config_sync_core::resolve::Side::Ours,
         "theirs" => config_sync_core::resolve::Side::Theirs,
-        other => return Err(CoreError { kind: ErrorKind::Io, message: format!("未知的解决方向：{other}"), stderr: None }),
+        other => {
+            return Err(CoreError {
+                kind: ErrorKind::Io,
+                message: format!("未知的解决方向：{other}"),
+                stderr: None,
+            });
+        }
     };
-    state.runtime().core.resolve_conflict(Path::new(&target), side)
+    state
+        .runtime()
+        .core
+        .resolve_conflict(Path::new(&target), side)
 }
 
 pub fn run() {

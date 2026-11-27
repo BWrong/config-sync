@@ -13,7 +13,10 @@ fn core() -> (fixtures::Fixture, Core) {
 }
 
 fn removed(target: &Path) -> RemoveOutcome {
-    RemoveOutcome { target: target.to_path_buf(), result: RemoveResult::Removed }
+    RemoveOutcome {
+        target: target.to_path_buf(),
+        result: RemoveResult::Removed,
+    }
 }
 
 #[test]
@@ -24,7 +27,10 @@ fn removing_a_managed_file_deletes_the_mirror_copy_and_leaves_home_alone() {
     f.git(&["add", "-A"]);
     f.git(&["commit", "-m", "add .zshrc"]);
 
-    assert_eq!(core.remove(&[zshrc.clone()]).unwrap(), vec![removed(&zshrc)]);
+    assert_eq!(
+        core.remove(&[zshrc.clone()]).unwrap(),
+        vec![removed(&zshrc)]
+    );
 
     // 源目录里的副本没了，$HOME 下的原文件一个字节都没动。
     assert!(!f.source_dir.join("home/.zshrc").exists());
@@ -44,7 +50,10 @@ fn a_file_that_was_never_added_is_reported_as_not_managed() {
 
     assert_eq!(
         core.remove(&[ghost.clone()]).unwrap(),
-        vec![RemoveOutcome { target: ghost, result: RemoveResult::NotManaged }]
+        vec![RemoveOutcome {
+            target: ghost,
+            result: RemoveResult::NotManaged
+        }]
     );
 }
 
@@ -61,10 +70,19 @@ fn paths_outside_home_are_rejected_and_the_rest_of_the_batch_still_runs() {
     assert_eq!(outcomes.len(), 2);
 
     match &outcomes[0] {
-        RemoveOutcome { target, result: RemoveResult::Rejected { reason } } => {
+        RemoveOutcome {
+            target,
+            result: RemoveResult::Rejected { reason },
+        } => {
             assert_eq!(target, &outside);
-            assert!(reason.contains("镜像"), "错误文案要说明镜像布局表达不了该位置：{reason}");
-            assert!(reason.contains(f.home.to_str().unwrap()), "错误文案要指出 $HOME：{reason}");
+            assert!(
+                reason.contains("镜像"),
+                "错误文案要说明镜像布局表达不了该位置：{reason}"
+            );
+            assert!(
+                reason.contains(f.home.to_str().unwrap()),
+                "错误文案要指出 $HOME：{reason}"
+            );
         }
         other => panic!("$HOME 之外的路径必须被拒绝，实际是 {other:?}"),
     }
