@@ -37,11 +37,13 @@ interface RepoStatus {
 
 /** 与 Core 的 `PushOutcome` 一一对应。 */
 interface PushOutcome {
-  /** false = 没有需要推送的改动。 */
+  /** false = 这次没有产生新的自动提交（可能只推了已有提交）。 */
   committed: boolean;
   files: number;
   message: string;
   remote_url: string;
+  /** 推送前就已在本地、这次一并推出去的提交数（不含本次自动提交）。 */
+  existing_commits: number;
 }
 
 interface CoreError {
@@ -270,7 +272,9 @@ function pendingHint(status: RepoStatus): string {
     parts.push(`<span>${glyph("dot", 13)}本机有 ${status.dirty} 处改动还没提交，推送会一并提交</span>`);
   }
   if (status.ahead > 0) {
-    parts.push(`<span>${glyph("arrowUp", 13)}本机有 ${status.ahead} 个提交还没推到远端</span>`);
+    parts.push(
+      `<span>${glyph("arrowUp", 13)}本机有 ${status.ahead} 个提交还没推到远端，点「推送」会一并推上去</span>`,
+    );
   }
   if (status.behind > 0) {
     parts.push(`<span>${glyph("arrowDown", 13)}远端有 ${status.behind} 个提交还没拉下来，先拉取</span>`);
@@ -531,11 +535,16 @@ async function pushChanges(): Promise<void> {
   setBusy(true);
   try {
     const outcome = await invoke<PushOutcome>("commit_and_push");
-    pushReportHtml = outcome.committed
-      ? `<p class="add-summary">已推送 ${outcome.files} 个文件到 <code>${escapeHtml(
-          outcome.remote_url,
-        )}</code>：${escapeHtml(outcome.message)}</p>`
-      : `<p class="add-summary">没有需要推送的改动。</p>`;
+    const remote = `<code>${escapeHtml(outcome.remote_url)}</code>`;
+    if (outcome.committed) {
+      pushReportHtml = `<p class="add-summary">已提交并推送 ${outcome.files} 个文件到 ${remote}：${escapeHtml(
+        outcome.message,
+      )}</p>`;
+    } else if (outcome.existing_commits > 0) {
+      pushReportHtml = `<p class="add-summary">已推送 ${outcome.existing_commits} 个本机已有提交到 ${remote}。</p>`;
+    } else {
+      pushReportHtml = `<p class="add-summary">没有需要推送的改动。</p>`;
+    }
   } catch (error) {
     pushReportHtml = errorPanel(error);
   }

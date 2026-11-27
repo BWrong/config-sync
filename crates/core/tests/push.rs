@@ -1,4 +1,5 @@
-//! 推送的行为测试：9 条路径规则 + 6 条内容规则逐条硬拦、正常推送、无可提交改动、push 失败。
+//! 推送的行为测试：9 条路径规则 + 6 条内容规则逐条硬拦、正常推送、无可提交改动、push 失败，
+//! 以及 ahead-only（工作区干净、只有本地提交）、待推提交里的密钥、无上游的首次推送。
 //!
 //! 唯一 seam 是 `Core`，全部用真 git（临时 home + 临时源目录 + 临时裸远端）。
 
@@ -134,6 +135,7 @@ fn push_commits_with_the_fixed_message_and_lands_on_the_remote() {
 
     assert!(outcome.committed, "有改动时必须自动提交：{outcome:?}");
     assert_eq!(outcome.files, 3);
+    assert_eq!(outcome.existing_commits, 0, "空仓库的第一次推送没有已有提交：{outcome:?}");
     assert_eq!(outcome.remote_url, f.remote_url());
     assert_message_shape(&outcome.message, 3);
     assert_eq!(head_message(&f), outcome.message, "本地提交 message 必须一致");
@@ -166,6 +168,7 @@ fn nothing_to_push_is_a_plain_result_not_an_empty_commit() {
 
     assert!(!outcome.committed, "{outcome:?}");
     assert_eq!(outcome.files, 0);
+    assert_eq!(outcome.existing_commits, 0, "没有待推提交：{outcome:?}");
     assert_eq!(f.head_sha(), before, "不许空提交");
     assert_eq!(f.git(&["rev-list", "--count", "HEAD"]), "1");
     assert!(!f.is_dirty());
@@ -194,4 +197,111 @@ fn a_push_rejected_by_the_remote_is_reported_with_gits_own_words() {
     assert!(head_message(&f).starts_with("config-sync: 1 files ("), "本地提交应保留");
     assert!(!f.is_dirty());
     assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before);
+}
+
+/// 工作区干净、只有本地提交（`ahead > 0`）：照常推送，只推已有提交，不空提交。
+#[test]
+fn ahead_only_push_sends_existing_commits_without_making_a_new_one() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    f.write_source("home/.zshrc", "export A=2\n");
+    f.commit_all("local: second");
+    f.write_source("home/.tmux.conf", "set -g mouse on\n");
+    f.commit_all("local: third");
+
+    let core = f.core();
+    let before = f.head_sha();
+    assert_eq!(core.repo_status().expect("读状态条").ahead, 2, "两个本地提交还没推");
+
+    let outcome = core.commit_and_push().expect("有本地提交时推送应成功");
+
+    assert!(!outcome.committed, "没有可提交的改动，不许空提交：{outcome:?}");
+    assert_eq!(outcome.files, 0);
+    assert_eq!(outcome.existing_commits, 2, "要如实报出推了几个已有提交：{outcome:?}");
+    assert_eq!(outcome.remote_url, f.remote_url());
+    assert_eq!(f.head_sha(), before, "只推已有提交，不产生新提交");
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), before, "远端必须收到这些提交");
+    assert_eq!(f.git_remote(&["show", "main:home/.zshrc"]), "export A=2");
+
+    let status = core.repo_status().expect("读状态条");
+    assert_eq!((status.ahead, status.dirty), (0, 0), "推送后 ahead 必须归零");
+}
+
+/// 待推提交里的密钥同样硬拦：这些提交会被这次 push 一起送到远端。
+#[test]
+fn a_secret_in_an_unpushed_commit_blocks_the_push_and_names_the_file() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    f.write_source("home/.zshrc", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+    f.commit_all("local: oops");
+    assert!(!f.is_dirty(), "前提：工作区干净，密钥只在已提交的提交里");
+
+    let error = f.core().commit_and_push().expect_err("待推提交里的密钥也必须拦");
+
+    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
+    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
+    assert!(error.message.contains("home/.zshrc"), "文件没被点名：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+    assert_eq!(f.git(&["rev-list", "--count", "@{u}..HEAD"]), "1", "本地提交原样保留，没有新提交");
+}
+
+/// 待推提交里新增的私钥路径也按路径规则拦（内容本身可以完全无害）。
+#[test]
+fn a_private_key_path_in_an_unpushed_commit_is_blocked_by_the_path_rule() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    f.write_source("home/.ssh/id_rsa", "hello\n");
+    f.commit_all("local: key");
+    assert!(!f.is_dirty(), "前提：工作区干净");
+
+    let error = f.core().commit_and_push().expect_err("待推提交里的私钥路径也必须拦");
+
+    assert!(error.message.contains("**/id_rsa"), "规则没被点名：{}", error.message);
+    assert!(error.message.contains("home/.ssh/id_rsa"), "文件没被点名：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+}
+
+/// 没有上游、只有本地提交：首次推送用 `-u origin <branch>` 建立跟踪，之后拉取认得上游。
+#[test]
+fn a_first_push_without_upstream_establishes_tracking() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("local: first");
+    let core = f.core();
+    assert!(!f.git_try(&["rev-parse", "--abbrev-ref", "@{u}"]), "前提：还没有上游");
+
+    let outcome = core.commit_and_push().expect("没有上游时首次推送应建立跟踪");
+
+    assert!(!outcome.committed, "{outcome:?}");
+    assert_eq!(outcome.existing_commits, 1, "{outcome:?}");
+    assert_eq!(f.git(&["rev-parse", "--abbrev-ref", "@{u}"]), "origin/main", "必须建立跟踪");
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
+    assert_eq!(core.repo_status().expect("读状态条").ahead, 0);
+    core.pull().expect("建立跟踪后拉取必须能识别上游");
+}
+
+/// 没有上游、还有未提交改动：先提交再推送，同时建立跟踪。
+#[test]
+fn a_first_push_with_local_changes_commits_and_sets_tracking() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+
+    let outcome = f.core().commit_and_push().expect("首次推送应提交并建立跟踪");
+
+    assert!(outcome.committed, "{outcome:?}");
+    assert_eq!(outcome.files, 1);
+    assert_eq!(outcome.existing_commits, 0, "这次推送没有已有提交：{outcome:?}");
+    assert_eq!(f.git(&["rev-parse", "--abbrev-ref", "@{u}"]), "origin/main");
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
+    assert_message_shape(&outcome.message, 1);
 }
