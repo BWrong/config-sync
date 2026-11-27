@@ -162,3 +162,28 @@ fn refresh_carries_inventory_and_status_from_one_read() {
     assert_eq!(refresh.status.dirty, 1);
     assert_eq!(refresh.entries.len(), 2);
 }
+
+#[test]
+fn renamed_file_is_listed_under_its_new_path_only() {
+    let (f, core) = core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.write_home(".zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+
+    // v2 的重命名记录（`2 …`）后面紧跟一个原路径字段：解析时按定长切到路径那段，
+    // 再跳过原路径。切错一格就会拿 `R100` 之类当路径。
+    f.git(&["mv", "home/.zshrc", "home/.zshrc.bak"]);
+
+    let entries = core.inventory().unwrap();
+    assert_eq!(entries.len(), 1, "重命名只该剩一行：{entries:?}");
+    assert!(
+        entries[0].source.ends_with("home/.zshrc.bak"),
+        "新路径没解析出来：{:?}",
+        entries[0].source
+    );
+    assert_eq!(
+        core.repo_status().unwrap().dirty,
+        1,
+        "一次重命名算一条未提交改动"
+    );
+}

@@ -114,14 +114,21 @@ where
 }
 
 /// 同上，给没有 `Result` 返回值的命令用：后台 panic 时给回退值（这些命令本身不会失败）。
-async fn blocking_or<T, F>(fallback: T, work: F) -> T
+///
+/// 没有错误通道，回退值会把编程错误伪装成「空状态」（`AppState` 未注册、锁中毒
+/// 都会变成「没有仓库」/「源目录为空」，用户直接看到引导页），所以至少留一行日志。
+async fn blocking_or<T, F>(what: &'static str, fallback: T, work: F) -> T
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(work)
-        .await
-        .unwrap_or(fallback)
+    match tauri::async_runtime::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("config-sync: {what} 的后台任务异常结束（{e}），先用回退值继续");
+            fallback
+        }
+    }
 }
 
 /// 一次刷新：清单 + 状态条。两半出自同一份 git 事实，所以只跑一次 `git status`（#19）。
@@ -145,7 +152,7 @@ async fn diff(app: AppHandle, target: String) -> Result<FileDiff, CoreError> {
 /// 源目录里是否已经有仓库：false 时前端进「输入远端地址」。
 #[tauri::command]
 async fn has_repo(app: AppHandle) -> bool {
-    blocking_or(false, move || {
+    blocking_or("has_repo", false, move || {
         app.state::<AppState>().runtime().core.has_repo()
     })
     .await
@@ -165,7 +172,7 @@ async fn edit(app: AppHandle, target: String) -> Result<(), CoreError> {
 
 #[tauri::command]
 async fn source_dir(app: AppHandle) -> String {
-    blocking_or(String::new(), move || {
+    blocking_or("source_dir", String::new(), move || {
         app.state::<AppState>()
             .runtime()
             .source_dir
@@ -185,6 +192,8 @@ async fn open_source_dir(app: AppHandle) -> Result<(), CoreError> {
 async fn clone_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
     blocking(move || {
         let state = app.state::<AppState>();
+        // 语句边界是必需的：这把 guard 必须在 `watch()` 之前释放。`watch()` 内部要取
+        // 同一把 `runtime()` 锁，`std::sync::Mutex` 不可重入，拿着 guard 调用就自死锁。
         state.runtime().core.clone(&remote)?;
         // 克隆出来的 `home/` 现在才存在：重建监视器，别再盯着含 `.git` 的整棵树。
         state.watch(&app);
@@ -214,7 +223,7 @@ async fn remove(app: AppHandle, targets: Vec<PathBuf>) -> Result<Vec<RemoveOutco
 /// 首次使用向导的候选：固定的一组常见配置文件 + 本机是否存在；勾选后交给 `add`。
 #[tauri::command]
 async fn onboarding_candidates(app: AppHandle) -> Vec<Candidate> {
-    blocking_or(Vec::new(), move || {
+    blocking_or("onboarding_candidates", Vec::new(), move || {
         app.state::<AppState>()
             .runtime()
             .core
@@ -312,6 +321,8 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CoreErr
         settings.validate(&state.home).map_err(io)?;
         settings.save(&config_path(&state.home)).map_err(io)?;
         *state.runtime() = Runtime::new(&state.home, settings, None);
+        // 上一条赋值是个完整语句，guard 在这一行结束时已经释放：`watch()` 内部要取
+        // 同一把 `runtime()` 锁（不可重入），并成一句就自死锁。
         // 源目录可能换了个地方，监视器跟着换。
         state.watch(&app);
         Ok(())
@@ -391,30 +402,64 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::blocking;
+    use std::sync::{Arc, Mutex};
+    use std::thread::ThreadId;
     use std::time::{Duration, Instant};
 
-    /// #18 的断言：一个卡在 git 上的长任务不该拖住另一个命令。
+    /// #18 的断言：长任务必须真的跑在另一条线程上，且不拖住其他命令。
     ///
-    /// 慢任务在 blocking 池里 sleep（真命令卡在 `git push` 上就是这样），
-    /// 期间发出的快命令必须立刻返回。同步命令下这个断言会失败：两条都在主线程排队。
+    /// 两件事分开验，因为只看耗时拓不住「假异步」：
+    ///
+    /// - **线程 id**：`blocking()` 若被改成就地执行闭包（教科书式假异步），闭包会跑在
+    ///   调用方（async worker）上，id 相同 → 红。不比线程名：`spawn_blocking` 的线程
+    ///   也叫 `tokio-rt-worker`，与 async worker 同名。
+    /// - **耗时**：真被挡住是 ≥400ms（慢任务整段长度），350ms 仍然能拓住，又不会
+    ///   因为 CI 机器的抖动误报。
     #[test]
-    fn a_slow_command_does_not_delay_another() {
+    fn a_slow_command_runs_off_thread_and_does_not_delay_another() {
         tauri::async_runtime::block_on(async {
-            let slow = tauri::async_runtime::spawn(blocking(|| {
-                std::thread::sleep(Duration::from_millis(400));
-                Ok("slow")
+            let caller = std::thread::current().id();
+            let slow_thread: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+            let fast_thread: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+
+            let slow = tauri::async_runtime::spawn(blocking({
+                let slot = Arc::clone(&slow_thread);
+                move || {
+                    *slot.lock().unwrap() = Some(std::thread::current().id());
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok("slow")
+                }
             }));
-            // 让慢任务先占住一条线程，模拟「推送/预览已经在跑」的那一刻。
+            // 让慢任务先开跑，模拟「推送/预览已经在跑」的那一刻。
             std::thread::sleep(Duration::from_millis(50));
 
             let started = Instant::now();
-            let fast = blocking(|| Ok("fast")).await.unwrap();
+            let fast = blocking({
+                let slot = Arc::clone(&fast_thread);
+                move || {
+                    *slot.lock().unwrap() = Some(std::thread::current().id());
+                    Ok("fast")
+                }
+            })
+            .await
+            .unwrap();
             let waited = started.elapsed();
 
             assert_eq!(fast, "fast");
             assert_eq!(slow.await.unwrap().unwrap(), "slow");
+
+            assert_ne!(
+                slow_thread.lock().unwrap().expect("慢任务的闭包没跑"),
+                caller,
+                "慢任务跑在调用方线程上了"
+            );
+            assert_ne!(
+                fast_thread.lock().unwrap().expect("快命令的闭包没跑"),
+                caller,
+                "快命令跑在调用方线程上了（假异步）"
+            );
             assert!(
-                waited < Duration::from_millis(200),
+                waited < Duration::from_millis(350),
                 "快命令等了 {waited:?}，被慢任务挡住了"
             );
         });

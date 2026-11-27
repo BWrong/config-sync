@@ -210,3 +210,33 @@ fn status_bar_counts_match_git_status_after_the_remote_moves() {
         f.git(&["status", "--porcelain"]).lines().count() as u32
     );
 }
+
+#[test]
+fn unmerged_paths_come_from_the_status_records_not_from_the_remote() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    f.write_home(".zshrc", "export A=1\n");
+
+    // 和一条本地分支制造冲突：@[u] 没动，所以「脏 + 远端改动」这一支不可能成立，
+    // Conflict 只能由 v2 的 `u`（未合并）记录推出来。
+    f.git(&["checkout", "-q", "-b", "side"]);
+    f.write_source("home/.zshrc", "export SIDE=2\n");
+    f.commit_all("config-sync: side");
+    f.git(&["checkout", "-q", "main"]);
+    f.write_source("home/.zshrc", "export MAIN=3\n");
+    f.commit_all("config-sync: main");
+    assert!(!f.git_try(&["merge", "side"]), "这次 merge 必须冲突");
+
+    assert_eq!(
+        core.repo_status().unwrap().behind,
+        0,
+        "远端没动，冲突不可能来自远端改动"
+    );
+    assert_eq!(
+        only_status(&core, "本地分支冲突留下未合并路径"),
+        Status::Conflict
+    );
+}

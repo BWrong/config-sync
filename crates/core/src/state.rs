@@ -209,3 +209,52 @@ pub(crate) fn derive(disk: Disk, repo_path: &Path, facts: &GitFacts) -> Status {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GitFacts;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("启动系统 git");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// rename 记录（`2 …`）后面多一个原路径字段：切错一格就会拿 `R100` 当路径。
+    ///
+    /// 这条必须看 `dirty_paths()`：走 `Core::inventory` 看不到，因为切错的路径不在
+    /// `home/` 下，会被清单按「不受管」过滤掉——错得无声无息。
+    #[test]
+    fn rename_records_yield_the_new_path_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::write(root.join("home/.zshrc"), "export A=1\n").unwrap();
+        git(root, &["init", "-q", "-b", "main", "."]);
+        git(root, &["config", "user.email", "t@example.com"]);
+        git(root, &["config", "user.name", "t"]);
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "init"]);
+        git(root, &["mv", "home/.zshrc", "home/.zshrc.bak"]);
+
+        let facts = GitFacts::read(root).unwrap();
+        let mut dirty: Vec<&PathBuf> = facts.dirty_paths().collect();
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec![&PathBuf::from("home/.zshrc.bak")],
+            "rename 记录的路径切错了"
+        );
+        assert_eq!(facts.dirty_count(), 1, "一次重命名算一条改动");
+    }
+}
