@@ -21,7 +21,12 @@ pub struct ApplyPlan {
 impl ApplyPlan {
     /// 批量摘要：新建 / 覆盖 / 跳过各几项。口径与 `execute_apply` 一致（跳过项不写盘）。
     pub fn summary(&self) -> ApplySummary {
-        let count = |action| self.items.iter().filter(|item| item.action == action).count();
+        let count = |action| {
+            self.items
+                .iter()
+                .filter(|item| item.action == action)
+                .count()
+        };
         ApplySummary {
             create: count(ApplyAction::Create),
             overwrite: count(ApplyAction::Overwrite),
@@ -133,7 +138,10 @@ impl Core {
                 Ok(()) => ApplyResult::Written,
                 Err(message) => ApplyResult::Failed { message },
             };
-            outcomes.push(ApplyOutcome { target: item.target.clone(), result });
+            outcomes.push(ApplyOutcome {
+                target: item.target.clone(),
+                result,
+            });
         }
         Ok(outcomes)
     }
@@ -183,9 +191,11 @@ impl Core {
                     "内容已一致，不用写".to_string(),
                     Some(SkipReason::InSync),
                 ),
-                state::Disk::Missing => {
-                    (ApplyAction::Create, "目标文件不存在，会新建".to_string(), None)
-                }
+                state::Disk::Missing => (
+                    ApplyAction::Create,
+                    "目标文件不存在，会新建".to_string(),
+                    None,
+                ),
                 state::Disk::Differs => (
                     ApplyAction::Overwrite,
                     "目标文件存在且内容不同，会覆盖（保留它原来的权限）".to_string(),
@@ -222,8 +232,13 @@ impl Core {
         let source = self.source_dir.join(paths::MIRROR_ROOT).join(&rel);
         let target = &item.target;
 
-        let bytes = std::fs::read(&source)
-            .map_err(|e| format!("读取源文件 {} 失败：{e}；没有写 {}", source.display(), target.display()))?;
+        let bytes = std::fs::read(&source).map_err(|e| {
+            format!(
+                "读取源文件 {} 失败：{e}；没有写 {}",
+                source.display(),
+                target.display()
+            )
+        })?;
         if digest(&bytes) != item.digest {
             return Err(format!(
                 "源文件 {} 在预览之后改过了，写下去的内容不是确认过的那份；没有写 {}，请重新预览",
@@ -235,8 +250,13 @@ impl Core {
         let parent = target
             .parent()
             .ok_or_else(|| format!("{} 没有父目录，没有写", target.display()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 {} 失败：{e}；没有写 {}", parent.display(), target.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "创建 {} 失败：{e}；没有写 {}",
+                parent.display(),
+                target.display()
+            )
+        })?;
 
         let temp = parent.join(format!(
             ".{}.config-sync-{}-{}.tmp",
@@ -272,7 +292,10 @@ fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
             home.display()
         ))
     })?;
-    if rel.components().any(|component| !matches!(component, Component::Normal(_))) {
+    if rel
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
         return Err(CoreError::io(format!(
             "{} 不是 $HOME 下的普通路径，拒绝写盘",
             target.display()

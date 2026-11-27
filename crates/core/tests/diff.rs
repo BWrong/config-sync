@@ -21,7 +21,11 @@ fn diff_between_target_and_source_for_a_pending_row() {
 
     let text = &diff.text;
     assert!(
-        text.starts_with(&format!("--- {}\n+++ {}\n", target.display(), source.display())),
+        text.starts_with(&format!(
+            "--- {}\n+++ {}\n",
+            target.display(),
+            source.display()
+        )),
         "{text}"
     );
     assert!(text.contains("@@"), "{text}");

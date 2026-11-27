@@ -19,8 +19,14 @@ fn clone_lands_a_repo_in_an_empty_source_dir_and_inventory_lists_its_files() {
     core.clone(&f.remote_url()).expect("从裸远端 clone 应成功");
 
     // 源目录是一个合法 git 仓库，origin 指回原远端。
-    assert_eq!(f.git_at(&fresh_source, &["rev-parse", "--is-inside-work-tree"]), "true");
-    assert_eq!(f.git_at(&fresh_source, &["remote", "get-url", "origin"]), f.remote_url());
+    assert_eq!(
+        f.git_at(&fresh_source, &["rev-parse", "--is-inside-work-tree"]),
+        "true"
+    );
+    assert_eq!(
+        f.git_at(&fresh_source, &["remote", "get-url", "origin"]),
+        f.remote_url()
+    );
     assert!(core.has_repo());
 
     // 清单直接来自 clone 下来的 home/，且没有写入任何真实文件。
@@ -38,7 +44,10 @@ fn clone_refuses_a_source_dir_that_already_has_files() {
     f.commit_all("seed");
     f.push();
 
-    let err = f.core().clone(&f.remote_url()).expect_err("非空源目录必须拒绝");
+    let err = f
+        .core()
+        .clone(&f.remote_url())
+        .expect_err("非空源目录必须拒绝");
 
     assert_eq!(err.kind, ErrorKind::Io);
     assert!(err.message.contains("源目录"), "{}", err.message);
@@ -56,7 +65,10 @@ fn clone_failure_carries_the_raw_git_stderr() {
 
     assert_eq!(err.kind, ErrorKind::Git);
     let stderr = err.stderr.expect("必须带 git 原始 stderr");
-    assert!(stderr.contains("does not appear to be a git repository"), "{stderr}");
+    assert!(
+        stderr.contains("does not appear to be a git repository"),
+        "{stderr}"
+    );
     assert!(!f.path("fresh-source").join(".git").exists());
 }
 
@@ -84,7 +96,10 @@ fn remote_url_reports_origin_and_keeps_gits_own_words_when_there_is_no_repo() {
         .remote_url()
         .expect_err("不是仓库就没有远端");
     assert_eq!(err.kind, ErrorKind::Git);
-    assert!(!err.stderr.unwrap_or_default().trim().is_empty(), "git 的原话要带回来");
+    assert!(
+        !err.stderr.unwrap_or_default().trim().is_empty(),
+        "git 的原话要带回来"
+    );
 }
 
 #[test]
@@ -93,20 +108,35 @@ fn setting_the_remote_replaces_or_adds_origin() {
     let core = f.core();
 
     // 已经有 origin：换掉地址，分支和提交不受影响。
-    core.set_remote("file:///tmp/dotfiles-a.git").expect("替换 origin 应成功");
-    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-a.git");
+    core.set_remote("file:///tmp/dotfiles-a.git")
+        .expect("替换 origin 应成功");
+    assert_eq!(
+        core.remote_url().expect("读回 origin"),
+        "file:///tmp/dotfiles-a.git"
+    );
 
-    core.set_remote("file:///tmp/dotfiles-b.git").expect("再次替换 origin 应成功");
-    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-b.git");
+    core.set_remote("file:///tmp/dotfiles-b.git")
+        .expect("再次替换 origin 应成功");
+    assert_eq!(
+        core.remote_url().expect("读回 origin"),
+        "file:///tmp/dotfiles-b.git"
+    );
 
     // 没有 origin 时用 add，不是 set-url。
     f.git(&["remote", "remove", "origin"]);
     assert!(core.remote_url().is_err(), "去掉 origin 后读不到地址");
-    core.set_remote("file:///tmp/dotfiles-c.git").expect("给没有 origin 的仓库补地址应成功");
-    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-c.git");
+    core.set_remote("file:///tmp/dotfiles-c.git")
+        .expect("给没有 origin 的仓库补地址应成功");
+    assert_eq!(
+        core.remote_url().expect("读回 origin"),
+        "file:///tmp/dotfiles-c.git"
+    );
 
     // 空地址直接拒绝，且不改动已有 origin。
     let rejected = core.set_remote("   ").expect_err("空地址应被拒绝");
     assert_eq!(rejected.kind, ErrorKind::Io);
-    assert_eq!(core.remote_url().expect("读回 origin"), "file:///tmp/dotfiles-c.git");
+    assert_eq!(
+        core.remote_url().expect("读回 origin"),
+        "file:///tmp/dotfiles-c.git"
+    );
 }

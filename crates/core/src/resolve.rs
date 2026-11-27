@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, Core, Status, git, state};
+use crate::{Core, CoreError, Status, git, state};
 
 /// 解决冲突时保留哪一侧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,11 +38,7 @@ impl Core {
     /// - 「本地未提交改动 ∧ 远端也改了同一路径」（本产品的主形态，索引里没有 stage）：
     ///   ours = 保留工作区内容直接提交；theirs = `checkout @{u} --` 把远端版本取进来。
     #[allow(clippy::too_many_lines)] // 分形态 + 收尾，逐行都直接对应语义。
-    pub fn resolve_conflict(
-        &self,
-        target: &Path,
-        side: Side,
-    ) -> Result<(), CoreError> {
+    pub fn resolve_conflict(&self, target: &Path, side: Side) -> Result<(), CoreError> {
         let rel = target.strip_prefix(&self.home).map_err(|_| {
             CoreError::io(format!(
                 "{} 不在 {} 下，没有对应的受管文件",
@@ -84,23 +80,38 @@ impl Core {
                 &self.source_dir,
                 &["checkout", &format!("--{}", side.verb()), "--", &repo],
             )
-            .map_err(|e| CoreError { message: format!("无法取出{}版本：{e}", side.verb()), ..e })?;
+            .map_err(|e| CoreError {
+                message: format!("无法取出{}版本：{e}", side.verb()),
+                ..e
+            })?;
         } else if side == Side::Theirs {
             // 主形态：「采用远端版本」把远端侧的版本取进工作区，覆盖掉本机未提交的改动。
             git::run(&self.source_dir, &["checkout", "@{u}", "--", &repo]).map_err(|e| {
-                CoreError { message: "无法从远端取出该文件的版本".to_string(), ..e }
+                CoreError {
+                    message: "无法从远端取出该文件的版本".to_string(),
+                    ..e
+                }
             })?;
         }
         // 主形态下的 ours：工作区的本机版本就是我们要的，直接进入提交。
 
         // 收尾：只暂存这一个文件，重新提交。提交信息里路径用仓库内的 `home/<rel>`。
-        git::run(&self.source_dir, &["add", "--", &repo])
-            .map_err(|e| CoreError { message: format!("暂存 {} 失败：{e}", target.display()), ..e })?;
+        git::run(&self.source_dir, &["add", "--", &repo]).map_err(|e| CoreError {
+            message: format!("暂存 {} 失败：{e}", target.display()),
+            ..e
+        })?;
         git::run(
             &self.source_dir,
-            &["commit", "-m", &format!("config-sync: resolve conflict: {repo} ({})", side.verb())],
+            &[
+                "commit",
+                "-m",
+                &format!("config-sync: resolve conflict: {repo} ({})", side.verb()),
+            ],
         )
-        .map_err(|e| CoreError { message: format!("提交冲突解决结果失败：{e}"), ..e })?;
+        .map_err(|e| CoreError {
+            message: format!("提交冲突解决结果失败：{e}"),
+            ..e
+        })?;
 
         Ok(())
     }

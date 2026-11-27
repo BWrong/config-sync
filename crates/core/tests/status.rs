@@ -7,7 +7,11 @@ use config_sync_core::{Core, Status};
 /// 清单里唯一那一行的状态。
 fn only_status(core: &Core, context: &str) -> Status {
     let entries = core.inventory().expect("读取清单");
-    assert_eq!(entries.len(), 1, "{context}：清单应只有一行，实际 {entries:?}");
+    assert_eq!(
+        entries.len(),
+        1,
+        "{context}：清单应只有一行，实际 {entries:?}"
+    );
     entries[0].status
 }
 
@@ -57,7 +61,10 @@ fn pending_commit_when_the_source_file_has_uncommitted_changes() {
     f.write_home(".zshrc", "export A=1\n");
     f.write_source("home/.zshrc", "export A=1\nexport B=2\n");
 
-    assert_eq!(only_status(&core, "源目录有未提交改动"), Status::PendingCommit);
+    assert_eq!(
+        only_status(&core, "源目录有未提交改动"),
+        Status::PendingCommit
+    );
 }
 
 #[test]
@@ -70,7 +77,10 @@ fn pending_pull_when_the_remote_changed_a_path_the_worktree_did_not() {
     f.write_home(".zshrc", "export A=1\n");
     f.advance_remote("home/.zshrc", "export A=1\nexport B=9\n");
 
-    assert_eq!(only_status(&core, "远端领先且改了同一路径"), Status::PendingPull);
+    assert_eq!(
+        only_status(&core, "远端领先且改了同一路径"),
+        Status::PendingPull
+    );
 }
 
 #[test]
@@ -135,7 +145,11 @@ fn status_table_covers_git_state_target_presence_and_remote_lead() {
         f.commit_all("config-sync: 1 files");
         f.push();
 
-        let source_content = if dirty { "export A=1\nexport LOCAL=7\n" } else { "export A=1\n" };
+        let source_content = if dirty {
+            "export A=1\nexport LOCAL=7\n"
+        } else {
+            "export A=1\n"
+        };
         if dirty {
             f.write_source("home/.zshrc", source_content);
         }
@@ -191,5 +205,8 @@ fn status_bar_counts_match_git_status_after_the_remote_moves() {
     let status = core.repo_status().unwrap();
     assert_eq!(status.branch, "main");
     assert_eq!((status.ahead, status.behind), (0, 1));
-    assert_eq!(status.dirty, f.git(&["status", "--porcelain"]).lines().count() as u32);
+    assert_eq!(
+        status.dirty,
+        f.git(&["status", "--porcelain"]).lines().count() as u32
+    );
 }

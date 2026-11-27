@@ -28,12 +28,19 @@ const CANDIDATES: &[&str] = &[
 /// 绝不推荐给用户的路径：历史记录、`~/.ssh/id_*` 私钥、含凭据字样的文件。
 fn is_sensitive(rel: &Path) -> bool {
     let text = rel.to_string_lossy().to_lowercase();
-    let name = rel.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let under_ssh = rel.components().any(|component| component.as_os_str() == ".ssh");
+    let name = rel
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let under_ssh = rel
+        .components()
+        .any(|component| component.as_os_str() == ".ssh");
 
     name.ends_with("_history")
         || (under_ssh && name.starts_with("id_"))
-        || ["credential", "token", "secret"].iter().any(|needle| text.contains(needle))
+        || ["credential", "token", "secret"]
+            .iter()
+            .any(|needle| text.contains(needle))
 }
 
 /// 向导里的一行候选。

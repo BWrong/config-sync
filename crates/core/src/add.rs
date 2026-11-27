@@ -62,12 +62,17 @@ impl Core {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 out.push(AddOutcome {
                     target,
-                    result: AddResult::Rejected { reason: format!("{} 不存在", input.display()) },
+                    result: AddResult::Rejected {
+                        reason: format!("{} 不存在", input.display()),
+                    },
                 });
                 return Ok(());
             }
             Err(e) => {
-                return Err(CoreError::io(format!("读取 {} 失败：{e}", target.display())))
+                return Err(CoreError::io(format!(
+                    "读取 {} 失败：{e}",
+                    target.display()
+                )));
             }
         };
 
@@ -77,7 +82,9 @@ impl Core {
             files.sort();
             for file in files {
                 // 目录在 $HOME 下，其中的文件也一定在 $HOME 下。
-                let rel = file.strip_prefix(&self.home).expect("目录内的文件都在 $HOME 下");
+                let rel = file
+                    .strip_prefix(&self.home)
+                    .expect("目录内的文件都在 $HOME 下");
                 self.copy_into_mirror(rel, out)?;
             }
         } else if meta.is_file() {
@@ -104,21 +111,30 @@ impl Core {
                 // 目标读不到（例如已被删除）就谈不上内容不同。
                 _ => true,
             };
-            let result =
-                if same { AddResult::AlreadyManaged } else { AddResult::AlreadyManagedDiffers };
+            let result = if same {
+                AddResult::AlreadyManaged
+            } else {
+                AddResult::AlreadyManagedDiffers
+            };
             out.push(AddOutcome { target, result });
             return Ok(());
         }
 
         if let Some(parent) = source.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                CoreError::io(format!("创建 {} 失败：{e}", parent.display()))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CoreError::io(format!("创建 {} 失败：{e}", parent.display())))?;
         }
         std::fs::copy(&target, &source).map_err(|e| {
-            CoreError::io(format!("复制 {} 到 {} 失败：{e}", target.display(), source.display()))
+            CoreError::io(format!(
+                "复制 {} 到 {} 失败：{e}",
+                target.display(),
+                source.display()
+            ))
         })?;
-        out.push(AddOutcome { target, result: AddResult::Added });
+        out.push(AddOutcome {
+            target,
+            result: AddResult::Added,
+        });
         Ok(())
     }
 }
@@ -130,9 +146,12 @@ fn collect_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CoreE
         .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", dir.display())))?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", dir.display())))?;
+        let entry =
+            entry.map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", dir.display())))?;
         let path = entry.path();
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
         if meta.is_dir() {
             let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
             if !is_symlink {

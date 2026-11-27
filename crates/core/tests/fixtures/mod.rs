@@ -35,15 +35,36 @@ impl Fixture {
         std::fs::create_dir_all(&home).expect("创建临时 home");
         std::fs::create_dir_all(&source_dir).expect("创建临时源目录");
 
-        git(None, root, &["init", "--bare", "--initial-branch=main", path(&remote)]);
+        git(
+            None,
+            root,
+            &["init", "--bare", "--initial-branch=main", path(&remote)],
+        );
         git(None, &source_dir, &["init", "--initial-branch=main"]);
         // 仓库内固定身份与签名开关：测试不受用户全局 gitconfig 影响。
-        git(None, &source_dir, &["config", "user.name", "config-sync test"]);
-        git(None, &source_dir, &["config", "user.email", "test@config-sync.invalid"]);
+        git(
+            None,
+            &source_dir,
+            &["config", "user.name", "config-sync test"],
+        );
+        git(
+            None,
+            &source_dir,
+            &["config", "user.email", "test@config-sync.invalid"],
+        );
         git(None, &source_dir, &["config", "commit.gpgsign", "false"]);
-        git(None, &source_dir, &["remote", "add", "origin", &file_url(&remote)]);
+        git(
+            None,
+            &source_dir,
+            &["remote", "add", "origin", &file_url(&remote)],
+        );
 
-        Fixture { _tmp: tmp, home, source_dir, remote }
+        Fixture {
+            _tmp: tmp,
+            home,
+            source_dir,
+            remote,
+        }
     }
 
     /// 用夹具的三个路径构造 Core：`(home, source_dir, config)`。

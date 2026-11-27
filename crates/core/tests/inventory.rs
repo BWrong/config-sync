@@ -44,7 +44,12 @@ fn inventory_mirrors_home_subtree_and_compares_content() {
                 status: Status::TargetMissing,
                 deleted: false,
             },
-            InventoryEntry { source, target, status: Status::InSync, deleted: false },
+            InventoryEntry {
+                source,
+                target,
+                status: Status::InSync,
+                deleted: false
+            },
         ]
     );
 
@@ -60,7 +65,12 @@ fn repo_status_follows_real_git_state_and_the_bare_remote() {
     f.write_source("home/.zshrc", "export A=1\n");
     assert_eq!(
         core.repo_status().unwrap(),
-        RepoStatus { branch: "main".into(), ahead: 0, behind: 0, dirty: 1 }
+        RepoStatus {
+            branch: "main".into(),
+            ahead: 0,
+            behind: 0,
+            dirty: 1
+        }
     );
 
     f.commit_all("config-sync: 1 files");
@@ -71,8 +81,14 @@ fn repo_status_follows_real_git_state_and_the_bare_remote() {
 
     // 第二份工作副本往远端再推一个提交 → fetch 之后 behind == 1。
     let other = f.path("other");
-    f.git_at(f.tmp_root(), &["clone", &f.remote_url(), other.to_str().unwrap()]);
-    f.git_at(&other, &["config", "user.email", "test@config-sync.invalid"]);
+    f.git_at(
+        f.tmp_root(),
+        &["clone", &f.remote_url(), other.to_str().unwrap()],
+    );
+    f.git_at(
+        &other,
+        &["config", "user.email", "test@config-sync.invalid"],
+    );
     f.git_at(&other, &["config", "user.name", "config-sync test"]);
     std::fs::write(other.join("home/.zshrc"), "export A=3\n").unwrap();
     f.git_at(&other, &["commit", "-am", "config-sync: 1 files"]);

@@ -42,7 +42,10 @@ mod tests {
         let marker = marker_path(home.path());
         assert!(marker.starts_with(crate::settings::app_dir(home.path())));
         assert!(marker.to_string_lossy().contains(".config/config-sync"));
-        assert!(!marker.starts_with(home.path().join(".local/share/config-sync")), "标记不进源目录");
+        assert!(
+            !marker.starts_with(home.path().join(".local/share/config-sync")),
+            "标记不进源目录"
+        );
     }
 
     #[test]
