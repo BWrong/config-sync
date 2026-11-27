@@ -884,13 +884,17 @@ fn git_stamp(source_dir: &Path) -> Option<Vec<(PathBuf, Option<Stamp>)>> {
         git_dir.join("info").join("exclude"),
         source_dir.join(".gitignore"),
     ];
-    collect_files(&git_dir.join("refs"), &mut files);
+    if !collect_files(&git_dir.join("refs"), &mut files) {
+        return None;
+    }
     files.sort();
     Some(
         files
             .into_iter()
             .map(|path| {
-                let stamp = std::fs::metadata(&path).ok().and_then(|meta| stamp(&meta));
+                let stamp = std::fs::symlink_metadata(&path)
+                    .ok()
+                    .and_then(|meta| stamp(&meta));
                 (path, stamp)
             })
             .collect(),
@@ -898,22 +902,28 @@ fn git_stamp(source_dir: &Path) -> Option<Vec<(PathBuf, Option<Stamp>)>> {
 }
 
 /// 把 `dir` 下的普通文件全收进来（`refs` 里分支、标签各占一个文件）。
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+///
+/// 条目读不出类型就返回 `false`，让整份戳作废：漏一个 ref 却声明「没变」是静默错，
+/// 整份不缓存只是多读一遍（#49 复审）。
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return true;
     };
     for entry in entries.flatten() {
         // 不跟随符号链接：`refs` 里不该有，有也不该顺着它绕出去（`file_type` 不解析链接）。
         let Ok(kind) = entry.file_type() else {
-            continue;
+            return false;
         };
         let path = entry.path();
         if kind.is_dir() {
-            collect_files(&path, out);
+            if !collect_files(&path, out) {
+                return false;
+            }
         } else {
             out.push(path);
         }
     }
+    true
 }
 
 /// 两侧长度已确认相等时，读内容比字节（错误文案与判等口径不变）。
