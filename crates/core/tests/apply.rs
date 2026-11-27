@@ -7,7 +7,8 @@ mod fixtures;
 use std::path::{Path, PathBuf};
 
 use config_sync_core::{
-    ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary,
+    ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary, DIFF_TOO_LARGE,
+    ErrorKind, Status,
 };
 
 fn written(target: &Path) -> ApplyOutcome {
@@ -212,6 +213,8 @@ fn paths_outside_home_are_refused_by_both_phases() {
             action: ApplyAction::Overwrite,
             reason: String::new(),
             diff: String::new(),
+            diff_omitted: false,
+            diff_reason: String::new(),
             digest: String::new(),
             skip_reason: None,
         }],
@@ -369,4 +372,209 @@ fn creating_a_target_keeps_the_executable_bit_and_overwriting_keeps_the_targets_
     let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "覆盖后的权限 {mode:o}");
     assert_eq!(f.read_home(".local/bin/hello"), "#!/bin/sh\necho bye\n");
+}
+
+#[test]
+fn a_target_of_a_different_size_is_judged_without_reading_its_content() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let target = committed(&f, ".zshrc", "export A=1\n");
+    // 长度不同就够判「待应用」：内容读不了也不该影响清单（先比 metadata().len()，见 #20）。
+    f.write_home(".zshrc", "export A=1\nexport B=2\n");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let entries = core.inventory().unwrap();
+    let row = entries.iter().find(|entry| entry.target == target).unwrap();
+    assert_eq!(row.status, Status::Pending, "{row:?}");
+
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn skipped_items_carry_no_diff_payload() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.tmux.conf", "set -g mouse on\n");
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.write_source("home/.bashrc", "export B=1\n");
+    f.commit_all("config-sync: 3 files");
+    f.push();
+    // 一致 → 跳过；待提交 → 跳过；冲突 → 跳过：三种跳过项都不写盘，也就不算 diff。
+    f.write_home(".tmux.conf", "set -g mouse on\n");
+    f.write_source("home/.zshrc", "export A=2\n");
+    f.advance_remote("home/.bashrc", "export B=9\n");
+    f.write_source("home/.bashrc", "export B=2\n");
+
+    let plan = core.plan_apply(None).unwrap();
+    let skipped: Vec<&ApplyItem> = plan
+        .items
+        .iter()
+        .filter(|item| item.action == ApplyAction::Skip)
+        .collect();
+    assert_eq!(skipped.len(), 3, "{:?}", plan.items);
+    for item in skipped {
+        assert_eq!(item.diff, "", "{} 跳过了还带了 diff", item.target.display());
+        assert!(!item.diff_omitted, "{}", item.target.display());
+        assert!(item.diff_reason.is_empty(), "{}", item.target.display());
+    }
+}
+
+#[test]
+fn files_over_the_diff_gate_are_not_previewed_as_diffs() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 超过 5000 行就超过闸门（阈值见 core 的 DIFF_MAX_*）。
+    let body: String = (0..6000).map(|i| format!("key_{i:05} = value\n")).collect();
+    f.write_source("home/big.conf", &body);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home("big.conf", "old\n");
+
+    let plan = core.plan_apply(None).unwrap();
+    let big = item(&plan, &target);
+    // 闸门只影响 diff，动作与摘要不变。
+    assert_eq!(big.action, ApplyAction::Overwrite);
+    assert!(
+        big.diff.is_empty(),
+        "闸门内不该生成 {} 字节的 diff",
+        big.diff.len()
+    );
+    assert!(big.diff_omitted, "{}", target.display());
+    assert_eq!(
+        plan.summary(),
+        ApplySummary {
+            create: 0,
+            overwrite: 1,
+            skip: 0
+        }
+    );
+
+    // 原因要能说清「多大 / 多少行 / 上限多少」（#17 N2）。
+    assert!(big.diff_reason.contains("行"), "{}", big.diff_reason);
+    assert!(
+        big.diff_reason.contains(DIFF_TOO_LARGE),
+        "{}",
+        big.diff_reason
+    );
+
+    // 预览不预生成，但显式点开仍要给内容：6000 行没过按需闸门（#17 S2）。
+    let diff = core.diff(&target).unwrap();
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(!diff.truncated, "{diff:?}");
+    assert!(diff.text.contains("+key_05999 = value"), "{}", diff.text);
+}
+
+#[test]
+fn the_line_gate_counts_the_line_heaviest_side_not_the_byte_widest_one() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 源：20000 条短行（约 176KB，字节没超闸门）；目标：8 条 32KB 巨行（约 250KB，
+    // 字节更宽但只有 8 行）。只按「字节最宽那侧」数行的话，5000 行上限就被绕过了（#17 B1）。
+    let source: String = (0..20_000)
+        .map(|i| format!("k{i:05}={}\n", i % 9))
+        .collect();
+    f.write_source("home/lines.conf", &source);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home("lines.conf", &format!("{}\n", "x".repeat(32_001)).repeat(8));
+    assert!(
+        source.len() < 256 * 1024,
+        "源要压在字节闸门内：{}",
+        source.len()
+    );
+    assert!(
+        std::fs::metadata(&target).unwrap().len() < 256 * 1024,
+        "目标也压在字节闸门内"
+    );
+
+    let plan = core.plan_apply(None).unwrap();
+    let item = item(&plan, &target);
+    assert_eq!(item.action, ApplyAction::Overwrite);
+    assert!(
+        item.diff.is_empty(),
+        "行数超闸门就不能生成 {} 字节的 diff",
+        item.diff.len()
+    );
+    assert!(item.diff_omitted, "行数闸门必须生效");
+    assert!(
+        item.diff_reason.contains("20000 行"),
+        "{}",
+        item.diff_reason
+    );
+
+    // 单文件 diff 走按需闸门（宽得多）：20000 行没超，照样给 diff（#17 S2）。
+    let diff = core.diff(&target).unwrap();
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(!diff.truncated, "{diff:?}");
+    assert!(diff.text.contains("+k19999="), "{}", diff.text.len());
+}
+
+#[test]
+fn a_directory_where_the_target_should_be_is_a_read_error() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    committed(&f, ".zshrc", "export A=1\n");
+    let target = f.home.join(".zshrc");
+    std::fs::create_dir(&target).unwrap();
+
+    // 目标是目录：沿用原来的读错误，而不是长度不等就判「不同」（#17 N3）。
+    let error = core.inventory().expect_err("目标是目录必须报读失败");
+    assert_eq!(error.kind, ErrorKind::Io, "{error:?}");
+    assert!(error.message.contains("读取"), "{}", error.message);
+}
+
+#[test]
+fn an_oversized_target_is_not_read_into_memory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    // 目标比闸门大得多，而且读不了：只有「先量字节、超了就不读」才可能出得了计划（#17 N4）。
+    let target = f.write_home(".zshrc", &"x".repeat(300 * 1024));
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let plan = core.plan_apply(None).expect("超闸门的目标不该被读进来");
+    let big = item(&plan, &target);
+    assert_eq!(big.action, ApplyAction::Overwrite);
+    assert!(big.diff_omitted, "{}", big.diff_reason);
+    // 措辞别过头：源侧是读了的，只说「超过上限的那一侧没有读入内存」（第 2 轮 N3）。
+    assert!(
+        big.diff_reason.contains("没有读入内存"),
+        "{}",
+        big.diff_reason
+    );
+
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn an_oversized_pair_of_equal_size_is_read_but_never_diffed() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 两侧等长且都超 256KB：一致性只能靠读内容判断，但 diff 一律不算（#17 N4 + B1）。
+    let source = "a".repeat(300 * 1024);
+    f.write_source("home/equal.conf", &source);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home("equal.conf", &"b".repeat(300 * 1024));
+
+    let plan = core.plan_apply(None).unwrap();
+    let big = item(&plan, &target);
+    assert_eq!(big.action, ApplyAction::Overwrite);
+    assert!(
+        big.diff.is_empty() && big.diff_omitted,
+        "{}",
+        big.diff_reason
+    );
+    // 读过就别再说「没有读入内存」：这句得报实际行数。
+    assert!(
+        !big.diff_reason.contains("没有读入内存"),
+        "{}",
+        big.diff_reason
+    );
 }

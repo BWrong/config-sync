@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Core, CoreError, Status, paths, read_text, state, unified_diff};
+use crate::{
+    Core, CoreError, DIFF_MAX_BYTES, Status, diff_gate_reason, paths, state, too_large_reason,
+    unified_diff,
+};
 
 /// 一份完整的应用计划。预览展示它，写盘也执行它。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +57,10 @@ pub struct ApplyItem {
     pub reason: String,
     /// 应用会带来的改动（目标 → 源），unified diff；没有改动时是空串。
     pub diff: String,
+    /// `diff` 因为两侧文件太大被闸门跳过（此时 `diff` 是空串）：界面显示 `diff_reason`。
+    pub diff_omitted: bool,
+    /// `diff_omitted` 为真时为什么不算：多大、多少行、上限多少。
+    pub diff_reason: String,
     /// 跳过项的归类：界面用图标表达，不逐条念句子。非跳过项为 `None`。
     pub skip_reason: Option<SkipReason>,
     /// 出计划时源文件内容的指纹（十六进制）：写盘前比对，源文件在这期间变过就不写。
@@ -166,13 +173,57 @@ impl Core {
                     source.display()
                 ),
                 diff: String::new(),
+                diff_omitted: false,
+                diff_reason: String::new(),
                 digest: String::new(),
                 skip_reason: Some(SkipReason::SourceMissing),
             });
         }
 
+        // 源侧必须完整读：digest 与 diff 的新内容都要它（#20）。
+        let source_bytes = std::fs::read(&source)
+            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
+        let target_meta = match std::fs::metadata(&target) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(CoreError::io(format!(
+                    "读取 {} 失败：{e}",
+                    target.display()
+                )));
+            }
+        };
+        // 目录之类的非普通目标：走原来的读错误路径，错误语义不变（#20 N3）。
+        if target_meta.as_ref().is_some_and(|meta| !meta.is_file()) {
+            std::fs::read(&target)
+                .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?;
+        }
+        let target_len = target_meta.as_ref().map_or(0, std::fs::Metadata::len);
+        let widest_bytes = source_bytes.len().max(target_len as usize);
+
+        // 超字节闸门时 diff 反正不算，目标就不读（#17 N4）；但等长的仍要读：
+        // 一致 / 不同的判断只能比内容，而 diff 的旧内容也要它（#20）。
+        let target_bytes = match &target_meta {
+            None => None,
+            Some(_)
+                if widest_bytes > DIFF_MAX_BYTES && target_len as usize != source_bytes.len() =>
+            {
+                None
+            }
+            Some(_) => Some(
+                std::fs::read(&target)
+                    .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?,
+            ),
+        };
+        let disk = match (&target_meta, &target_bytes) {
+            (None, _) => state::Disk::Missing,
+            // 只有「长度不同且超闸门」会不读：长度不同已经能判不同。
+            (Some(_), None) => state::Disk::Differs,
+            (Some(_), Some(bytes)) if bytes == &source_bytes => state::Disk::Same,
+            (Some(_), Some(_)) => state::Disk::Differs,
+        };
+
         let repo_path = Path::new(paths::MIRROR_ROOT).join(rel);
-        let disk = self.disk(rel)?;
         let (action, reason, skip_reason) = match state::derive(disk, &repo_path, facts) {
             // 源侧内容还没定下来：先让用户处理提交 / 冲突，应用不动目标文件。
             Status::PendingCommit => (
@@ -204,18 +255,44 @@ impl Core {
             },
         };
 
-        let bytes = std::fs::read(&source)
-            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
-        let item_source = source.clone();
+        // 跳过项（一致 / 待提交 / 冲突）不写盘，也没人去读它们的 diff：不算（#17）。
+        // 闸门先按字节判：超了就根本不做 lossy 转换，直接给结论（#17 N4）。
+        let (diff, diff_omitted, diff_reason) = if action == ApplyAction::Skip {
+            (String::new(), false, String::new())
+        } else if widest_bytes > DIFF_MAX_BYTES {
+            // 目标没读（长度不同且超闸门）时只有源侧能数行；读了就两侧都数，别报“没读入”却其实读过（#17 N2）。
+            let lines = target_bytes
+                .as_deref()
+                .map(|target_bytes| line_count(target_bytes).max(line_count(&source_bytes)));
+            (String::new(), true, too_large_reason(widest_bytes, lines))
+        } else {
+            let old = target_bytes
+                .as_deref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            let new = String::from_utf8_lossy(&source_bytes);
+            // 行数闸门：两侧字节各自取最大（见 lib.rs 的 diff_gate_reason）。
+            match diff_gate_reason(&old, &new) {
+                Some(reason) => (String::new(), true, reason),
+                None => (
+                    unified_diff(
+                        &target.display().to_string(),
+                        &source.display().to_string(),
+                        &old,
+                        &new,
+                    ),
+                    false,
+                    String::new(),
+                ),
+            }
+        };
+
         Ok(ApplyItem {
-            source: item_source,
-            diff: unified_diff(
-                &target.display().to_string(),
-                &source.display().to_string(),
-                &read_text(&target),
-                &String::from_utf8_lossy(&bytes),
-            ),
-            digest: digest(&bytes),
+            source: source.clone(),
+            diff,
+            diff_omitted,
+            diff_reason,
+            digest: digest(&source_bytes),
             target,
             action,
             reason,
@@ -265,10 +342,13 @@ impl Core {
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
 
-        let written = std::fs::copy(&source, &temp).and_then(|_| {
-            // 覆盖已有文件时，保留它原来的权限（用户可能自己收紧过）。
-            if let Ok(existing) = std::fs::metadata(target) {
-                std::fs::set_permissions(&temp, existing.permissions())?;
+        let written = std::fs::write(&temp, &bytes).and_then(|()| {
+            // 覆盖已有文件时保留它原来的权限；新建沿用源文件（可执行位不丢）。
+            let permissions = std::fs::metadata(target)
+                .or_else(|_| std::fs::metadata(&source))
+                .map(|meta| meta.permissions());
+            if let Ok(permissions) = permissions {
+                std::fs::set_permissions(&temp, permissions)?;
             }
             std::fs::rename(&temp, target)
         });
@@ -305,6 +385,13 @@ fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
 }
 
 /// 源文件内容的指纹，只为「预览之后源文件变过没有」这一次比对服务。
+/// 按字节数行（不做 lossy 转换）：只给超闸门时那句原因用。
+/// 与 `str::lines()` 一个口径：末行不带换行也算一行（第 2 轮 N3）。
+fn line_count(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
+    newlines + usize::from(bytes.last().is_some_and(|byte| *byte != b'\n'))
+}
+
 fn digest(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
