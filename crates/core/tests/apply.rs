@@ -549,3 +549,30 @@ fn an_oversized_target_is_not_read_into_memory() {
 
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+#[test]
+fn an_oversized_pair_of_equal_size_is_read_but_never_diffed() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 两侧等长且都超 256KB：一致性只能靠读内容判断，但 diff 一律不算（#17 N4 + B1）。
+    let source = "a".repeat(300 * 1024);
+    f.write_source("home/equal.conf", &source);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home("equal.conf", &"b".repeat(300 * 1024));
+
+    let plan = core.plan_apply(None).unwrap();
+    let big = item(&plan, &target);
+    assert_eq!(big.action, ApplyAction::Overwrite);
+    assert!(
+        big.diff.is_empty() && big.diff_omitted,
+        "{}",
+        big.diff_reason
+    );
+    // 读过就别再说「没有读入内容」：这句得报实际行数。
+    assert!(
+        !big.diff_reason.contains("没有读入内容"),
+        "{}",
+        big.diff_reason
+    );
+}

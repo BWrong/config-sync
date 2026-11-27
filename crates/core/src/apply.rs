@@ -260,7 +260,11 @@ impl Core {
         let (diff, diff_omitted, diff_reason) = if action == ApplyAction::Skip {
             (String::new(), false, String::new())
         } else if widest_bytes > DIFF_MAX_BYTES {
-            (String::new(), true, too_large_reason(widest_bytes, None))
+            // 目标没读（长度不同且超闸门）时只有源侧能数行；读了就两侧都数，别报“没读入”却其实读过（#17 N2）。
+            let lines = target_bytes
+                .as_deref()
+                .map(|target_bytes| line_count(target_bytes).max(line_count(&source_bytes)));
+            (String::new(), true, too_large_reason(widest_bytes, lines))
         } else {
             let old = target_bytes
                 .as_deref()
@@ -381,6 +385,11 @@ fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
 }
 
 /// 源文件内容的指纹，只为「预览之后源文件变过没有」这一次比对服务。
+/// 按字节数行（不做 lossy 转换）：只给超闸门时那句原因用。
+fn line_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
+}
+
 fn digest(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
