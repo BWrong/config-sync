@@ -276,6 +276,17 @@ pub(crate) fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
         .ok()
 }
 
+/// 一次数两个方向：`rev-list --count --left-right base...branch`，返回 `(ahead, behind)`——
+/// right 是 branch 独有（ahead），left 是 base 独有（behind）。
+pub(crate) fn count_between(source_dir: &Path, base: &str, branch: &str) -> Option<(u32, u32)> {
+    let range = format!("{base}...{branch}");
+    let out = git::run(source_dir, &["rev-list", "--count", "--left-right", &range]).ok()?;
+    let mut fields = out.split_whitespace();
+    let behind = fields.next()?.parse().ok()?;
+    let ahead = fields.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
 /// `git add -A` 之后暂存区里的文件数 = 本次提交涉及的文件数。
 fn staged_file_count(source_dir: &Path) -> Result<u32, CoreError> {
     let names = git::run(source_dir, &["diff", "--cached", "--name-only"])?;

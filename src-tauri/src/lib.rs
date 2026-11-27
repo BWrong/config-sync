@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use config_sync_core::{
-    AddOutcome, ApplyOutcome, ApplyPlan, ApplySummary, BackupSummary, Candidate, Core, CoreError,
-    ErrorKind, FileDiff, PushOutcome, Refresh, RemoveOutcome, RestoreOutcome, RestorePlan,
+    AddOutcome, ApplyExecution, ApplyOutcome, ApplyPlan, ApplySummary, BackupSummary, Candidate,
+    Core, CoreError, ErrorKind, FileDiff, PushOutcome, Refresh, RemoveOutcome, RestoreOutcome,
+    RestorePlan,
 };
 use serde::Serialize;
 use settings::Settings;
@@ -382,10 +383,13 @@ async fn plan_apply(
 
 /// 「应用」第二步：执行预览里那一份计划，不重新判断动作。
 #[tauri::command]
-async fn execute_apply(app: AppHandle, plan: ApplyPlan) -> Result<Vec<ApplyOutcome>, CoreError> {
+async fn execute_apply(
+    app: AppHandle,
+    execution: ApplyExecution,
+) -> Result<Vec<ApplyOutcome>, CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|scope| scope.runtime().core.execute_apply(&plan))
+            .write(|scope| scope.runtime().core.execute(&execution))
     })
     .await
 }
