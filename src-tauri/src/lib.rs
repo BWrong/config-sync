@@ -132,8 +132,15 @@ fn open_source_dir(state: State<'_, AppState>) -> Result<(), CoreError> {
 }
 
 #[tauri::command]
-fn clone_remote(state: State<'_, AppState>, remote: String) -> Result<(), CoreError> {
-    state.runtime().core.clone(&remote)
+fn clone_remote(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    remote: String,
+) -> Result<(), CoreError> {
+    state.runtime().core.clone(&remote)?;
+    // 克隆出来的 `home/` 现在才存在：重建监视器，别再盯着含 `.git` 的整棵树。
+    state.watch(&app);
+    Ok(())
 }
 
 /// 写入或替换源目录仓库的 origin 地址。只动 git 配置，不提交、不写 $HOME。
