@@ -111,9 +111,14 @@ impl Core {
             &facts,
             target.scan_base.as_deref(),
             target.ahead,
-        )?;
+        )
+        .map_err(|error| with_switch_note(error, &branch, switched_from.as_deref()))?;
         if !hits.is_empty() {
-            return Err(blocked_error(&hits));
+            return Err(with_switch_note(
+                blocked_error(&hits),
+                &branch,
+                switched_from.as_deref(),
+            ));
         }
 
         let dirty = facts.dirty_paths().next().is_some();
@@ -302,8 +307,22 @@ fn scan(
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen: HashSet<(&'static str, String)> = HashSet::new();
 
+    // 路径规则先跑完全部路径，再进尺寸闸门：两者都拦，先后只决定用户先看到哪一条文案。
+    // 命中路径规则的文件本就不该进仓库，比「太大了」更贴病因，所以哪怕它同时超大也先报它。
+    for path in &paths {
+        check_path_rules(&mut hits, &mut seen, &repo_str(path));
+    }
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+
     // 暂存区版本：先把路径换成 blob sha，再一次 batch 取完。查询串里只出现 sha——
     // 路径带换行/引号都不可能把一次查询切成两条，响应与查询也就永远一一对应。
+    //
+    // 为什么连索引也扫：这一步在 `git add -A` **之前**，暂存区此刻还压着工作区里其实已经
+    // 没了的内容（删掉/改名/再改干净）。那份 blob 不会进新树——`add -A` 会把删除一并暂存、
+    // 把新内容一起写进索引——所以扫索引是保守多拦一次，不是「这次要送出去的内容」。
+    // 方向安全：多拦只会多拒一次，不会放漏。
     let dirty_names: HashSet<String> = paths.iter().map(|path| repo_str(path)).collect();
     let staged_blobs = index_blobs(source_dir, &dirty_names)?;
     let index_specs: Vec<String> = staged_blobs.iter().map(|(_, sha)| sha.clone()).collect();
@@ -325,9 +344,12 @@ fn scan(
 
     for path in &paths {
         let repo_path = repo_str(path);
-        check_path_rules(&mut hits, &mut seen, &repo_path);
         // 超过闸门：不读内容，整次中止（与暂存区、待推 blob 同一个 fail-closed 口径）。
-        check_worktree_size(source_dir, path)?;
+        // 不是普通文件（软链接、目录）就没有会被推送的内容可扫，跳过读取——别顺着软链接
+        // 把外部大文件整份读进内存。
+        if !worktree_gate(source_dir, path)? {
+            continue;
+        }
         // 工作区版本读磁盘；二进制按有损 UTF-8 读，不影响正则。
         if let Ok(bytes) = std::fs::read(source_dir.join(path)) {
             check_content_rules(
@@ -587,15 +609,20 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// 工作区版本的尺寸闸门：`metadata` 就够，绝不为了判大小先读内容。
-/// 超过上限不是「跳过内容扫描」，而是整次中止——跳过就等于大文件里的密钥照推。
-/// 查不到 metadata（已删除、断链等）谈不上超大：那种路径本来就 `fs::read` 不出内容，
-/// 内容规则也就没有可扫的东西（暂存区版本另有自己的闸门）。
-fn check_worktree_size(source_dir: &Path, path: &Path) -> Result<(), CoreError> {
+/// 工作区版本的尺寸闸门：只看路径**自身**的尺寸（`symlink_metadata`，不跟随软链接），
+/// 绝不为了判大小先读内容。超过上限不是「跳过内容扫描」，而是整次中止——跳过就等于
+/// 大文件里的密钥照推。返回值 = 要不要读内容扫（只有普通文件才值得读）。
+///
+/// 方向偏宽，宽的是本来就送不出去的东西：git 只把软链接自身（目标路径那串文本）存进
+/// 仓库，链接目标的尺寸与内容都不在这次推送里，所以指向外部 20 MiB 文件的软链接不该
+/// 以链接路径报超限。查不到 metadata（已删除、断链等）同样谈不上超大，跳过读取即可
+/// （暂存区版本另有自己的闸门）。
+fn worktree_gate(source_dir: &Path, path: &Path) -> Result<bool, CoreError> {
     let full = source_dir.join(path);
-    match std::fs::metadata(&full) {
+    match std::fs::symlink_metadata(&full) {
         Ok(meta) if meta.len() > MAX_BLOB_BYTES => Err(blob_too_large("工作区", &full, meta.len())),
-        _ => Ok(()),
+        Ok(meta) => Ok(meta.is_file()),
+        Err(_) => Ok(false),
     }
 }
 
@@ -807,6 +834,23 @@ fn glob_segment_matches(pattern: &str, text: &str) -> bool {
                 && text.ends_with(suffix)
         }
         None => text == pattern,
+    }
+}
+
+/// 中止文案的补句：`ensure_branch` 在扫描之前跑，所以「推送被拒」时源目录其实已经换到
+/// 设置的分支了。不说出来，用户会以为工作区还在原来的分支上。
+///
+/// shortcut: 次序不动（`ensure_branch` 与扫描的先后涉及 #26 的既有语义），只在文案里交代。
+fn with_switch_note(error: CoreError, branch: &str, switched_from: Option<&str>) -> CoreError {
+    let Some(from) = switched_from else {
+        return error;
+    };
+    CoreError {
+        message: format!(
+            "{}（注意：中止之前源目录已经先切到设置的 {branch}，已从 {from} 切到 {branch}——工作区现在不在 {from} 上了。）",
+            error.message
+        ),
+        ..error
     }
 }
 
