@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use config_sync_core::{
-    AddOutcome, ApplyOutcome, ApplyPlan, ApplySummary, Candidate, Core, CoreError, ErrorKind,
-    FileDiff, PushOutcome, Refresh, RemoveOutcome,
+    AddOutcome, ApplyOutcome, ApplyPlan, ApplySummary, BackupSummary, Candidate, Core, CoreError,
+    ErrorKind, FileDiff, PushOutcome, Refresh, RemoveOutcome, RestoreOutcome, RestorePlan,
 };
 use serde::Serialize;
 use settings::Settings;
@@ -283,6 +283,33 @@ async fn execute_apply(app: AppHandle, plan: ApplyPlan) -> Result<Vec<ApplyOutco
     blocking(move || app.state::<AppState>().runtime().core.execute_apply(&plan)).await
 }
 
+/// 现有备份（新的在前）：应用结果页拿最新一份做「撤销这次应用」。
+#[tauri::command]
+async fn list_backups(app: AppHandle) -> Result<Vec<BackupSummary>, CoreError> {
+    blocking(move || app.state::<AppState>().runtime().core.list_backups()).await
+}
+
+/// 撤销第一步：出一份恢复计划 + diff 预览（走 `#27` 的同一套闸门），一个字节都不写。
+#[tauri::command]
+async fn plan_restore_backup(app: AppHandle, id: String) -> Result<RestorePlan, CoreError> {
+    blocking(move || {
+        app.state::<AppState>()
+            .runtime()
+            .core
+            .plan_restore_backup(&id)
+    })
+    .await
+}
+
+/// 撤销第二步：执行预览里那一份计划，不重新判断动作。
+#[tauri::command]
+async fn restore_backup(
+    app: AppHandle,
+    plan: RestorePlan,
+) -> Result<Vec<RestoreOutcome>, CoreError> {
+    blocking(move || app.state::<AppState>().runtime().core.restore_backup(&plan)).await
+}
+
 #[derive(Serialize)]
 struct SettingsView {
     settings: Settings,
@@ -386,6 +413,9 @@ pub fn run() {
             remove,
             plan_apply,
             execute_apply,
+            list_backups,
+            plan_restore_backup,
+            restore_backup,
             onboarding_candidates,
             onboarding_done,
             finish_onboarding,

@@ -3,13 +3,12 @@
 //! 两阶段：`plan_apply` 只出计划（纯数据，不写盘），`execute_apply` 执行**同一份**计划。
 //! 动作在计划里定下后不再重算；写盘只做两道防越界的检查（目标在 `$HOME` 下、源文件还在且没变过）。
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::backup::Snapshot;
 use crate::{
     Core, CoreError, DIFF_MAX_BYTES, Status, diff_gate_reason, paths, state, too_large_reason,
     unified_diff,
@@ -96,6 +95,9 @@ pub enum ApplyAction {
 pub struct ApplyOutcome {
     pub target: PathBuf,
     pub result: ApplyResult,
+    /// 整次应用的一条警告（所有项都带同一条）：例如备份清单写不下去，这次快照撤销不了。
+    /// 文件已经写了，所以它是警告而不是错误——不能因此把结果页和撤销入口一起抹掉。
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -136,20 +138,59 @@ impl Core {
     /// 边界行为：单项失败不中断整批，其余项照常写；每个目标文件的写入是原子的
     /// （同目录临时文件 + rename），失败项的目标文件保持原样，也不留临时文件。
     pub fn execute_apply(&self, plan: &ApplyPlan) -> Result<Vec<ApplyOutcome>, CoreError> {
+        // 真要写盘才建快照：全跳过的计划一个字节都不写，也不留空备份。
+        if !plan
+            .items
+            .iter()
+            .any(|item| item.action != ApplyAction::Skip)
+        {
+            return Ok(Vec::new());
+        }
+        let mut snapshot = Snapshot::create(&self.home, &self.source_dir)?;
+
         let mut outcomes = Vec::new();
         for item in &plan.items {
             if item.action == ApplyAction::Skip {
                 continue;
             }
-            let result = match self.write_item(item) {
-                Ok(()) => ApplyResult::Written,
-                Err(message) => ApplyResult::Failed { message },
+            // 先备份再写：备份失败就这一项不写（目标文件原样），其余项照常。
+            let result = match snapshot.save(&self.home, &item.target) {
+                Ok(origin) => {
+                    let result = match self.write_item(item) {
+                        Ok(()) => ApplyResult::Written,
+                        Err(message) => ApplyResult::Failed { message },
+                    };
+                    match &result {
+                        ApplyResult::Written => snapshot.record_written(
+                            &item.target,
+                            origin,
+                            item.digest.clone(),
+                            // 写下去的长度：撤销时跟指纹一起比对。
+                            std::fs::metadata(&item.target).ok().map(|meta| meta.len()),
+                        ),
+                        ApplyResult::Failed { message } => {
+                            snapshot.record_failed(&item.target, Some(origin), message.clone())
+                        }
+                    }
+                    result
+                }
+                Err(message) => {
+                    // 连备份都没拿到：这一项没有写，清单里也要说清楚。
+                    snapshot.record_failed(&item.target, None, message.clone());
+                    ApplyResult::Failed { message }
+                }
             };
             outcomes.push(ApplyOutcome {
                 target: item.target.clone(),
                 result,
+                warning: None,
             });
         }
+
+        // 清单写不下去不算这次应用失败：文件其实已经写了，把它降级成警告带回去，
+        // 「已写 N 个」和撤销入口都不会因此消失（清单每记一项就会落一次盘）。
+        let (_, warning) = snapshot.commit();
+        attach_warning(&mut outcomes, warning);
         Ok(outcomes)
     }
 
@@ -324,47 +365,60 @@ impl Core {
             ));
         }
 
-        let parent = target
-            .parent()
-            .ok_or_else(|| format!("{} 没有父目录，没有写", target.display()))?;
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "创建 {} 失败：{e}；没有写 {}",
-                parent.display(),
-                target.display()
-            )
-        })?;
-
-        let temp = parent.join(format!(
-            ".{}.config-sync-{}-{}.tmp",
-            target.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-        ));
-
-        let written = std::fs::write(&temp, &bytes).and_then(|()| {
-            // 覆盖已有文件时保留它原来的权限；新建沿用源文件（可执行位不丢）。
-            let permissions = std::fs::metadata(target)
-                .or_else(|_| std::fs::metadata(&source))
-                .map(|meta| meta.permissions());
-            if let Ok(permissions) = permissions {
-                std::fs::set_permissions(&temp, permissions)?;
-            }
-            std::fs::rename(&temp, target)
-        });
-        written.map_err(|e| {
-            // rename 之前失败：目标文件从没被碰过，把临时文件清掉。
-            let _ = std::fs::remove_file(&temp);
-            format!("写 {} 失败：{e}", target.display())
-        })
+        // 覆盖已有文件时保留它原来的权限；新建沿用源文件（可执行位不丢）。
+        let permissions = std::fs::metadata(target)
+            .or_else(|_| std::fs::metadata(&source))
+            .map(|meta| meta.permissions())
+            .ok();
+        replace_file(target, &bytes, permissions)
     }
+}
+
+/// 原子写一份文件：补建父目录 → 同目录临时文件 → rename 到位。
+///
+/// 应用与撤销共用这一条写盘路径（权限由调用方给出）：临时文件保证编辑器之类的进程
+/// 不会读到半截内容，失败时目标文件从没被碰过，也不留临时文件。
+pub(crate) fn replace_file(
+    target: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("{} 没有父目录，没有写", target.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "创建 {} 失败：{e}；没有写 {}",
+            parent.display(),
+            target.display()
+        )
+    })?;
+
+    let temp = parent.join(format!(
+        ".{}.config-sync-{}-{}.tmp",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let written = std::fs::write(&temp, bytes).and_then(|()| {
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(&temp, permissions)?;
+        }
+        std::fs::rename(&temp, target)
+    });
+    written.map_err(|e| {
+        // rename 之前失败：目标文件从没被碰过，把临时文件清掉。
+        let _ = std::fs::remove_file(&temp);
+        format!("写 {} 失败：{e}", target.display())
+    })
 }
 
 /// 临时文件名里的序号，让同一进程内的多次写不会撞名。
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// 目标路径必须严格落在 `$HOME` 下（不能带 `..` / `.` 这类穿透成分）。
-fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
+pub(crate) fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
     let rel = target.strip_prefix(home).map_err(|_| {
         CoreError::io(format!(
             "{} 不在 {} 下，没有对应的受管文件",
@@ -386,14 +440,77 @@ fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
 
 /// 源文件内容的指纹，只为「预览之后源文件变过没有」这一次比对服务。
 /// 按字节数行（不做 lossy 转换）：只给超闸门时那句原因用。
+/// 清单没写成时，把同一条警告发给每一项：前端照样渲染「已写 N 个」与撤销入口，
+/// 不能让一个落盘失败把已经发生的事从界面上抹掉。
+fn attach_warning(outcomes: &mut [ApplyOutcome], warning: Option<String>) {
+    for outcome in outcomes {
+        outcome.warning.clone_from(&warning);
+    }
+}
+
 /// 与 `str::lines()` 一个口径：末行不带换行也算一行（第 2 轮 N3）。
-fn line_count(bytes: &[u8]) -> usize {
+pub(crate) fn line_count(bytes: &[u8]) -> usize {
     let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
     newlines + usize::from(bytes.last().is_some_and(|byte| *byte != b'\n'))
 }
 
-fn digest(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+/// 内容指纹：FNV-1a 64。`DefaultHasher` 不保证跨 Rust 版本稳定，而这份指纹会被写进
+/// 备份清单、几天后再读回来比对——换了 toolchain 旧备份就全被判成「被改过」
+/// （方向是 fail-closed，但等于旧备份全废）。FNV-1a 的常量写死在代码里，永远稳定。
+/// 换哈希本身会让 `DefaultHasher` 时代的清单必然判成「被改过」；撤销功能发布前不存在
+/// 这类清单，所以不写迁移——真需要读那种清单时按 `written_len` 重新认一遍即可。
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 单项结果的两阶段行为：清单写失败只降级成警告，不抹掉写入结果。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(target: &str, result: ApplyResult) -> ApplyOutcome {
+        ApplyOutcome {
+            target: PathBuf::from(target),
+            result,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn a_manifest_warning_lands_on_every_item_without_hiding_the_writes() {
+        let mut outcomes = vec![
+            outcome("/home/u/.zshrc", ApplyResult::Written),
+            outcome(
+                "/home/u/.gitconfig",
+                ApplyResult::Failed {
+                    message: "没写成".to_string(),
+                },
+            ),
+        ];
+
+        attach_warning(&mut outcomes, Some("写备份清单失败：磁盘满".to_string()));
+
+        assert_eq!(outcomes.len(), 2, "警告不能吞掉逐项结果");
+        for outcome in &outcomes {
+            assert_eq!(
+                outcome.warning.as_deref(),
+                Some("写备份清单失败：磁盘满"),
+                "清单警告必须逐项带上"
+            );
+        }
+        assert!(matches!(outcomes[0].result, ApplyResult::Written));
+        assert!(matches!(outcomes[1].result, ApplyResult::Failed { .. }));
+    }
+
+    #[test]
+    fn no_warning_leaves_the_items_alone() {
+        let mut outcomes = vec![outcome("/home/u/.zshrc", ApplyResult::Written)];
+        attach_warning(&mut outcomes, None);
+        assert!(outcomes[0].warning.is_none());
+    }
 }

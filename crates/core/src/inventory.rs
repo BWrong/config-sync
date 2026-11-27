@@ -60,6 +60,8 @@ pub struct RepoStatus {
     pub behind: u32,
     /// 未提交改动的路径数（含未跟踪文件；未跟踪目录里的每个文件各算一条）。
     pub dirty: u32,
+    /// 设置里的分支与当前分支不同时是那个分支（此时 ahead/behind 按它算）；一致时为 `None`。
+    pub setting: Option<String>,
 }
 
 /// 一次刷新的全部结果：清单 + 状态条，同一份 git 事实算出，一次 IPC 带走（#19）。

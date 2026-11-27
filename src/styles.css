@@ -725,9 +725,28 @@ h2 {
   color: var(--add);
 }
 
-.apply-tag-Overwrite {
+.apply-tag-Overwrite,
+.apply-tag-Restore {
   border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--accent);
+}
+
+/* 撤销预览里的「删除」= 这次应用新建的文件，撤销就是删掉它。 */
+.apply-tag-Delete {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  color: var(--danger);
+}
+
+.apply-summary .undo-apply {
+  margin-left: 8px;
+  padding: 1px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .apply-reason {

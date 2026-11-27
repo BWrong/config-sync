@@ -39,6 +39,8 @@ interface RepoStatus {
   ahead: number;
   behind: number;
   dirty: number;
+  /** 设置里的分支与当前分支不一致时是那个分支（此时 ahead/behind 按它算）；一致时为 null。 */
+  setting: string | null;
 }
 
 /** 与 Core 的 `Refresh` 一一对应：清单与状态条出自同一次 `git status`。 */
@@ -56,6 +58,8 @@ interface PushOutcome {
   remote_url: string;
   /** 推送前就已在本地、这次一并推出去的提交数（不含本次自动提交）。 */
   existing_commits: number;
+  /** 这次推送前为了对齐设置的分支而切过分支时的一句话（例：已从 main 切到 trunk 再推送）。 */
+  switch_note: string | null;
 }
 
 interface CoreError {
@@ -129,6 +133,46 @@ type ApplyResult = "Written" | { Failed: { message: string } };
 interface ApplyOutcome {
   target: string;
   result: ApplyResult;
+  /** 文件已经写了、但清单没落盘时的整次警告；有它就不给撤销入口，但写入结果照常展示。 */
+  warning: string | null;
+}
+
+/** 备份摘要：`list_backups` 回来的，新的在前。 */
+interface BackupSummary {
+  id: string;
+  created_at: string;
+  /** 写成几项（撤销时要恢复的）。 */
+  written: number;
+  failed: number;
+}
+
+/** 撤销动作：恢复原文 / 删掉那次新建的文件 / 不动。 */
+type RestoreAction = "Restore" | "Delete" | "Skip";
+
+interface RestoreItem {
+  target: string;
+  action: RestoreAction;
+  reason: string;
+  /** 恢复会带来的改动（目标 → 备份原文）；跳过项为空串。 */
+  diff: string;
+  diff_omitted: boolean;
+  diff_reason: string;
+  /** 目标在应用之后又被改过：撤销会跳过它，不覆盖新改动。 */
+  conflict: boolean;
+}
+
+/** `plan_restore_backup` 回来的计划：确认时原样送回执行。 */
+interface RestorePlan {
+  backup: string;
+  created_at: string;
+  items: RestoreItem[];
+}
+
+type RestoreResult = "Restored" | "Deleted" | { Failed: { message: string } };
+
+interface RestoreOutcome {
+  target: string;
+  result: RestoreResult;
 }
 
 interface Settings {
@@ -223,6 +267,9 @@ let applySummary: ApplySummary | null = null;
 /** 上一次应用的结果（或报错），同样放进清单模板里。 */
 let applyReportHtml = "";
 
+/** 待确认的撤销计划；非 null 时界面显示恢复预览页。 */
+let restorePlan: RestorePlan | null = null;
+
 /** 源目录绝对路径，boot 时取一次：清单里每行都重复的长前缀靠它省掉。 */
 let sourceDir = "";
 
@@ -269,10 +316,17 @@ function markBusy(button: HTMLButtonElement, busy: boolean, label: string): void
 }
 
 function statusBar(status: RepoStatus): string {
+  // 推送送到的是「设置的分支」，不一定是 HEAD 所在的那一个：两者不一致时状态条必须说清楚，
+  // 否则用户会照着这里的分支名理解「已经推完了」，而另一个分支上的提交其实还躺在本地。
+  const branchChip = status.setting
+    ? `<span class="chip" title="推送会送到设置的分支；源目录当前不在它上面，推送前会先切过去">设置分支 <b>${escapeHtml(
+        status.setting,
+      )}</b>（当前在 ${escapeHtml(status.branch)}，还没切过去）</span>`
+    : `<span class="chip">分支 <b>${escapeHtml(status.branch)}</b></span>`;
   return `
     <header class="bar">
       <span class="chips">
-        <span class="chip">分支 <b>${escapeHtml(status.branch)}</b></span>
+        ${branchChip}
         <span class="chip">${glyph("arrowUp", 11)}${status.ahead} ${glyph("arrowDown", 11)}${status.behind}</span>
         <span class="chip">未提交 <b>${status.dirty}</b></span>
       </span>
@@ -284,6 +338,13 @@ ${SETTINGS_BUTTON}
 /** 本机与远端不一致时给一句话：该推送还是该拉取，一眼看得见。 */
 function pendingHint(status: RepoStatus): string {
   const parts: string[] = [];
+  if (status.setting) {
+    parts.push(
+      `<span>推送会把源目录切到设置的分支 <b>${escapeHtml(
+        status.setting,
+      )}</b> 再推；工作区有未提交改动时会先拒绝</span>`,
+    );
+  }
   if (status.dirty > 0) {
     parts.push(`<span>${glyph("dot", 13)}本机有 ${status.dirty} 处改动还没提交，推送会一并提交</span>`);
   }
@@ -558,16 +619,20 @@ async function pushChanges(): Promise<void> {
   try {
     const outcome = await invoke<PushOutcome>("commit_and_push");
     const remote = `<code>${escapeHtml(outcome.remote_url)}</code>`;
+    // 切过分支就先说这一句：不说的话，「没有需要推送的改动」会让人以为刚才看到的东西消失了。
+    const switchNote = outcome.switch_note
+      ? `<p class="pending-hint"><span>${escapeHtml(outcome.switch_note)}</span></p>`
+      : "";
     if (outcome.committed) {
       // dirty + ahead 同时存在时，这次推送送出去的是「新提交 + 本机已有提交」，两句都说清楚。
       const also = outcome.existing_commits > 0 ? `，并把本机已有的 ${outcome.existing_commits} 个提交一并推上去` : "";
-      pushReportHtml = `<p class="add-summary">已提交并推送 ${outcome.files} 个文件${also}到 ${remote}：${escapeHtml(
+      pushReportHtml = `${switchNote}<p class="add-summary">已提交并推送 ${outcome.files} 个文件${also}到 ${remote}：${escapeHtml(
         outcome.message,
       )}</p>`;
     } else if (outcome.existing_commits > 0) {
-      pushReportHtml = `<p class="add-summary">已推送 ${outcome.existing_commits} 个本机已有提交到 ${remote}。</p>`;
+      pushReportHtml = `${switchNote}<p class="add-summary">已推送 ${outcome.existing_commits} 个本机已有提交到 ${remote}。</p>`;
     } else {
-      pushReportHtml = `<p class="add-summary">没有需要推送的改动。</p>`;
+      pushReportHtml = `${switchNote}<p class="add-summary">没有需要推送的改动。</p>`;
     }
   } catch (error) {
     pushReportHtml = errorPanel(error);
@@ -725,14 +790,32 @@ async function confirmApply(): Promise<void> {
   const button = app.querySelector<HTMLButtonElement>(".confirm-apply")!;
   button.disabled = true;
   button.textContent = "正在写…";
+  let outcomes: ApplyOutcome[] | null = null;
   try {
-    applyReportHtml = applyReport(await invoke<ApplyOutcome[]>("execute_apply", { plan: applyPlan }));
+    outcomes = await invoke<ApplyOutcome[]>("execute_apply", { plan: applyPlan });
   } catch (error) {
     applyReportHtml = errorPanel(error);
   }
   applyPlan = null;
   applySummary = null;
+  if (outcomes) {
+    // 最新一份备份就是刚才这次；一个文件都没写成时没有可撤销的东西。
+    // 清单没落盘时也拿不到这份备份（list_backups 过滤没有清单的目录），
+    // 回落问「最新一份」会拿到上一次的 id，撤销按钮就指向了别的快照——宁可不给。
+    const written = outcomes.filter((outcome) => outcome.result === "Written").length;
+    const warned = outcomes.some((outcome) => outcome.warning);
+    applyReportHtml = applyReport(outcomes, written && !warned ? await latestBackup() : null);
+  }
   await renderInventory();
+}
+
+/** 最新一份备份的 id：写完盘立刻问后端，避免前端自己造时间戳。 */
+async function latestBackup(): Promise<string | null> {
+  try {
+    return (await invoke<BackupSummary[]>("list_backups"))[0]?.id ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function cancelApply(): Promise<void> {
@@ -741,8 +824,8 @@ async function cancelApply(): Promise<void> {
   await renderInventory();
 }
 
-/** 应用结果的汇总：写成功的计数 + 没写成的逐条原因。 */
-function applyReport(outcomes: ApplyOutcome[]): string {
+/** 应用结果的汇总：写成功的计数 + 没写成的逐条原因 + 「撤销这次应用」入口。 */
+function applyReport(outcomes: ApplyOutcome[], undoId: string | null): string {
   const written = outcomes.filter((outcome) => outcome.result === "Written").length;
   const failed = outcomes.length - written;
   const notes = outcomes.flatMap((outcome) => {
@@ -754,7 +837,154 @@ function applyReport(outcomes: ApplyOutcome[]): string {
       )}</li>`,
     ];
   });
-  return `<p class="apply-summary">已写 ${written} 个文件${failed ? ` · ${failed} 个没有写` : ""}</p>${notes.length ? `<ul class="apply-notes">${notes.join("")}</ul>` : ""}`;
+  // 清单没写成时文件其实已经写了：这条警告不能吞掉「已写 N 个」；
+  // 撤销入口此时由调用方按同一条口径关掉（拿不到本次的备份 id）。
+  const warnings = [...new Set(outcomes.map((outcome) => outcome.warning).filter((w): w is string => !!w))];
+  for (const warning of warnings) {
+    notes.push(`<li>文件已经写了，但备份清单没落盘：${escapeHtml(warning)}</li>`);
+  }
+  // 撤销只在这份结果下面出现一次：它就是刚才那次应用留下的快照。
+  const undo = undoId
+    ? `<button type="button" class="undo-apply" data-undo-apply="${escapeHtml(undoId)}"
+         title="恢复到这次应用之前（先预览，没人改过的文件才会被动）">撤销这次应用</button>`
+    : "";
+  return `<p class="apply-summary">已写 ${written} 个文件${failed ? ` · ${failed} 个没有写` : ""}${undo}</p>${notes.length ? `<ul class="apply-notes">${notes.join("")}</ul>` : ""}`;
+}
+
+/** 撤销第一步：向 Core 要一份恢复计划 + diff 预览，只读不写。 */
+async function startRestore(id: string): Promise<void> {
+  setBusy(true);
+  try {
+    restorePlan = await invoke<RestorePlan>("plan_restore_backup", { id });
+  } catch (error) {
+    applyReportHtml = errorPanel(error);
+  }
+  setBusy(false);
+  await renderInventory();
+}
+
+async function cancelRestore(): Promise<void> {
+  restorePlan = null;
+  await renderInventory();
+}
+
+/** 撤销第二步：把预览里那一份计划原样送回执行；冲突项在计划里已经是 Skip。 */
+async function confirmRestore(): Promise<void> {
+  if (!restorePlan) return;
+  const button = app.querySelector<HTMLButtonElement>(".confirm-restore")!;
+  button.disabled = true;
+  button.textContent = "正在恢复…";
+  try {
+    applyReportHtml = restoreReport(
+      await invoke<RestoreOutcome[]>("restore_backup", { plan: restorePlan }),
+    );
+  } catch (error) {
+    applyReportHtml = errorPanel(error);
+  }
+  restorePlan = null;
+  await renderInventory();
+}
+
+/** 撤销结果的汇总：恢复 / 删除各几个，剩下的是没动的（含冲突）。 */
+function restoreReport(outcomes: RestoreOutcome[]): string {
+  const count = (match: (result: RestoreResult) => boolean) =>
+    outcomes.filter((outcome) => match(outcome.result)).length;
+  const restored = count((result) => result === "Restored");
+  const deleted = count((result) => result === "Deleted");
+  const notes = outcomes.flatMap((outcome) => {
+    const result = outcome.result;
+    if (result === "Restored" || result === "Deleted") return [];
+    return [`<li><code>${escapeHtml(outcome.target)}</code> 没有动：${escapeHtml(result.Failed.message)}</li>`];
+  });
+  return `<p class="apply-summary">已恢复 ${restored} 个文件${deleted ? ` · 删掉 ${deleted} 个新建的` : ""}${
+    notes.length ? ` · ${notes.length} 个没有动` : ""
+  }</p>${notes.length ? `<ul class="apply-notes">${notes.join("")}</ul>` : ""}`;
+}
+
+const RESTORE_LABEL: Record<RestoreAction, string> = {
+  Restore: "恢复",
+  Delete: "删除",
+  Skip: "不动",
+};
+
+/** 撤销预览里的一项：路径 + 动作 + 原因 + 会写回的 diff。 */
+function restoreItemHtml(item: RestoreItem): string {
+  const marker = item.conflict
+    ? `<span class="apply-skip-icon status-Conflict" role="img"
+         title="应用之后又被改过，撤销会跳过" aria-label="应用之后又被改过，撤销会跳过">${glyph("warn", 14)}</span>`
+    : item.action === "Skip"
+      ? `<span class="apply-skip-icon" aria-hidden="true">${glyph("check", 14)}</span>`
+      : `<span class="apply-skip-icon" aria-hidden="true"></span>`;
+  const diff = item.diff
+    ? `<pre class="apply-diff">${diffLines(item.diff)}</pre>`
+    : item.diff_omitted
+      ? `<p class="apply-reason">${escapeHtml(item.diff_reason)}</p>`
+      : "";
+  return `
+    <li class="apply-item apply-${item.action}">
+      <div class="apply-head">
+        ${marker}
+        <code title="${escapeHtml(item.target)}">${escapeHtml(item.target)}</code>
+        <span class="apply-tag apply-tag-${item.action}">${RESTORE_LABEL[item.action]}</span>
+      </div>
+      <p class="apply-reason">${escapeHtml(item.reason)}</p>
+      ${diff}
+    </li>`;
+}
+
+/** 撤销预览页：先看清楚恢复什么、哪些会跳过，再确认。 */
+function renderRestorePreview(): void {
+  const plan = restorePlan!;
+  const writes = plan.items.filter((item) => item.action !== "Skip");
+  const skipped = plan.items.filter((item) => item.action === "Skip");
+  const conflicts = skipped.filter((item) => item.conflict);
+  const restored = writes.filter((item) => item.action === "Restore").length;
+  const deleted = writes.length - restored;
+
+  app.innerHTML = `
+    <header class="bar">
+      <button type="button" class="nav back icon" data-cancel-restore title="返回清单（不写盘）"
+        aria-label="返回清单">${glyph("back", 15)}</button>
+      <span class="chips">
+        <span class="chip">恢复 <b>${restored}</b></span>
+        <span class="chip">删除 <b>${deleted}</b></span>
+        <span class="chip">不动 <b>${skipped.length}</b></span>
+      </span>
+${OPEN_DIR_BUTTON}
+${SETTINGS_BUTTON}
+    </header>
+    <main class="inventory apply-preview">
+      <p class="apply-hint">${
+        writes.length === 0
+          ? "这次没有可撤销的改动：文件在应用之后又被改过，或者当时就没写成。"
+          : `确认后会把下面 ${writes.length} 个文件恢复到 ${escapeHtml(plan.created_at)} 那次应用之前；你之后改过的文件不会被动。`
+      }</p>
+      <div class="action-error"></div>
+      ${writes.length ? `<ul class="apply-items">${writes.map(restoreItemHtml).join("")}</ul>` : ""}
+      ${
+        conflicts.length
+          ? `<p class="apply-hint">${conflicts.length} 个文件在应用之后又被改过（或删掉了），撤销会跳过它们，免得丢掉你的新改动。</p>`
+          : ""
+      }
+      ${
+        skipped.length
+          ? `<details class="apply-skipped"${conflicts.length ? " open" : ""}>
+              <summary>跳过 ${skipped.length} 个，不会动</summary>
+              <ul class="apply-items">${skipped.map(restoreItemHtml).join("")}</ul>
+            </details>`
+          : ""
+      }
+      <div class="apply-actions">
+        <button type="button" class="confirm-restore" ${writes.length === 0 ? "disabled" : ""}
+          title="按预览恢复，只动没人改过的文件">确认撤销</button>
+        <button type="button" class="cancel-restore" title="不写盘，回到清单">取消</button>
+      </div>
+    </main>`;
+
+  app.querySelector<HTMLButtonElement>("[data-cancel-restore]")?.addEventListener("click", () => void cancelRestore());
+  app.querySelector<HTMLButtonElement>(".confirm-restore")?.addEventListener("click", () => void confirmRestore());
+  app.querySelector<HTMLButtonElement>(".cancel-restore")?.addEventListener("click", () => void cancelRestore());
+  bindSettingsEntry();
 }
 
 /** 清单页的整体刷新：同一时刻只跑一次。
@@ -785,6 +1015,11 @@ async function renderInventoryOnce(): Promise<void> {
     // 有未确认的计划时，整个页面就是预览页：这一屏不写盘。
     if (applyPlan) {
       renderApplyPreview();
+      return;
+    }
+    // 撤销也是两阶段：计划没确认时这一屏同样不写盘。
+    if (restorePlan) {
+      renderRestorePreview();
       return;
     }
     // 清单和状态条出自同一次 git status，后端一次全给（#19）。
@@ -832,6 +1067,10 @@ async function renderInventoryOnce(): Promise<void> {
       void pushChanges(),
     );
     app.querySelector<HTMLButtonElement>("[data-apply]")?.addEventListener("click", () => void startApply());
+    app.querySelector<HTMLButtonElement>("[data-undo-apply]")?.addEventListener("click", (event) => {
+      const id = (event.currentTarget as HTMLButtonElement).dataset.undoApply;
+      if (id) void startRestore(id);
+    });
     app.querySelectorAll<HTMLButtonElement>(".resolve-choose").forEach((button) => {
       const row = button.closest<HTMLLIElement>(".row");
       if (row) button.addEventListener("click", () => void resolveRow(row, button));
@@ -973,6 +1212,7 @@ async function renderSettings(): Promise<void> {
         <label>分支
           <input name="branch" value="${escapeHtml(view.settings.branch)}"
             autocomplete="off" spellcheck="false" />
+          <small>clone / 拉取 / 推送都按这个分支。源目录当前在别的分支上时，工作区干净会切过来；有未提交改动则拒绝并提示，不静默丢改动。</small>
         </label>
         <label>编辑器命令
           <input name="editor_command" value="${escapeHtml(view.settings.editor_command)}"

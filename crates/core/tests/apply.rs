@@ -15,6 +15,7 @@ fn written(target: &Path) -> ApplyOutcome {
     ApplyOutcome {
         target: target.to_path_buf(),
         result: ApplyResult::Written,
+        warning: None,
     }
 }
 

@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::Serialize;
 
-use crate::{Core, CoreError, ErrorKind, git, state};
+use crate::{Core, CoreError, git, state};
 
 /// 命中硬拦时固定的解释；没有「强行继续」。
 const ENCRYPTION_HINT: &str = "私钥/凭据类文件需要先加密才能同步，加密在 v0.3 提供。";
@@ -82,6 +82,9 @@ pub struct PushOutcome {
     /// 推送前就已在本地、这次顺手推出去的提交数（不含本次自动提交）；
     /// `0` 且 `committed == false` 才是真的「没有需要推送的改动」。
     pub existing_commits: u32,
+    /// 这次推送前为了对齐设置的分支而切过分支时，给界面的一句话
+    /// （例如「已从 main 切到 trunk 再推送」）；没切过是 `None`。
+    pub switch_note: Option<String>,
 }
 
 impl Core {
@@ -93,9 +96,16 @@ impl Core {
     /// 没有上游时第一次推送顺手 `-u origin <branch>` 建立跟踪。
     /// 提交成功而 push 失败是可接受的终态：错误里如实说明「已提交」并带上 git 原始 stderr。
     pub fn commit_and_push(&self) -> Result<PushOutcome, CoreError> {
+        // 推送目标分支来自设置：HEAD 不在它上面就先对齐（工作区脏时 ensure_branch 会拒绝，
+        // 绝不把改动静默带到别的分支）。切过就把这件事告诉界面：否则用户看到「没有需要
+        // 推送的改动」，而刚刚他明明在另一个分支上看到了待推提交。
+        let (branch, switched_from) = self.ensure_branch()?;
+        let switch_note = switched_from
+            .as_ref()
+            .map(|from| format!("已从 {from} 切到 {branch} 再推送"));
         // 一份 GitFacts 同时喂给硬拦与「有没有改动」，不重复跑 `git status`。
         let facts = state::GitFacts::read(&self.source_dir)?;
-        let target = PushTarget::read(&self.source_dir)?;
+        let target = PushTarget::read(&self.source_dir, &branch)?;
         let hits = scan(
             &self.source_dir,
             &facts,
@@ -109,7 +119,7 @@ impl Core {
         let dirty = facts.dirty_paths().next().is_some();
         // 工作区干净、也没有待推提交：真的没事可做（空仓库同样落在这里）。
         if !dirty && target.ahead == 0 {
-            return Ok(self.outcome(false, 0, String::new(), 0));
+            return Ok(self.outcome(&target, switch_note, false, 0, String::new()));
         }
 
         let mut committed = false;
@@ -136,16 +146,18 @@ impl Core {
         // 远端与分支都取自上游配置，不是本地分支名：`git branch -m` 之后本地叫 `trunk` 而
         // 上游是 `origin/main` 时，拿本地名当 refspec 会在远端凭空建出 `trunk`，`origin/main`
         // 永不前进，`ahead` 基准也没动过——每次点推送都报「已推了 1 个本机已有提交」。
-        let refspec = target
-            .push_to
-            .as_ref()
-            .map(|route| format!("HEAD:{}", route.remote_ref));
-        let push: Vec<&str> = match (&target.push_to, refspec.as_deref()) {
-            (Some(route), Some(refspec)) => {
-                vec!["push", "--no-follow-tags", route.remote.as_str(), refspec]
-            }
-            // 第一次推送没有上游，顺手建立跟踪（拉取那边靠它判断能否 fetch）。
-            _ => vec!["push", "--no-follow-tags", "-u", "origin", &target.branch],
+        let refspec = format!("HEAD:{}", target.push_to.remote_ref);
+        let push: Vec<&str> = if target.first_push {
+            // 第一次推送没有上游，顺手建立跟踪（上游只用来取远端名，不是推送目标）。
+            vec![
+                "push",
+                "--no-follow-tags",
+                "-u",
+                &target.push_to.remote,
+                &refspec,
+            ]
+        } else {
+            vec!["push", "--no-follow-tags", &target.push_to.remote, &refspec]
         };
         git::run(&self.source_dir, &push).map_err(|e| CoreError {
             message: if committed {
@@ -156,100 +168,75 @@ impl Core {
             ..e
         })?;
 
-        Ok(self.outcome(committed, files, message, target.ahead))
+        Ok(self.outcome(&target, switch_note, committed, files, message))
     }
 
+    /// 结果里带上「这次究竟对着哪个远端」，远端不叫 origin 时也不能显示成 origin 的地址。
     fn outcome(
         &self,
+        target: &PushTarget,
+        switch_note: Option<String>,
         committed: bool,
         files: u32,
         message: String,
-        existing_commits: u32,
     ) -> PushOutcome {
         PushOutcome {
             committed,
             files,
             message,
-            remote_url: self.remote_url().unwrap_or_default(),
-            existing_commits,
+            remote_url: self
+                .remote_url_of(&target.push_to.remote)
+                .unwrap_or_default(),
+            existing_commits: target.ahead,
+            switch_note,
         }
     }
 }
 
-/// 推送目标的现状：当前分支、上游、待推提交数，以及硬拦扫待推提交时的比较基准。
+/// 推送目标的现状：送到哪个远端哪个分支、待推提交数，以及硬拦扫待推提交时的比较基准。
 struct PushTarget {
-    branch: String,
-    /// 显式 refspec 的两半；`None` = 没有上游，走 `-u origin <branch>`。
-    push_to: Option<PushRoute>,
+    /// 显式 refspec 的两半：远端名来自上游配置，分支来自设置。
+    push_to: PushRoute,
+    /// 还没有上游：第一次推送顺手 `-u` 建立跟踪。
+    first_push: bool,
     /// 推送前已有、尚未推到远端的提交数。
     ahead: u32,
     /// `ahead` 那些提交从哪算起；`None` = 没有可比基准，整个 HEAD 树都要扫。
     scan_base: Option<String>,
 }
 
-/// 送到哪里：远端名 + 那个远端上的 ref 名，两者都来自上游配置。
+/// 送到哪里：远端名 + 那个远端上的 ref 名。
 struct PushRoute {
     remote: String,
     remote_ref: String,
 }
 
 impl PushTarget {
-    fn read(source_dir: &Path) -> Result<Self, CoreError> {
-        // 一次 `for-each-ref` 同时拿到当前分支、它的上游，以及推送目标的两半
-        // （`*` 标出当前分支）。本地分支名与上游分支名可以不同，所以远端名与远端 ref
-        // 只能从上游配置读，不能拿本地名拼。
-        let refs = git::run(
+    fn read(source_dir: &Path, branch: &str) -> Result<Self, CoreError> {
+        // 远端名只能从上游配置读（`branch.<b>.remote`），分支名来自设置。
+        // 推送目标不是「上游 ref」：设置说了推哪个分支，就送哪个分支，上游只决定发往哪个远端。
+        let local_ref = format!("refs/heads/{branch}");
+        let upstream = git::run(
             source_dir,
             &[
                 "for-each-ref",
-                "--format=%(HEAD)%09%(refname:short)%09%(upstream:short)%09%(upstream:remotename)%09%(upstream:remoteref)",
-                "refs/heads/",
+                "--format=%(upstream:remotename)",
+                &local_ref,
             ],
         )?;
-        let found = refs.lines().find_map(|line| {
-            let mut fields = line.split('\t');
-            if fields.next() != Some("*") {
-                return None;
-            }
-            let branch = fields.next()?.to_string();
-            let upstream = fields
-                .next()
-                .filter(|up| !up.is_empty())
-                .map(str::to_string);
-            let remote = fields.next().unwrap_or_default();
-            let remote_ref = fields.next().unwrap_or_default();
-            // 上游指向本地分支（`branch.<b>.remote = .`）时 remote 是 `.`：那也照样推 `.`，
-            // 因为扫描基准就是那个本地分支，二者必须同一个来源。
-            let push_to = (!remote.is_empty() && !remote_ref.is_empty()).then(|| PushRoute {
-                remote: remote.to_string(),
-                remote_ref: remote_ref.to_string(),
-            });
-            Some((branch, upstream, push_to))
-        });
-        let (branch, upstream, push_to) = match found {
-            Some(found) => found,
-            // 空仓库（还没有第一个提交）时 `refs/heads` 是空的，只能单独问一次分支名。
-            None => {
-                let branch = git::run(source_dir, &["branch", "--show-current"])?;
-                if branch.is_empty() {
-                    return Err(CoreError {
-                        kind: ErrorKind::Git,
-                        message: "源目录当前不在任何分支上（detached HEAD）".to_string(),
-                        stderr: None,
-                    });
-                }
-                (branch, None, None)
-            }
-        };
+        let upstream = upstream.trim();
+        // 上游指向本地分支（`branch.<b>.remote = .`）时推不到任何远端，那就不算远端：
+        // 回落 origin，否则「推送」会在本地空转一场、远端永远收不到东西。
+        let remote = crate::branch_remote(source_dir, branch);
+        let remote_ref = format!("refs/heads/{branch}");
 
-        // 比较基准：上游优先；没有上游（或上游的 tracking ref 被删）时用远端同名分支
-        // （手动推过但没建跟踪），两者都不存在才整树。`ahead`、历史扫描区间、路径规则都
-        // 从这一个函数取基准——三处各算各的就会在历史扫描里把 B2 原样复刻一遍。
-        let scan_base = push_base(source_dir, &branch, upstream.as_deref());
+        // 比较基准必须是**目标分支**在远端上的 tracking ref：上游可能指向别的远端分支，
+        // 那个区间覆盖不到这次要送出去的提交。tracking ref 不存在就整树扫（整树永远是
+        // 「要送出的提交」的超集，不会漏扫），宁可多扫也不静默推没扫过的内容。
+        let scan_base = destination_base(source_dir, &remote, branch);
 
-        // `ahead` 与 `scan_base` 必须同一个基准：远端已有同名分支且已同步时，ahead 得是 0
+        // `ahead` 与 `scan_base` 必须同一个基准：远端已有目标分支且已同步时，ahead 得是 0
         // （否则会谎报「推了 N 个已有提交」，还永远走网络）。
-        // 基准算不出来（如上游配置在、tracking ref 被删）就退回整树计数，宁可不漏推。
         let ahead = scan_base
             .as_deref()
             .and_then(|base| count_commits(source_dir, &format!("{base}..HEAD")))
@@ -257,29 +244,26 @@ impl PushTarget {
             .unwrap_or(0);
 
         Ok(PushTarget {
-            branch,
-            push_to,
+            push_to: PushRoute { remote, remote_ref },
+            first_push: upstream.is_empty(),
             ahead,
             scan_base,
         })
     }
 }
 
+/// 待推区间与硬拦扫描的唯一基准：目标分支在目的远端上的 tracking ref
+/// （`<remote>/<branch>`）；不存在才是 `None`（整棵 HEAD 树）。
+pub(crate) fn destination_base(source_dir: &Path, remote: &str, branch: &str) -> Option<String> {
+    let base = format!("{remote}/{branch}");
+    rev_exists(source_dir, &base).then_some(base)
+}
+
 fn rev_exists(source_dir: &Path, rev: &str) -> bool {
     git::run(source_dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok()
 }
 
-/// 待推区间与硬拦扫描的唯一基准：上游优先，其次远端同名分支，都没有才是 `None`（整棵 HEAD 树）。
-fn push_base(source_dir: &Path, branch: &str, upstream: Option<&str>) -> Option<String> {
-    let origin_branch = format!("origin/{branch}");
-    [upstream, Some(origin_branch.as_str())]
-        .into_iter()
-        .flatten()
-        .find(|rev| rev_exists(source_dir, rev))
-        .map(str::to_string)
-}
-
-fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
+pub(crate) fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
     git::run(source_dir, &["rev-list", "--count", rev])
         .ok()?
         .trim()
@@ -578,7 +562,7 @@ fn over_limit(what: String, current: String, cap: String, advice: &str) -> CoreE
     ))
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     if bytes as f64 >= MIB {
         format!("{:.1} MiB", bytes as f64 / MIB)

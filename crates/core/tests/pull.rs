@@ -101,25 +101,47 @@ fn pull_refuses_to_create_a_merge_commit_and_leaves_the_source_dir_clean() {
     assert_eq!(zshrc.status, Status::PendingPull, "远端仍领先，状态不变");
 }
 
+/// 拉取认设置里的分支，不需要先有上游：推过一次但没建跟踪，照样能拉。
 #[test]
-fn pull_reports_missing_upstream_with_gits_own_words() {
+fn pull_follows_the_configured_branch_without_needing_an_upstream() {
     let f = fixtures::Fixture::new();
     let core = f.core();
     f.write_source("home/.zshrc", "export A=1\n");
     f.commit_all("config-sync: 1 files");
-    // 没 push 过，因此没有上游分支。
+    f.git(&["push", "origin", "main"]);
+    assert!(
+        !f.git_try(&["rev-parse", "--abbrev-ref", "@{u}"]),
+        "前提：没有上游"
+    );
+
+    f.advance_remote("home/.zshrc", "export A=1\nexport B=2\n");
+    core.pull().expect("没有上游也要按设置的分支拉取");
+
+    assert_eq!(f.head_sha(), f.git_remote(&["rev-parse", "main"]));
+    assert!(!f.is_dirty(), "拉取后源目录应干净");
+}
+
+/// 远端没有设置的分支：明确说「远端可能没有这个分支」，并保留 git 的原始 stderr。
+#[test]
+fn pull_reports_a_branch_the_remote_does_not_have() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    // 没 push 过：远端（裸仓库）还是空的，没有 main。
 
     let error = failure(&core);
     assert!(
-        error.message.contains("上游分支"),
+        error.message.contains("取回最新提交") && error.message.contains("main"),
         "message = {}",
         error.message
     );
     let stderr = error.stderr.unwrap();
     assert!(
-        stderr.contains("no upstream configured"),
+        stderr.contains("couldn't find remote ref"),
         "stderr = {stderr}"
     );
+    assert!(!f.is_dirty(), "fetch 失败后源目录必须干净");
 }
 
 #[test]
