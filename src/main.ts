@@ -395,16 +395,9 @@ function visibleEntries(entries: InventoryEntry[]): InventoryEntry[] {
   );
 }
 
-/** 清单区（列表 + 图例）：过滤时只换这一块，输入框不丢焦点。 */
-function listHtml(entries: InventoryEntry[]): string {
-  if (entries.length === 0) {
-    return `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`;
-  }
-  const visible = visibleEntries(entries);
-  if (visible.length === 0) {
-    return `<p class="empty">没有匹配的文件<small>过滤的是 home/… 与 ~/… 两列路径。</small></p>`;
-  }
-  return `<ul class="rows">${rows(visible)}</ul><p class="legend">${STATUS_LEGEND}</p>`;
+/** 清单为空时的说明：清单区里只剩这一句。 */
+function emptyListHtml(): string {
+  return `<p class="empty">清单为空<small>源目录里还没有任何受管文件。</small></p>`;
 }
 
 /** 勾选中的行（批量移除用）。 */
@@ -414,48 +407,171 @@ function selectedTargets(): string[] {
   });
 }
 
-function rows(entries: InventoryEntry[]): string {
-  return entries
-    .map((entry) => {
-      const rel = mirrorRel(entry.source);
-      // 左边是源目录里的副本（home/…），右边是它落到 $HOME 的位置（~/…）。
-      const mirror = splitPath(rel ? `home/${rel}` : escapeHtml(entry.source));
-      const target = splitPath(shortTarget(entry.target, rel));
-      const pair = `${escapeHtml(entry.source)} ↔ ${escapeHtml(entry.target)}`;
-      const gone = entry.deleted ? ` class="gone"` : "";
-      return `
+/** 一行里「源 ↔ 目标」两列：刷新时只换这段文本，行节点本身留着。 */
+function pathsHtml(entry: InventoryEntry): string {
+  const rel = mirrorRel(entry.source);
+  // 左边是源目录里的副本（home/…），右边是它落到 $HOME 的位置（~/…）。
+  const mirror = splitPath(rel ? `home/${rel}` : escapeHtml(entry.source));
+  const target = splitPath(shortTarget(entry.target, rel));
+  const gone = entry.deleted ? ` class="gone"` : "";
+  return `<code${gone} title="源目录里的副本"><span class="dir">${escapeHtml(mirror.dir)}</span>${escapeHtml(mirror.name)}</code>
+    <span class="arrow">↔</span>
+    <code class="alt"${gone} title="落到 $HOME 的位置"><span class="dir">${escapeHtml(target.dir)}</span>${escapeHtml(target.name)}</code>`;
+}
+
+const CONFLICT_ACTIONS = `<span class="resolve-actions">
+  <button type="button" class="resolve-choose" data-side="ours"
+    title="保留本机，并把这个文件重新提交">保留本机</button>
+  <button type="button" class="resolve-choose" data-side="theirs"
+    title="用远端版本覆盖本机未提交的改动">采用远端</button>
+</span>`;
+
+const ROW_ACTIONS = `<span class="row-actions">
+  <button type="button" class="row-action" data-edit title="编辑：打开源目录里的副本"
+    aria-label="编辑">${glyph("pencil", 16)}</button>
+</span>`;
+
+/** 一行所有内容的来源：签名没变，这一行就不用碰。 */
+function rowSignature(entry: InventoryEntry): string {
+  return `${entry.status}|${entry.deleted}|${entry.source}|${entry.target}`;
+}
+
+/** 一行的完整标记：只在新增这一行时用，已存在的行走 updateRow。 */
+function rowHtml(entry: InventoryEntry): string {
+  const pair = `${escapeHtml(entry.source)} ↔ ${escapeHtml(entry.target)}`;
+  return `
       <li class="row" data-target="${escapeHtml(entry.target)}"
-        data-rel="${escapeHtml(rel ?? "")}">
+        data-rel="${escapeHtml(mirrorRel(entry.source) ?? "")}" data-sig="${escapeHtml(rowSignature(entry))}">
         <input type="checkbox" class="row-check" data-target="${escapeHtml(entry.target)}"
           title="选择这一行" aria-label="选择这一行" ${entry.deleted ? "disabled" : ""} />
         <button type="button" class="row-head" aria-expanded="false" title="展开或收起差异">
           <span class="status status-${entry.status}" role="img"
             title="${STATUS_LABEL[entry.status]}" aria-label="${STATUS_LABEL[entry.status]}"
           >${glyph(STATUS_ICON[entry.status], 16)}</span>
-          <span class="paths" title="${pair}">
-            <code${gone} title="源目录里的副本"><span class="dir">${escapeHtml(mirror.dir)}</span>${escapeHtml(mirror.name)}</code>
-            <span class="arrow">↔</span>
-            <code class="alt"${gone} title="落到 $HOME 的位置"><span class="dir">${escapeHtml(target.dir)}</span>${escapeHtml(target.name)}</code>
-          </span>
+          <span class="paths" title="${pair}">${pathsHtml(entry)}</span>
         </button>
-        ${
-          entry.status === "Conflict"
-            ? `<span class="resolve-actions">
-                <button type="button" class="resolve-choose" data-side="ours"
-                  title="保留本机，并把这个文件重新提交">保留本机</button>
-                <button type="button" class="resolve-choose" data-side="theirs"
-                  title="用远端版本覆盖本机未提交的改动">采用远端</button>
-              </span>`
-            : ""
-        }
-        ${entry.deleted ? "" : `<span class="row-actions">
-          <button type="button" class="row-action" data-edit title="编辑：打开源目录里的副本"
-            aria-label="编辑">${glyph("pencil", 16)}</button>
-        </span>`}
+        ${entry.status === "Conflict" ? CONFLICT_ACTIONS : ""}
+        ${entry.deleted ? "" : ROW_ACTIONS}
         <div class="diff"></div>
       </li>`;
-    })
-    .join("");
+}
+
+function rowNode(entry: InventoryEntry): HTMLLIElement {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = rowHtml(entry);
+  return tpl.content.firstElementChild as HTMLLIElement;
+}
+
+/** 同一个 target 的行已存在：只改真的变了的类名 / 属性 / 文本。 */
+function updateRow(row: HTMLLIElement, entry: InventoryEntry): void {
+  const sig = rowSignature(entry);
+  if (row.dataset.sig === sig) return;
+  row.dataset.sig = sig;
+  row.dataset.rel = mirrorRel(entry.source) ?? "";
+  row.classList.toggle("gone", entry.deleted);
+
+  const label = STATUS_LABEL[entry.status];
+  const status = row.querySelector<HTMLElement>(".status")!;
+  status.className = `status status-${entry.status}`;
+  status.title = label;
+  status.setAttribute("aria-label", label);
+  status.innerHTML = glyph(STATUS_ICON[entry.status], 16);
+
+  const paths = row.querySelector<HTMLElement>(".paths")!;
+  paths.title = `${entry.source} ↔ ${entry.target}`;
+  paths.innerHTML = pathsHtml(entry);
+
+  const box = row.querySelector<HTMLInputElement>(".row-check")!;
+  box.disabled = entry.deleted;
+  if (entry.deleted) box.checked = false;
+
+  const conflict = row.querySelector(".resolve-actions");
+  if (entry.status === "Conflict" && !conflict) {
+    row.querySelector(".diff")!.insertAdjacentHTML("beforebegin", CONFLICT_ACTIONS);
+  } else if (entry.status !== "Conflict" && conflict) {
+    conflict.remove();
+  }
+  const actions = row.querySelector(".row-actions");
+  if (entry.deleted && actions) {
+    actions.remove();
+  } else if (!entry.deleted && !actions) {
+    row.querySelector(".diff")!.insertAdjacentHTML("beforebegin", ROW_ACTIONS);
+  }
+
+  // 状态变了，展开的 diff 就是旧的：收起来，下次展开重读。
+  const slot = row.querySelector<HTMLDivElement>(".diff")!;
+  if (row.classList.contains("open") || slot.innerHTML !== "") {
+    row.classList.remove("open");
+    row.querySelector(".row-head")!.setAttribute("aria-expanded", "false");
+    slot.innerHTML = "";
+    delete slot.dataset.loaded;
+  }
+}
+
+/** 列表增量更新：按 target 认行，同一个 target 复用原来的 li，只改变化的部分。
+ *  新增的行插进去、清单里已经没有的行删掉；被过滤掉的行只 hidden——
+ *  滚动位置、搜索框焦点、勾选与展开的 diff 都不会因为一次刷新丢掉。 */
+function patchList(container: HTMLElement, entries: InventoryEntry[]): void {
+  if (entries.length === 0) {
+    const html = emptyListHtml();
+    if (container.innerHTML !== html) container.innerHTML = html;
+    return;
+  }
+
+  let ul = container.querySelector<HTMLUListElement>("ul.rows");
+  let legend = container.querySelector<HTMLElement>(".legend");
+  if (!ul || !legend) {
+    container.innerHTML = `<ul class="rows"></ul><p class="legend">${STATUS_LEGEND}</p>`;
+    ul = container.querySelector<HTMLUListElement>("ul.rows")!;
+    legend = container.querySelector<HTMLElement>(".legend")!;
+  }
+
+  const present = new Set(entries.map((entry) => entry.target));
+  const visible = visibleEntries(entries);
+  const shown = new Set(visible.map((entry) => entry.target));
+  const existing = new Map<string, HTMLLIElement>();
+  for (const row of Array.from(ul.querySelectorAll<HTMLLIElement>("li.row"))) {
+    const target = row.dataset.target!;
+    if (!present.has(target)) {
+      row.remove();
+      continue;
+    }
+    existing.set(target, row);
+  }
+
+  let cursor = ul.firstElementChild;
+  for (const entry of visible) {
+    let row = existing.get(entry.target);
+    if (row) {
+      updateRow(row, entry);
+    } else {
+      row = rowNode(entry);
+    }
+    row.hidden = false;
+    // 过滤掉的行留在原位，找下一个可见行对齐顺序，别去搬 hidden 的节点。
+    while (cursor instanceof HTMLElement && cursor.hidden) cursor = cursor.nextElementSibling;
+    if (row === cursor) {
+      cursor = cursor.nextElementSibling;
+    } else {
+      ul.insertBefore(row, cursor);
+    }
+  }
+  for (const [target, row] of existing) {
+    if (!shown.has(target)) row.hidden = true;
+  }
+
+  legend.hidden = visible.length === 0;
+  const empty = container.querySelector<HTMLElement>(".list-empty");
+  if (visible.length === 0) {
+    if (!empty) {
+      ul.insertAdjacentHTML(
+        "afterend",
+        `<p class="empty list-empty">没有匹配的文件<small>过滤的是 home/… 与 ~/… 两列路径。</small></p>`,
+      );
+    }
+  } else {
+    empty?.remove();
+  }
 }
 
 /** 「编辑」：用系统打开方式（或设置里的编辑器命令）打开源目录里的副本。
@@ -773,7 +889,6 @@ ${SETTINGS_BUTTON}
   });
   app.querySelector<HTMLButtonElement>(".confirm-apply")?.addEventListener("click", () => void confirmApply());
   app.querySelector<HTMLButtonElement>(".cancel-apply")?.addEventListener("click", () => void cancelApply());
-  bindSettingsEntry();
 }
 
 /** 预览里的路径：能换算成 `~/…` 就换算，和清单里一个口径。 */
@@ -1014,7 +1129,6 @@ ${SETTINGS_BUTTON}
   app.querySelector<HTMLButtonElement>("[data-cancel-restore]")?.addEventListener("click", () => void cancelRestore());
   app.querySelector<HTMLButtonElement>(".confirm-restore")?.addEventListener("click", () => void confirmRestore());
   app.querySelector<HTMLButtonElement>(".cancel-restore")?.addEventListener("click", () => void cancelRestore());
-  bindSettingsEntry();
 }
 
 /** 清单页的整体刷新：同一时刻只跑一次。
@@ -1054,80 +1168,148 @@ async function renderInventoryOnce(): Promise<void> {
     }
     // 清单和状态条出自同一次 git status，后端一次全给（#19）。
     const { entries, status } = await invoke<Refresh>("refresh");
-    app.innerHTML = `
-      ${statusBar(status)}
-      ${pendingHint(status)}
-      <div class="toolbar">
-        <button type="button" class="add-files" title="添加文件" aria-label="添加文件">
-          ${glyph("plus", 14)}添加文件
-        </button>
-        <button type="button" class="batch-remove" data-batch-remove hidden disabled
-          title="移除选中的文件（不删 $HOME 原文件）" aria-label="移除选中的文件"
-        >${glyph("trash", 14)}</button>
-        <button type="button" data-pull title="拉取" aria-label="拉取">${glyph("download", 14)}</button>
-        <button type="button" data-push title="推送" aria-label="推送">${glyph("upload", 14)}</button>
-        <button type="button" data-apply title="应用：把源目录的内容写到 $HOME" aria-label="应用"
-        >${glyph("sync", 14)}</button>
-      </div>
-      <div class="action-error">${pushReportHtml}</div>
-      <main class="inventory">
-        <div class="add-report">${addReportHtml}</div>
-        <div class="apply-report">${applyReportHtml}</div>
-        ${entries.length === 0 ? "" : `<input class="search" type="search" placeholder="按路径过滤…"
-          value="${escapeHtml(query)}" aria-label="按路径过滤" spellcheck="false" />`}
-        <div class="list">${listHtml(entries)}</div>
-      </main>`;
-
     lastEntries = entries;
-
-    const main = app.querySelector<HTMLElement>("main.inventory")!;
-    main.addEventListener("click", (event) => {
-      const target = event.target as HTMLElement;
-      const edit = target.closest<HTMLButtonElement>("[data-edit]");
-      const row = target.closest<HTMLLIElement>(".row");
-      if (!row) return;
-      if (edit) {
-        void editRow(row, edit);
-      } else if (target.closest(".row-head")) {
-        void toggleDiff(row);
-      }
-    });
-    app.querySelector<HTMLButtonElement>("[data-pull]")?.addEventListener("click", () => void pull());
-    app.querySelector<HTMLButtonElement>("[data-push]")?.addEventListener("click", () =>
-      void pushChanges(),
-    );
-    app.querySelector<HTMLButtonElement>("[data-apply]")?.addEventListener("click", () => void startApply());
-    app.querySelector<HTMLButtonElement>("[data-undo-apply]")?.addEventListener("click", (event) => {
-      const id = (event.currentTarget as HTMLButtonElement).dataset.undoApply;
-      if (id) void startRestore(id);
-    });
-    app.querySelectorAll<HTMLButtonElement>(".resolve-choose").forEach((button) => {
-      const row = button.closest<HTMLLIElement>(".row");
-      if (row) button.addEventListener("click", () => void resolveRow(row, button));
-    });
-
-    // 勾选状态决定批量移除按钮是否出现：列表被过滤重绘后勾选会清空，按钮也跟着隐藏。
-    const batch = app.querySelector<HTMLButtonElement>("[data-batch-remove]");
-    const syncBatch = () => {
-      if (!batch) return;
-      const count = selectedTargets().length;
-      batch.hidden = count === 0;
-      batch.disabled = count === 0;
-    };
-    main.addEventListener("change", (event) => {
-      if ((event.target as HTMLElement).classList.contains("row-check")) syncBatch();
-    });
-    batch?.addEventListener("click", () => void removeSelected(batch));
-    app.querySelector<HTMLInputElement>(".search")?.addEventListener("input", (event) => {
-      query = (event.target as HTMLInputElement).value;
-      const list = app.querySelector<HTMLElement>(".list");
-      if (list) list.innerHTML = listHtml(lastEntries);
-      syncBatch();
-    });
-    bindSettingsEntry();
+    renderInventoryView(entries, status);
   } catch (error) {
     renderError(error);
   }
+}
+
+/** 清单页的工具栏：内容固定，只有批量移除按钮的 hidden/disabled 由 syncBatchButton 管，
+ *  所以靠 data-static 认它，不参与内容比对（否则一勾选就被当成变了而重建）。 */
+const INVENTORY_TOOLBAR = `<div class="toolbar" data-static="toolbar">
+  <button type="button" class="add-files" title="添加文件" aria-label="添加文件">
+    ${glyph("plus", 14)}添加文件
+  </button>
+  <button type="button" class="batch-remove" data-batch-remove hidden disabled
+    title="移除选中的文件（不删 $HOME 原文件）" aria-label="移除选中的文件"
+  >${glyph("trash", 14)}</button>
+  <button type="button" data-pull title="拉取" aria-label="拉取">${glyph("download", 14)}</button>
+  <button type="button" data-push title="推送" aria-label="推送">${glyph("upload", 14)}</button>
+  <button type="button" data-apply title="应用：把源目录的内容写到 $HOME" aria-label="应用"
+  >${glyph("sync", 14)}</button>
+</div>`;
+
+/** 清单页：骨架只建一次，之后每次刷新只换真的变了的那几块。
+ *  整页重建会丢滚动位置、搜索框焦点和勾选，也把整棵 DOM 重新解析一遍（#42 第 6 条）。 */
+function renderInventoryView(entries: InventoryEntry[], status: RepoStatus): void {
+  let main = app.querySelector<HTMLElement>("main.inventory[data-inventory]");
+  if (!main) {
+    app.innerHTML = `
+      ${statusBar(status)}
+      ${pendingHint(status)}
+      ${INVENTORY_TOOLBAR}
+      <div class="action-error">${pushReportHtml}</div>
+      <main class="inventory" data-inventory>
+        <div class="add-report">${addReportHtml}</div>
+        <div class="apply-report">${applyReportHtml}</div>
+        <div class="search-slot"></div>
+        <div class="list"></div>
+      </main>`;
+    main = app.querySelector<HTMLElement>("main.inventory[data-inventory]")!;
+    bindInventory(main);
+  } else {
+    syncChrome(
+      main,
+      `${statusBar(status)}${pendingHint(status)}${INVENTORY_TOOLBAR}<div class="action-error">${pushReportHtml}</div>`,
+    );
+    patchHtml(main.querySelector(".add-report")!, addReportHtml);
+    patchHtml(main.querySelector(".apply-report")!, applyReportHtml);
+  }
+  patchSearch(entries);
+  patchList(main.querySelector<HTMLElement>(".list")!, entries);
+  syncBatchButton();
+}
+
+/** main 之前的外壳（状态条 / 提示 / 工具栏 / 报告）按顺序对齐：内容没变就留原节点，
+ *  变了只换那一段。搜索框与行都在 main 里，不经过这里。 */
+function syncChrome(main: HTMLElement, html: string): void {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  let index = 0;
+  for (const node of Array.from(tpl.content.children)) {
+    const current = app.children[index];
+    const staticSlot = node.getAttribute("data-static");
+    if (current === main) {
+      app.insertBefore(node, main);
+    } else if (
+      current &&
+      (current.isEqualNode(node) ||
+        (staticSlot !== null && current.getAttribute("data-static") === staticSlot))
+    ) {
+      index++;
+      continue;
+    } else if (current) {
+      current.replaceWith(node);
+    } else {
+      app.append(node);
+    }
+    index++;
+  }
+  while (app.children[index] && app.children[index] !== main) app.children[index].remove();
+}
+
+function patchHtml(el: Element, html: string): void {
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+/** 搜索框只建一次；清单清空时拿掉，回来时把过滤词填回去。 */
+function patchSearch(entries: InventoryEntry[]): void {
+  const slot = app.querySelector<HTMLElement>(".search-slot")!;
+  const input = slot.querySelector<HTMLInputElement>(".search");
+  if (entries.length === 0) {
+    if (input) slot.innerHTML = "";
+    return;
+  }
+  if (input) return;
+  slot.innerHTML = `<input class="search" type="search" placeholder="按路径过滤…"
+    aria-label="按路径过滤" spellcheck="false" />`;
+  const created = slot.querySelector<HTMLInputElement>(".search")!;
+  created.value = query;
+  created.addEventListener("input", (event) => {
+    query = (event.target as HTMLInputElement).value;
+    // 只重绘列表容器：输入框不动，焦点就在这里。
+    patchList(app.querySelector<HTMLElement>(".list")!, lastEntries);
+    syncBatchButton();
+  });
+}
+
+/** 勾选数决定批量移除按钮是否出现：刷新复用节点后也要按当前勾选同步一次。 */
+function syncBatchButton(): void {
+  const batch = app.querySelector<HTMLButtonElement>("[data-batch-remove]");
+  if (!batch) return;
+  const count = selectedTargets().length;
+  batch.hidden = count === 0;
+  batch.disabled = count === 0;
+}
+
+/** 清单页的事件只绑一次：行是增量插入的，所以行内按钮走事件委派。 */
+function bindInventory(main: HTMLElement): void {
+  main.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    const row = target.closest<HTMLLIElement>(".row");
+    if (!row) return;
+    const edit = target.closest<HTMLButtonElement>("[data-edit]");
+    const resolve = target.closest<HTMLButtonElement>(".resolve-choose");
+    if (edit) {
+      void editRow(row, edit);
+    } else if (resolve) {
+      void resolveRow(row, resolve);
+    } else if (target.closest(".row-head")) {
+      void toggleDiff(row);
+    }
+  });
+  app.querySelector<HTMLButtonElement>("[data-pull]")?.addEventListener("click", () => void pull());
+  app.querySelector<HTMLButtonElement>("[data-push]")?.addEventListener("click", () =>
+    void pushChanges(),
+  );
+  app.querySelector<HTMLButtonElement>("[data-apply]")?.addEventListener("click", () => void startApply());
+  // 勾选状态决定批量移除按钮是否出现。
+  main.addEventListener("change", (event) => {
+    if ((event.target as HTMLElement).classList.contains("row-check")) syncBatchButton();
+  });
+  const batch = app.querySelector<HTMLButtonElement>("[data-batch-remove]");
+  batch?.addEventListener("click", () => void removeSelected(batch));
 }
 
 /** 添加结果的汇总：新增的行已经在清单里，这里只补「已在清单中 / 没添加」的说明。 */
@@ -1180,16 +1362,6 @@ function renderError(error: unknown): void {
     ${errorPanel(error)}
     <div class="actions">${OPEN_DIR_BUTTON}<button class="nav" data-settings title="设置"
       >${glyph("sliders", 15)}设置</button></div>`;
-  bindSettingsEntry();
-}
-
-function bindSettingsEntry(): void {
-  app.querySelectorAll<HTMLButtonElement>("[data-settings]").forEach((button) => {
-    button.addEventListener("click", () => void renderSettings());
-  });
-  app.querySelectorAll<HTMLButtonElement>("[data-open-dir]").forEach((button) => {
-    button.addEventListener("click", () => void openSourceDir());
-  });
 }
 
 /** 「打开目录」：在 Finder 里打开源目录，方便直接看 `home/` 里都有什么。 */
@@ -1417,7 +1589,6 @@ function renderOnboarding(sourceDir: string): void {
   const button = form.querySelector<HTMLButtonElement>("button")!;
   const slot = app.querySelector<HTMLDivElement>(".clone-error")!;
   input.focus();
-  bindSettingsEntry();
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1492,9 +1663,19 @@ function escapeHtml(text: string): string {
   );
 }
 
-// 添加控件在每次重渲染后都是新的，所以用事件委派挂在 #app 上，只绑一次。
+// 添加 / 撤销 / 顶栏入口的节点每次渲染都是新的，所以用事件委派挂在 #app 上，只绑一次。
 app.addEventListener("click", (event) => {
-  if ((event.target as HTMLElement).closest(".add-files")) void pickFiles();
+  const target = event.target as HTMLElement;
+  if (target.closest(".add-files")) {
+    void pickFiles();
+  } else if (target.closest("[data-settings]")) {
+    void renderSettings();
+  } else if (target.closest("[data-open-dir]")) {
+    void openSourceDir();
+  } else {
+    const undo = target.closest<HTMLButtonElement>("[data-undo-apply]");
+    if (undo?.dataset.undoApply) void startRestore(undo.dataset.undoApply);
+  }
 });
 
 app.innerHTML = `<p class="empty">正在读取清单…</p>`;
