@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Core, CoreError, Status, paths, read_text, state, unified_diff};
+use crate::{Core, CoreError, Status, diff_gate_reason, paths, state, unified_diff};
 
 /// 一份完整的应用计划。预览展示它，写盘也执行它。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +54,8 @@ pub struct ApplyItem {
     pub reason: String,
     /// 应用会带来的改动（目标 → 源），unified diff；没有改动时是空串。
     pub diff: String,
+    /// `diff` 因为两侧文件太大被闸门跳过（此时 `diff` 是空串）：界面显示「差异过大」。
+    pub diff_omitted: bool,
     /// 跳过项的归类：界面用图标表达，不逐条念句子。非跳过项为 `None`。
     pub skip_reason: Option<SkipReason>,
     /// 出计划时源文件内容的指纹（十六进制）：写盘前比对，源文件在这期间变过就不写。
@@ -166,13 +168,33 @@ impl Core {
                     source.display()
                 ),
                 diff: String::new(),
+                diff_omitted: false,
                 digest: String::new(),
                 skip_reason: Some(SkipReason::SourceMissing),
             });
         }
 
+        // 源、目标各读一次；一致性判断、digest、diff 的旧值全用这两份字节（#20）。
+        let source_bytes = std::fs::read(&source)
+            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
+        let target_bytes = match std::fs::read(&target) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(CoreError::io(format!(
+                    "读取 {} 失败：{e}",
+                    target.display()
+                )));
+            }
+        };
+        let disk = match &target_bytes {
+            None => state::Disk::Missing,
+            Some(bytes) if bytes.len() != source_bytes.len() => state::Disk::Differs,
+            Some(bytes) if bytes == &source_bytes => state::Disk::Same,
+            Some(_) => state::Disk::Differs,
+        };
+
         let repo_path = Path::new(paths::MIRROR_ROOT).join(rel);
-        let disk = self.disk(rel)?;
         let (action, reason, skip_reason) = match state::derive(disk, &repo_path, facts) {
             // 源侧内容还没定下来：先让用户处理提交 / 冲突，应用不动目标文件。
             Status::PendingCommit => (
@@ -204,18 +226,35 @@ impl Core {
             },
         };
 
-        let bytes = std::fs::read(&source)
-            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
-        let item_source = source.clone();
+        // 跳过项（一致 / 待提交 / 冲突）不写盘，也没人去读它们的 diff：不算（#17）。
+        let (diff, diff_omitted) = if action == ApplyAction::Skip {
+            (String::new(), false)
+        } else {
+            let old = target_bytes
+                .as_deref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            let new = String::from_utf8_lossy(&source_bytes);
+            // 超过闸门的文件不预生成 diff，只给出标记（见 lib.rs 的 DIFF_MAX_*）。
+            match diff_gate_reason(&old, &new) {
+                Some(_) => (String::new(), true),
+                None => (
+                    unified_diff(
+                        &target.display().to_string(),
+                        &source.display().to_string(),
+                        &old,
+                        &new,
+                    ),
+                    false,
+                ),
+            }
+        };
+
         Ok(ApplyItem {
-            source: item_source,
-            diff: unified_diff(
-                &target.display().to_string(),
-                &source.display().to_string(),
-                &read_text(&target),
-                &String::from_utf8_lossy(&bytes),
-            ),
-            digest: digest(&bytes),
+            source: source.clone(),
+            diff,
+            diff_omitted,
+            digest: digest(&source_bytes),
             target,
             action,
             reason,
@@ -265,10 +304,13 @@ impl Core {
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
 
-        let written = std::fs::copy(&source, &temp).and_then(|_| {
-            // 覆盖已有文件时，保留它原来的权限（用户可能自己收紧过）。
-            if let Ok(existing) = std::fs::metadata(target) {
-                std::fs::set_permissions(&temp, existing.permissions())?;
+        let written = std::fs::write(&temp, &bytes).and_then(|()| {
+            // 覆盖已有文件时保留它原来的权限；新建沿用源文件（可执行位不丢）。
+            let permissions = std::fs::metadata(target)
+                .or_else(|_| std::fs::metadata(&source))
+                .map(|meta| meta.permissions());
+            if let Ok(permissions) = permissions {
+                std::fs::set_permissions(&temp, permissions)?;
             }
             std::fs::rename(&temp, target)
         });

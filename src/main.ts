@@ -87,6 +87,8 @@ interface ApplyItem {
   reason: string;
   /** 应用会带来的改动（目标 → 源），空串 = 没有差异。 */
   diff: string;
+  /** diff 因两侧文件太大被闸门跳过（此时 diff 是空串）；与 Core 的 DIFF_TOO_LARGE 对应。 */
+  diff_omitted: boolean;
   /** 跳过项的归类：界面用图标表达。非跳过项是 null。 */
   skip_reason: SkipReason | null;
 }
@@ -456,9 +458,11 @@ async function toggleDiff(row: HTMLLIElement): Promise<void> {
   slot.innerHTML = `<p class="diff-hint">正在读取差异…</p>`;
   try {
     const diff = await invoke<FileDiff>("diff", { target: row.dataset.target });
-    slot.innerHTML = diff.text
-      ? `<pre class="diff-text">${diffLines(diff.text)}</pre>`
-      : `<p class="diff-hint">两侧内容相同，没有差异。</p>`;
+    slot.innerHTML = diff.text.startsWith(DIFF_TOO_LARGE)
+      ? `<p class="diff-hint">${escapeHtml(diff.text)}</p>`
+      : diff.text
+        ? `<pre class="diff-text">${diffLines(diff.text)}</pre>`
+        : `<p class="diff-hint">两侧内容相同，没有差异。</p>`;
   } catch (error) {
     slot.innerHTML = errorPanel(error);
   }
@@ -485,6 +489,9 @@ async function resolveRow(row: HTMLLIElement, button: HTMLButtonElement): Promis
     button.disabled = false;
   }
 }
+
+/** 与 Core 的 `DIFF_TOO_LARGE` 同一个字符串：diff 超过闸门时用它开头做标记。 */
+const DIFF_TOO_LARGE = "差异过大";
 
 function diffLines(text: string): string {
   return text
@@ -651,7 +658,11 @@ function applyPath(item: ApplyItem): string {
 }
 
 function applyItemHtml(item: ApplyItem): string {
-  const diff = item.diff ? `<pre class="apply-diff">${diffLines(item.diff)}</pre>` : "";
+  const diff = item.diff
+    ? `<pre class="apply-diff">${diffLines(item.diff)}</pre>`
+    : item.diff_omitted
+      ? `<p class="apply-reason">${DIFF_TOO_LARGE}，没有预生成 diff</p>`
+      : "";
   // 跳过项不写一句话，只在路径前面放个图标，说明留给悬停。
   const hint = item.skip_reason ? SKIP_HINT[item.skip_reason] : null;
   // 非跳过项也留出这一格，左侧边界才对齐。

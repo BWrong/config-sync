@@ -164,6 +164,9 @@ impl Core {
         // 删掉的文件在磁盘上已经没有了，但 git 里还挂着这桩删除（未提交，或已提交未推送）：
         // 不列出来的话，清单上根本看不见「待提交」和「待推送」的删除。
         let mut deleted = HashSet::new();
+        // `managed_relative_paths` 已经排好序：查重用 HashSet，补齐的行事后按序插入，
+        // 不再 O(D×N) 线性找 + 整体重排（#20）。
+        let known: HashSet<&Path> = rels.iter().map(PathBuf::as_path).collect();
         for path in facts.dirty_paths().chain(facts.push_deleted_paths()) {
             let Ok(rel) = path.strip_prefix(paths::MIRROR_ROOT) else {
                 continue;
@@ -172,13 +175,16 @@ impl Core {
             if std::fs::symlink_metadata(mirror_root.join(rel)).is_ok() {
                 continue;
             }
-            if rels.iter().any(|known| known == rel) {
+            if known.contains(rel) {
                 continue;
             }
-            rels.push(rel.to_path_buf());
             deleted.insert(rel.to_path_buf());
         }
-        rels.sort();
+        for rel in &deleted {
+            if let Err(at) = rels.binary_search(rel) {
+                rels.insert(at, rel.clone());
+            }
+        }
 
         for rel in rels {
             let source = mirror_root.join(&rel);
@@ -250,10 +256,19 @@ impl Core {
             ),
         };
 
+        // 超过闸门的一对不在这里算：单文件 diff 也不许因为大文件把整条命令拖死（#17）。
+        let text = if old == new {
+            String::new()
+        } else if let Some(reason) = diff_gate_reason(&old, &new) {
+            reason
+        } else {
+            unified_diff(&old_label, &new_label, &old, &new)
+        };
+
         Ok(FileDiff {
             target: target.to_path_buf(),
             status,
-            text: unified_diff(&old_label, &new_label, &old, &new),
+            text,
         })
     }
 
@@ -314,10 +329,11 @@ impl Core {
         )
     }
 
+    /// 先比长度：不相等直接不同，相等才读内容（#20）。
     fn disk(&self, rel: &Path) -> Result<state::Disk, CoreError> {
         let target = self.home.join(rel);
-        let target_bytes = match std::fs::read(&target) {
-            Ok(bytes) => bytes,
+        let target_len = match std::fs::metadata(&target) {
+            Ok(meta) => meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(state::Disk::Missing),
             Err(e) => {
                 return Err(CoreError::io(format!(
@@ -328,6 +344,15 @@ impl Core {
         };
 
         let source = self.source_dir.join(paths::MIRROR_ROOT).join(rel);
+        let source_len = std::fs::metadata(&source)
+            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?
+            .len();
+        if source_len != target_len {
+            return Ok(state::Disk::Differs);
+        }
+
+        let target_bytes = std::fs::read(&target)
+            .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", target.display())))?;
         let source_bytes = std::fs::read(&source)
             .map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", source.display())))?;
 
@@ -394,6 +419,30 @@ fn revision_text(source_dir: &Path, rev: &str, repo_path: &Path) -> String {
         &["show", &format!("{rev}:{}", repo_path.display())],
     )
     .unwrap_or_default()
+}
+
+/// diff 闸门的两个上限：单侧超过任一值就不再生成 diff。阈值只在这里定义（#17）。
+const DIFF_MAX_BYTES: usize = 256 * 1024;
+const DIFF_MAX_LINES: usize = 5000;
+
+/// 超闸门的标记：`ApplyItem.diff_omitted` 为真时 `diff` 为空；
+/// 单文件 diff 的 `FileDiff.text` 以它开头，表示「没有算 diff」。
+/// 前端 `src/main.ts` 里有同名字符串，改这里要一起改。
+pub const DIFF_TOO_LARGE: &str = "差异过大";
+
+/// 两侧取更大的一侧判闸门；超了返回给人看的原因，没超返回 `None`。
+fn diff_gate_reason(old: &str, new: &str) -> Option<String> {
+    let widest = if old.len() >= new.len() { old } else { new };
+    let lines = widest.lines().count();
+    if widest.len() <= DIFF_MAX_BYTES && lines <= DIFF_MAX_LINES {
+        return None;
+    }
+    Some(format!(
+        "{DIFF_TOO_LARGE}：最大的一侧 {} KB / {lines} 行，超过 {} KB / {DIFF_MAX_LINES} 行的上限，\
+         没有生成 diff；请在编辑器里对比这两个文件",
+        widest.len().div_ceil(1024),
+        DIFF_MAX_BYTES / 1024,
+    ))
 }
 
 /// 两侧相同就是空串（前端显示「没有差异」），否则是带 `---/+++` 头的 unified diff。

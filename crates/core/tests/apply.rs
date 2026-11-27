@@ -7,7 +7,8 @@ mod fixtures;
 use std::path::{Path, PathBuf};
 
 use config_sync_core::{
-    ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary,
+    ApplyAction, ApplyItem, ApplyOutcome, ApplyPlan, ApplyResult, ApplySummary, DIFF_TOO_LARGE,
+    Status,
 };
 
 fn written(target: &Path) -> ApplyOutcome {
@@ -212,6 +213,7 @@ fn paths_outside_home_are_refused_by_both_phases() {
             action: ApplyAction::Overwrite,
             reason: String::new(),
             diff: String::new(),
+            diff_omitted: false,
             digest: String::new(),
             skip_reason: None,
         }],
@@ -369,4 +371,85 @@ fn creating_a_target_keeps_the_executable_bit_and_overwriting_keeps_the_targets_
     let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "覆盖后的权限 {mode:o}");
     assert_eq!(f.read_home(".local/bin/hello"), "#!/bin/sh\necho bye\n");
+}
+
+#[test]
+fn a_target_of_a_different_size_is_judged_without_reading_its_content() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    let target = committed(&f, ".zshrc", "export A=1\n");
+    // 长度不同就够判「待应用」：内容读不了也不该影响清单（先比 metadata().len()，见 #20）。
+    f.write_home(".zshrc", "export A=1\nexport B=2\n");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let entries = core.inventory().unwrap();
+    let row = entries.iter().find(|entry| entry.target == target).unwrap();
+    assert_eq!(row.status, Status::Pending, "{row:?}");
+
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn skipped_items_carry_no_diff_payload() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    f.write_source("home/.tmux.conf", "set -g mouse on\n");
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.write_source("home/.bashrc", "export B=1\n");
+    f.commit_all("config-sync: 3 files");
+    f.push();
+    // 一致 → 跳过；待提交 → 跳过；冲突 → 跳过：三种跳过项都不写盘，也就不算 diff。
+    f.write_home(".tmux.conf", "set -g mouse on\n");
+    f.write_source("home/.zshrc", "export A=2\n");
+    f.advance_remote("home/.bashrc", "export B=9\n");
+    f.write_source("home/.bashrc", "export B=2\n");
+
+    let plan = core.plan_apply(None).unwrap();
+    let skipped: Vec<&ApplyItem> = plan
+        .items
+        .iter()
+        .filter(|item| item.action == ApplyAction::Skip)
+        .collect();
+    assert_eq!(skipped.len(), 3, "{:?}", plan.items);
+    for item in skipped {
+        assert_eq!(item.diff, "", "{} 跳过了还带了 diff", item.target.display());
+        assert!(!item.diff_omitted, "{}", item.target.display());
+    }
+}
+
+#[test]
+fn files_over_the_diff_gate_are_not_previewed_as_diffs() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 超过 5000 行就超过闸门（阈值见 core 的 DIFF_MAX_*）。
+    let body: String = (0..6000).map(|i| format!("key_{i:05} = value\n")).collect();
+    f.write_source("home/big.conf", &body);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home("big.conf", "old\n");
+
+    let plan = core.plan_apply(None).unwrap();
+    let big = item(&plan, &target);
+    // 闸门只影响 diff，动作与摘要不变。
+    assert_eq!(big.action, ApplyAction::Overwrite);
+    assert!(
+        big.diff.is_empty(),
+        "闸门内不该生成 {} 字节的 diff",
+        big.diff.len()
+    );
+    assert!(big.diff_omitted, "{}", target.display());
+    assert_eq!(
+        plan.summary(),
+        ApplySummary {
+            create: 0,
+            overwrite: 1,
+            skip: 0
+        }
+    );
+
+    // 按需的单文件 diff 走同一道闸门：给出原因，而不是算出一份巨大的 diff。
+    let diff = core.diff(&target).unwrap();
+    assert!(diff.text.starts_with(DIFF_TOO_LARGE), "{}", diff.text);
 }
