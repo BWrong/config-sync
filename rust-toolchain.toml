@@ -1,0 +1,6 @@
+# 钉住 CI 已验证过的 stable（ci.yml 上一直跑的就是这个版本），
+# 让 rustfmt / clippy 的版本跨机器一致。
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
