@@ -1,18 +1,41 @@
-//! 推送：硬拦 → `git add -A` → 自动提交 → `git push`，三步在同一个方法里。
+//! 推送：硬拦 → `git add -A` → 自动提交 → `git push`。
 //!
-//! 硬拦在 `git add` 之前跑，看的是「工作区 ∪ 暂存区」：命中任一条规则就整次拒绝，
-//! 一个文件都不进暂存区，也没有 override 通道（见 DESIGN.md）。
+//! 硬拦看的是「工作区 ∪ 暂存区 ∪ 待推提交（`@{u}..HEAD`）」：命中任一条规则就整次拒绝，
+//! 一个文件都不进暂存区，也没有 override 通道（见 DESIGN.md）。已提交但没推送的提交同样
+//! 要扫——这次 `git push` 会把它们一起送到远端，不扫就等于没有硬拦。
+//!
+//! 待推提交按「区间里出现过的每一个 blob 版本」扫（`rev-list --objects`），而不是按
+//! `base..HEAD` 的最终 diff：提交 A 加进密钥、提交 B 把文件删掉时，最终 diff 与 HEAD 树里
+//! 都没有它，可 A 的 blob 照样会被 push 送出去。为此区间有上限（见 `MAX_*` 常量），超限
+//! 整次中止并说明是哪一项——扫不完就推等于把硬拦关掉，不静默放行。
+//! 工作区干净但 `ahead > 0` 时照常推送（只推已有提交）；没有上游时用
+//! `push -u origin <branch>` 建立跟踪。暂存区与待推提交的内容一次 `git cat-file --batch`
+//! 取完，文件再多也只是一个进程。
 
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::Serialize;
 
-use crate::{Core, CoreError, git, state};
+use crate::{Core, CoreError, ErrorKind, git, state};
 
 /// 命中硬拦时固定的解释；没有「强行继续」。
 const ENCRYPTION_HINT: &str = "私钥/凭据类文件需要先加密才能同步，加密在 v0.3 提供。";
+
+// 待推提交的扫描上限。这几个数远超「本机配置仓库」的日常量级，顶到上限说明该先手动推一次；
+// 超限一律 fail-closed（整次中止），绝不「太大的跳过」——跳过就等于大文件里藏密钥照推。
+/// 未推送提交数上限。
+const MAX_UNPUSHED_COMMITS: u32 = 1000;
+/// 待扫 blob 版本数上限（按 oid 去重后）。
+const MAX_UNPUSHED_BLOBS: usize = 10_000;
+/// 待扫内容累计上限。
+const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+/// 单个 blob 版本上限（在 `cat-file --batch-check` 拿到 size 时就判，不必读内容）。
+const MAX_BLOB_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 9 条路径规则。`**/` 前缀表示「仓库内任意层级」。
 const PATH_RULES: &[&str] = &[
@@ -48,82 +71,220 @@ static CONTENT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// 一次推送的结果，供状态条显示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PushOutcome {
-    /// 这次是否产生了自动提交；false = 没有需要推送的改动。
+    /// 这次是否产生了自动提交；false = 没有产生新提交。
     pub committed: bool,
-    /// 本次提交涉及的文件数。
+    /// 本次提交涉及的文件数；没提交时是 0。
     pub files: u32,
     /// 固定格式的提交 message；没提交时是空串。
     pub message: String,
     /// 推送目标的远端地址。
     pub remote_url: String,
+    /// 推送前就已在本地、这次顺手推出去的提交数（不含本次自动提交）；
+    /// `0` 且 `committed == false` 才是真的「没有需要推送的改动」。
+    pub existing_commits: u32,
 }
 
 impl Core {
     /// 推送 = 硬拦 → `git add -A` → `git commit -m "<固定格式>"` → `git push`。
     ///
     /// 命中硬拦时整次拒绝：不暂存、不提交、不推送，错误里点名规则与文件。
-    /// 没有可提交的改动时返回 `committed: false`，不报错也不空提交。
+    /// 没有可提交的改动、`ahead` 也是 0 时返回 `committed: false`，不报错也不空提交；
+    /// 只有 `ahead > 0` 时照常推送（`committed: false` + `existing_commits > 0`）。
+    /// 没有上游时第一次推送顺手 `-u origin <branch>` 建立跟踪。
     /// 提交成功而 push 失败是可接受的终态：错误里如实说明「已提交」并带上 git 原始 stderr。
     pub fn commit_and_push(&self) -> Result<PushOutcome, CoreError> {
-        let hits = scan(&self.source_dir)?;
+        // 一份 GitFacts 同时喂给硬拦与「有没有改动」，不重复跑 `git status`。
+        let facts = state::GitFacts::read(&self.source_dir)?;
+        let target = PushTarget::read(&self.source_dir)?;
+        let hits = scan(
+            &self.source_dir,
+            &facts,
+            target.scan_base.as_deref(),
+            target.ahead,
+        )?;
         if !hits.is_empty() {
             return Err(blocked_error(&hits));
         }
 
-        if !has_changes(&self.source_dir)? {
-            return Ok(self.outcome(false, 0, String::new()));
+        let dirty = facts.dirty_paths().next().is_some();
+        // 工作区干净、也没有待推提交：真的没事可做（空仓库同样落在这里）。
+        if !dirty && target.ahead == 0 {
+            return Ok(self.outcome(false, 0, String::new(), 0));
         }
 
-        git::run(&self.source_dir, &["add", "-A"])?;
-        let files = staged_file_count(&self.source_dir)?;
-        let message = format!(
-            "config-sync: {files} files ({})",
-            chrono::Local::now().format("%Y-%m-%d %H:%M")
-        );
-        git::run(&self.source_dir, &["commit", "-m", &message]).map_err(|e| CoreError {
-            message: format!("自动提交「{message}」失败"),
-            ..e
-        })?;
+        let mut committed = false;
+        let mut files = 0;
+        let mut message = String::new();
+        if dirty {
+            git::run(&self.source_dir, &["add", "-A"])?;
+            files = staged_file_count(&self.source_dir)?;
+            message = format!(
+                "config-sync: {files} files ({})",
+                chrono::Local::now().format("%Y-%m-%d %H:%M")
+            );
+            git::run(&self.source_dir, &["commit", "-m", &message]).map_err(|e| CoreError {
+                message: format!("自动提交「{message}」失败"),
+                ..e
+            })?;
+            committed = true;
+        }
 
-        // 第一次推送没有上游，顺手建立跟踪（拉取那边靠它判断能否 fetch）。
-        let branch = git::run(&self.source_dir, &["branch", "--show-current"])?;
-        let push: Vec<String> =
-            if git::run(&self.source_dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok() {
-                vec!["push".to_string()]
+        // 推送目标必须显式写出来：裸 `git push` 服从 `push.default`，配成 `matching` 时
+        // 会把远端已有的同名分支一起推上去，而那些分支不在本次扫描范围内。
+        // `--no-follow-tags` 同理，堵住 `push.followTags=true` 顺手推 tag。
+        //
+        // 远端与分支都取自上游配置，不是本地分支名：`git branch -m` 之后本地叫 `trunk` 而
+        // 上游是 `origin/main` 时，拿本地名当 refspec 会在远端凭空建出 `trunk`，`origin/main`
+        // 永不前进，`ahead` 基准也没动过——每次点推送都报「已推了 1 个本机已有提交」。
+        let refspec = target
+            .push_to
+            .as_ref()
+            .map(|route| format!("HEAD:{}", route.remote_ref));
+        let push: Vec<&str> = match (&target.push_to, refspec.as_deref()) {
+            (Some(route), Some(refspec)) => {
+                vec!["push", "--no-follow-tags", route.remote.as_str(), refspec]
+            }
+            // 第一次推送没有上游，顺手建立跟踪（拉取那边靠它判断能否 fetch）。
+            _ => vec!["push", "--no-follow-tags", "-u", "origin", &target.branch],
+        };
+        git::run(&self.source_dir, &push).map_err(|e| CoreError {
+            message: if committed {
+                format!("已自动提交「{message}」，但推送失败：远端没有接受这个提交")
             } else {
-                vec![
-                    "push".to_string(),
-                    "-u".to_string(),
-                    "origin".to_string(),
-                    branch,
-                ]
-            };
-        let args: Vec<&str> = push.iter().map(String::as_str).collect();
-        git::run(&self.source_dir, &args).map_err(|e| CoreError {
-            message: format!("已自动提交「{message}」，但推送失败：远端没有接受这个提交"),
+                format!("推送失败：远端没有接受本机已有的 {} 个提交", target.ahead)
+            },
             ..e
         })?;
 
-        Ok(self.outcome(true, files, message))
+        Ok(self.outcome(committed, files, message, target.ahead))
     }
 
-    fn outcome(&self, committed: bool, files: u32, message: String) -> PushOutcome {
+    fn outcome(
+        &self,
+        committed: bool,
+        files: u32,
+        message: String,
+        existing_commits: u32,
+    ) -> PushOutcome {
         PushOutcome {
             committed,
             files,
             message,
             remote_url: self.remote_url().unwrap_or_default(),
+            existing_commits,
         }
     }
 }
 
-/// 仓库里是否有未提交改动（含未跟踪、含暂存）。
-fn has_changes(source_dir: &Path) -> Result<bool, CoreError> {
-    let porcelain = git::run(
-        source_dir,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    Ok(!porcelain.is_empty())
+/// 推送目标的现状：当前分支、上游、待推提交数，以及硬拦扫待推提交时的比较基准。
+struct PushTarget {
+    branch: String,
+    /// 显式 refspec 的两半；`None` = 没有上游，走 `-u origin <branch>`。
+    push_to: Option<PushRoute>,
+    /// 推送前已有、尚未推到远端的提交数。
+    ahead: u32,
+    /// `ahead` 那些提交从哪算起；`None` = 没有可比基准，整个 HEAD 树都要扫。
+    scan_base: Option<String>,
+}
+
+/// 送到哪里：远端名 + 那个远端上的 ref 名，两者都来自上游配置。
+struct PushRoute {
+    remote: String,
+    remote_ref: String,
+}
+
+impl PushTarget {
+    fn read(source_dir: &Path) -> Result<Self, CoreError> {
+        // 一次 `for-each-ref` 同时拿到当前分支、它的上游，以及推送目标的两半
+        // （`*` 标出当前分支）。本地分支名与上游分支名可以不同，所以远端名与远端 ref
+        // 只能从上游配置读，不能拿本地名拼。
+        let refs = git::run(
+            source_dir,
+            &[
+                "for-each-ref",
+                "--format=%(HEAD)%09%(refname:short)%09%(upstream:short)%09%(upstream:remotename)%09%(upstream:remoteref)",
+                "refs/heads/",
+            ],
+        )?;
+        let found = refs.lines().find_map(|line| {
+            let mut fields = line.split('\t');
+            if fields.next() != Some("*") {
+                return None;
+            }
+            let branch = fields.next()?.to_string();
+            let upstream = fields
+                .next()
+                .filter(|up| !up.is_empty())
+                .map(str::to_string);
+            let remote = fields.next().unwrap_or_default();
+            let remote_ref = fields.next().unwrap_or_default();
+            // 上游指向本地分支（`branch.<b>.remote = .`）时 remote 是 `.`：那也照样推 `.`，
+            // 因为扫描基准就是那个本地分支，二者必须同一个来源。
+            let push_to = (!remote.is_empty() && !remote_ref.is_empty()).then(|| PushRoute {
+                remote: remote.to_string(),
+                remote_ref: remote_ref.to_string(),
+            });
+            Some((branch, upstream, push_to))
+        });
+        let (branch, upstream, push_to) = match found {
+            Some(found) => found,
+            // 空仓库（还没有第一个提交）时 `refs/heads` 是空的，只能单独问一次分支名。
+            None => {
+                let branch = git::run(source_dir, &["branch", "--show-current"])?;
+                if branch.is_empty() {
+                    return Err(CoreError {
+                        kind: ErrorKind::Git,
+                        message: "源目录当前不在任何分支上（detached HEAD）".to_string(),
+                        stderr: None,
+                    });
+                }
+                (branch, None, None)
+            }
+        };
+
+        // 比较基准：上游优先；没有上游（或上游的 tracking ref 被删）时用远端同名分支
+        // （手动推过但没建跟踪），两者都不存在才整树。`ahead`、历史扫描区间、路径规则都
+        // 从这一个函数取基准——三处各算各的就会在历史扫描里把 B2 原样复刻一遍。
+        let scan_base = push_base(source_dir, &branch, upstream.as_deref());
+
+        // `ahead` 与 `scan_base` 必须同一个基准：远端已有同名分支且已同步时，ahead 得是 0
+        // （否则会谎报「推了 N 个已有提交」，还永远走网络）。
+        // 基准算不出来（如上游配置在、tracking ref 被删）就退回整树计数，宁可不漏推。
+        let ahead = scan_base
+            .as_deref()
+            .and_then(|base| count_commits(source_dir, &format!("{base}..HEAD")))
+            .or_else(|| count_commits(source_dir, "HEAD"))
+            .unwrap_or(0);
+
+        Ok(PushTarget {
+            branch,
+            push_to,
+            ahead,
+            scan_base,
+        })
+    }
+}
+
+fn rev_exists(source_dir: &Path, rev: &str) -> bool {
+    git::run(source_dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok()
+}
+
+/// 待推区间与硬拦扫描的唯一基准：上游优先，其次远端同名分支，都没有才是 `None`（整棵 HEAD 树）。
+fn push_base(source_dir: &Path, branch: &str, upstream: Option<&str>) -> Option<String> {
+    let origin_branch = format!("origin/{branch}");
+    [upstream, Some(origin_branch.as_str())]
+        .into_iter()
+        .flatten()
+        .find(|rev| rev_exists(source_dir, rev))
+        .map(str::to_string)
+}
+
+fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
+    git::run(source_dir, &["rev-list", "--count", rev])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// `git add -A` 之后暂存区里的文件数 = 本次提交涉及的文件数。
@@ -139,54 +300,463 @@ struct Hit {
     path: String,
 }
 
-/// 在「工作区 ∪ 暂存区」上跑 9 条路径规则与 6 条内容规则。
-fn scan(source_dir: &Path) -> Result<Vec<Hit>, CoreError> {
-    let facts = state::GitFacts::read(source_dir)?;
+/// 在「工作区 ∪ 暂存区 ∪ 待推提交」上跑 9 条路径规则与 6 条内容规则。
+fn scan(
+    source_dir: &Path,
+    facts: &state::GitFacts,
+    base: Option<&str>,
+    ahead: u32,
+) -> Result<Vec<Hit>, CoreError> {
     let mut paths: Vec<_> = facts.dirty_paths().cloned().collect();
     paths.sort();
 
     let mut hits: Vec<Hit> = Vec::new();
-    for path in &paths {
-        let repo_path = path.to_string_lossy().replace('\\', "/");
-        let mut push_hit = |kind: &'static str, rule: &'static str| {
-            // 同一规则在同一文件上只报一次（暂存区与工作区各扫一遍）。
-            if !hits
-                .iter()
-                .any(|hit| hit.rule == rule && hit.path == repo_path)
-            {
-                hits.push(Hit {
-                    kind,
-                    rule,
-                    path: repo_path.clone(),
-                });
-            }
-        };
+    let mut seen: HashSet<(&'static str, String)> = HashSet::new();
 
-        for rule in PATH_RULES {
-            if path_rule_matches(rule, &repo_path) {
-                push_hit("路径", rule);
-            }
-        }
-
-        for text in contents(source_dir, path) {
-            for (rule, pattern) in CONTENT_RULES.iter().zip(CONTENT_PATTERNS.iter()) {
-                if pattern.is_match(&text) {
-                    push_hit("内容", rule);
-                }
-            }
+    // 暂存区版本：先把路径换成 blob sha，再一次 batch 取完。查询串里只出现 sha——
+    // 路径带换行/引号都不可能把一次查询切成两条，响应与查询也就永远一一对应。
+    let dirty_names: HashSet<String> = paths.iter().map(|path| repo_str(path)).collect();
+    let staged_blobs = index_blobs(source_dir, &dirty_names)?;
+    let index_specs: Vec<String> = staged_blobs.iter().map(|(_, sha)| sha.clone()).collect();
+    let index = cat_file_batch(source_dir, &index_specs)?;
+    for (path, sha) in &staged_blobs {
+        if let Some(text) = index.get(sha) {
+            check_content_rules(&mut hits, &mut seen, path, text);
         }
     }
+
+    for path in &paths {
+        let repo_path = repo_str(path);
+        check_path_rules(&mut hits, &mut seen, &repo_path);
+        // 工作区版本读磁盘；二进制按有损 UTF-8 读，不影响正则。
+        if let Ok(bytes) = std::fs::read(source_dir.join(path)) {
+            check_content_rules(
+                &mut hits,
+                &mut seen,
+                &repo_path,
+                &String::from_utf8_lossy(&bytes),
+            );
+        }
+    }
+
+    // 已提交未推送的提交：这次 push 会把它们送出去。扫的是区间里出现过的每一个 blob 版本
+    // （含之后被删掉的路径）——按最终 diff 扫会漏掉「加了又删」的那个密钥 blob。
+    let pending = pending_blobs(source_dir, base, ahead)?;
+    for blob in &pending {
+        check_path_rules(&mut hits, &mut seen, &blob.path);
+    }
+    let pending_specs: Vec<String> = pending.iter().map(|blob| blob.oid.clone()).collect();
+    let pending_contents = cat_file_batch(source_dir, &pending_specs)?;
+    for blob in &pending {
+        if let Some(text) = pending_contents.get(&blob.oid) {
+            check_content_rules(&mut hits, &mut seen, &blob.path, text);
+        }
+    }
+
     Ok(hits)
 }
 
-/// 一个路径在暂存区与工作区里的文本内容（二进制按有损 UTF-8 读，不影响正则）。
-fn contents(source_dir: &Path, repo_path: &Path) -> Vec<String> {
-    let worktree = std::fs::read(source_dir.join(repo_path))
-        .ok()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    // 未跟踪的文件不在暂存区，`git show :<路径>` 会失败，按「没有这份内容」处理。
-    let staged = git::run(source_dir, &["show", &format!(":{}", repo_path.display())]).ok();
-    worktree.into_iter().chain(staged).collect()
+/// 待推区间里的一个 blob 版本：仓库内路径 + blob sha（同一份内容只算一次）。
+struct PendingBlob {
+    path: String,
+    oid: String,
+}
+
+/// `base..HEAD` 里出现过的每个 blob 版本，按 oid 去重。
+///
+/// `rev-list --objects` 列的是「有了 base 还缺的对象」，所以区间里每个提交的树都会被展开：
+/// 提交 A 加进的 blob 即使被提交 B 删掉也在这份名单里。不扫 `--all` 也不扫整仓历史：
+/// 只扫这次真要推出去的部分，成本才有界。
+fn pending_blobs(
+    source_dir: &Path,
+    base: Option<&str>,
+    ahead: u32,
+) -> Result<Vec<PendingBlob>, CoreError> {
+    if ahead > MAX_UNPUSHED_COMMITS {
+        return Err(over_limit(
+            "未推送提交数".to_string(),
+            format!("{ahead} 个"),
+            format!("{MAX_UNPUSHED_COMMITS} 个"),
+            "请先手动 `git push` 一次，把已有提交送上远端再试",
+        ));
+    }
+    if ahead == 0 {
+        return Ok(Vec::new());
+    }
+
+    let range = match base {
+        Some(base) => format!("{base}..HEAD"),
+        None => "HEAD".to_string(),
+    };
+    let listed = git::run(source_dir, &["rev-list", "--objects", &range])?;
+    let objects = parse_objects(&listed);
+    // 路径要从 `log --raw -z` 拿：`rev-list --objects` 遇到带换行的路径会把后半截截掉，
+    // `-z` 的 raw 输出才是 NUL 结尾的完整路径。
+    let raw = git::run(
+        source_dir,
+        &[
+            "log",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "-r",
+            "--pretty=format:%H",
+            &range,
+        ],
+    )?;
+    let paths = parse_raw_paths(&raw);
+
+    let mut oids: Vec<String> = Vec::new();
+    let mut seen_oid: HashSet<&str> = HashSet::new();
+    for (oid, _) in &objects {
+        if seen_oid.insert(oid) {
+            oids.push(oid.clone());
+        }
+    }
+    // 类型与大小一次问完：非 blob（commit/tree、子模块）没内容可扫，大 blob 在拿内容之前就拦下。
+    let metas = cat_file_meta(source_dir, &oids)?;
+
+    let mut blobs: Vec<PendingBlob> = Vec::new();
+    let mut seen_blob: HashSet<String> = HashSet::new();
+    let mut total: u64 = 0;
+    for (oid, listed_path) in objects {
+        // 名单来自 rev-list，问不到类型就是仓库缺对象：宁可中止也不能当成「没内容可扫」。
+        let (kind, size) = metas.get(&oid).ok_or_else(|| missing_object(&oid))?;
+        if kind != "blob" || !seen_blob.insert(oid.clone()) {
+            continue;
+        }
+        // 优先用 raw diff 给的完整路径；没有 diff 记录（如 merge 带进来的内容）才退回 rev-list 的。
+        let path = match paths.get(&oid).filter(|path| !path.is_empty()) {
+            Some(path) => path.clone(),
+            // rev-list 的路径会被换行截断，只当兜底；连它都没有就点名 oid，别只说「未知」。
+            None if !listed_path.is_empty() => listed_path,
+            None => format!("（路径未知，blob {oid}）"),
+        };
+        if *size > MAX_BLOB_BYTES {
+            return Err(over_limit(
+                format!("单个文件版本「{path}」占"),
+                human_bytes(*size),
+                human_bytes(MAX_BLOB_BYTES),
+                "把这个提交里的它移出仓库，或先手动 `git push` 推掉这个提交再试",
+            ));
+        }
+        total += size;
+        blobs.push(PendingBlob { path, oid });
+    }
+
+    if blobs.len() > MAX_UNPUSHED_BLOBS {
+        return Err(over_limit(
+            "待扫描的文件版本数".to_string(),
+            format!("{} 个", blobs.len()),
+            format!("{MAX_UNPUSHED_BLOBS} 个"),
+            "请先手动 `git push` 一次，把已有提交送上远端再试",
+        ));
+    }
+    if total > MAX_SCAN_BYTES {
+        return Err(over_limit(
+            "待扫描内容总大小".to_string(),
+            human_bytes(total),
+            human_bytes(MAX_SCAN_BYTES),
+            "请先手动 `git push` 一次，把已有提交送上远端再试",
+        ));
+    }
+    Ok(blobs)
+}
+
+/// `git rev-list --objects` 的输出：每行 `<oid>[ <path>]`。
+///
+/// 这里只要对象名单，所以按行首 oid 取。路径只作兜底：带换行的路径会被**截断**
+/// （实测换行之后的全部内容都不出现在输出里，也就不会留下续行），所以没有「续行看起来
+/// 像新记录」的歧义；完整路径由 `parse_raw_paths` 从 `log --raw -z` 取。
+fn parse_objects(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|line| match line.split_once(' ') {
+            Some((oid, path)) if is_oid(oid) => Some((oid.to_string(), path.to_string())),
+            _ if is_oid(line) => Some((line.to_string(), String::new())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_oid(text: &str) -> bool {
+    (text.len() == 40 || text.len() == 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// `git log --raw -z` 的输出：每条 diff 是 `:旧模式 新模式 旧sha 新sha 状态\0路径\0`，
+/// 重命名/复制后面还跟一条旧路径。只收「这条提交新引入的」blob（新 sha 非全 0）：
+/// 被删掉的那个 blob 由当初引入它的提交负责，同一次 push 里会被扫到。
+fn parse_raw_paths(raw: &str) -> HashMap<String, String> {
+    let mut path_of: HashMap<String, String> = HashMap::new();
+    // (新 sha, 还要跳过的路径数)：重命名/复制先跟一条旧路径。
+    let mut pending: Option<(String, usize)> = None;
+    for token in raw.split('\0') {
+        // 提交 sha 头部与它的第一条 diff 记录在同一个 NUL 段里，拆掉头部。
+        let token = match token.split_once('\n') {
+            Some((head, rest)) if is_oid(head) && (rest.is_empty() || rest.starts_with(':')) => {
+                rest
+            }
+            _ => token,
+        };
+        if let Some((sha, skip)) = pending.as_mut() {
+            if *skip > 0 {
+                *skip -= 1;
+                continue;
+            }
+            path_of
+                .entry(sha.clone())
+                .or_insert_with(|| token.to_string());
+            pending = None;
+            continue;
+        }
+        let Some(fields) = token.strip_prefix(':') else {
+            continue;
+        };
+        let fields: Vec<&str> = fields.split(' ').collect();
+        let (Some(new_sha), Some(status)) = (fields.get(3), fields.get(4)) else {
+            continue;
+        };
+        if !is_oid(new_sha) || new_sha.bytes().all(|byte| byte == b'0') {
+            continue;
+        }
+        let skip = usize::from(status.starts_with('R') || status.starts_with('C'));
+        pending = Some((new_sha.to_string(), skip));
+    }
+    path_of
+}
+
+/// `cat-file --batch-check` 问一批对象：oid → (类型, 字节数)。
+///
+/// 每行都要对得上查询：`missing` 说明 rev-list 列出的对象在仓库里不存在，
+/// 那部分内容就扫不到 —— fail-closed，整次中止并点名 oid。
+fn cat_file_meta(
+    source_dir: &Path,
+    specs: &[String],
+) -> Result<HashMap<String, (String, u64)>, CoreError> {
+    if specs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let out = cat_file(source_dir, "--batch-check", specs)?;
+    let text = String::from_utf8_lossy(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() != specs.len() {
+        return Err(batch_parse_error(&format!(
+            "{} 条查询只回了 {} 行",
+            specs.len(),
+            lines.len()
+        )));
+    }
+    let mut metas = HashMap::with_capacity(specs.len());
+    for (spec, line) in specs.iter().zip(lines) {
+        let mut fields = line.split(' ');
+        let oid = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        if oid != spec {
+            return Err(batch_parse_error(&format!("查询「{spec}」回了「{oid}」")));
+        }
+        if kind == "missing" {
+            return Err(missing_object(spec));
+        }
+        let size = fields.next().and_then(|size| size.parse::<u64>().ok());
+        let size = size.ok_or_else(|| batch_parse_error(spec))?;
+        metas.insert(oid.to_string(), (kind.to_string(), size));
+    }
+    Ok(metas)
+}
+
+/// 待推区间里列了、却取不到的对象：仓库可能损坏，扫不了就别推。
+fn missing_object(oid: &str) -> CoreError {
+    CoreError::git(
+        format!("扫描待推提交时找不到对象 {oid}，为免漏扫这次推送已中止"),
+        "仓库可能已损坏",
+    )
+}
+
+/// 超限文案固定含四项：超了哪一项、当前值、上限、下一步该干什么。
+fn over_limit(what: String, current: String, cap: String, advice: &str) -> CoreError {
+    CoreError::io(format!(
+        "推送被拒绝：待推送内容超过安全扫描上限，为免漏扫这次推送已中止。{what} {current}，上限 {cap}：{advice}。"
+    ))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{bytes} 字节")
+    }
+}
+
+fn repo_str(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// 索引里这些路径的 blob sha（`wanted` 为空则不查）。冲突多阶段时同一路径会有多条，逐个扫。
+fn index_blobs(
+    source_dir: &Path,
+    wanted: &HashSet<String>,
+) -> Result<Vec<(String, String)>, CoreError> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw = git::run(source_dir, &["ls-files", "-s", "-z"])?;
+    Ok(parse_meta_lines(&raw, 1)
+        .into_iter()
+        .filter(|(path, _)| wanted.contains(path))
+        .collect())
+}
+
+/// `ls-files -s` 的 `-z` 输出：每条是 `<元信息>\t<路径>`，元信息里第 `sha_field`
+/// 个空格分隔字段是 blob sha。路径里有换行也无所谓，两者的分隔是 NUL。
+fn parse_meta_lines(raw: &str, sha_field: usize) -> Vec<(String, String)> {
+    raw.split('\0')
+        .filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            let sha = meta.split(' ').nth(sha_field)?.to_string();
+            Some((path.to_string(), sha))
+        })
+        .collect()
+}
+
+fn check_path_rules(hits: &mut Vec<Hit>, seen: &mut HashSet<(&'static str, String)>, path: &str) {
+    for rule in PATH_RULES {
+        if path_rule_matches(rule, path) {
+            record(hits, seen, "路径", rule, path);
+        }
+    }
+}
+
+fn check_content_rules(
+    hits: &mut Vec<Hit>,
+    seen: &mut HashSet<(&'static str, String)>,
+    path: &str,
+    text: &str,
+) {
+    for (rule, pattern) in CONTENT_RULES.iter().zip(CONTENT_PATTERNS.iter()) {
+        if pattern.is_match(text) {
+            record(hits, seen, "内容", rule, path);
+        }
+    }
+}
+
+/// 同一规则在同一文件上只报一次（暂存区、工作区、待推提交可能各扫一遍）。
+fn record(
+    hits: &mut Vec<Hit>,
+    seen: &mut HashSet<(&'static str, String)>,
+    kind: &'static str,
+    rule: &'static str,
+    path: &str,
+) {
+    if seen.insert((rule, path.to_string())) {
+        hits.push(Hit {
+            kind,
+            rule,
+            path: path.to_string(),
+        });
+    }
+}
+
+/// 一次 `git cat-file --batch` 取一批对象的内容，键是查询串（这里是 blob sha）。
+///
+/// 一个进程覆盖任意多个文件：推送耗时不再随 dirty 文件数线性增长（#16）。
+fn cat_file_batch(
+    source_dir: &Path,
+    specs: &[String],
+) -> Result<HashMap<String, String>, CoreError> {
+    if specs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let out = cat_file(source_dir, "--batch", specs)?;
+    parse_batch(&out, specs)
+}
+
+/// 一次 `git cat-file <flag>` 把查询串喂完，返回原始 stdout。
+fn cat_file(source_dir: &Path, flag: &str, specs: &[String]) -> Result<Vec<u8>, CoreError> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(source_dir)
+        .args(["cat-file", flag])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CoreError::io(format!("无法启动系统 git：{e}")))?;
+
+    // 查询串是 blob sha（`[0-9a-f]{40,64}`），不含空白与换行，`\n` 分隔不会有歧义。
+    let input = format!("{}\n", specs.join("\n"));
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| CoreError::io("git cat-file 的 stdin 没有打开"))?;
+    // 写端放后台：大仓库里输出可能超过管道缓冲，边写边等读端会互锁。
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        stdin.write_all(input.as_bytes())?;
+        stdin.flush()
+    });
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| CoreError::io(format!("读取 git cat-file 的输出失败：{e}")))?;
+    // 查询只写了一半 = git 那边少扫了文件，不能当「没命中」：写入与线程错误都整次失败。
+    writer
+        .join()
+        .map_err(|_| CoreError::io("写入 git cat-file 的查询时线程崩溃"))?
+        .map_err(|e| CoreError::io(format!("写入 git cat-file 的查询失败：{e}")))?;
+    if !out.status.success() {
+        return Err(CoreError::git(
+            format!("git cat-file {flag} 执行失败"),
+            String::from_utf8_lossy(&out.stderr).trim_end().to_string(),
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// `--batch` 的输出按查询顺序一组：`<sha> <type> <size>\n<内容>\n`（缺对象是 `<spec> missing`）。
+///
+/// 与 `cat_file_meta` 同一套口径：回显的 oid 必须就是查询的 spec，`missing` 点名 oid 报错；
+/// 其余解析不了就整次报错，不猜偏移、也不把剩余项当「没内容」（那是静默漏扫）。
+fn parse_batch(bytes: &[u8], specs: &[String]) -> Result<HashMap<String, String>, CoreError> {
+    let mut contents = HashMap::with_capacity(specs.len());
+    let mut pos = 0;
+    for spec in specs {
+        let header_end = bytes[pos..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| batch_parse_error(spec))?;
+        let header = String::from_utf8_lossy(&bytes[pos..pos + header_end]);
+        pos += header_end + 1;
+        let mut fields = header.split(' ');
+        let oid = fields.next().unwrap_or_default();
+        if oid != spec {
+            return Err(batch_parse_error(&format!("查询「{spec}」回了「{oid}」")));
+        }
+        let kind = fields.next().unwrap_or_default();
+        if kind == "missing" {
+            return Err(missing_object(spec));
+        }
+        let size = fields
+            .next()
+            .and_then(|size| size.parse::<usize>().ok())
+            .ok_or_else(|| batch_parse_error(spec))?;
+        let end = pos.checked_add(size).filter(|end| *end <= bytes.len());
+        let end = end.ok_or_else(|| batch_parse_error(spec))?;
+        contents.insert(
+            spec.clone(),
+            String::from_utf8_lossy(&bytes[pos..end]).into_owned(),
+        );
+        // 内容后面跟一字节分隔符；顺手卡上界，少给一个字节也不至于越界 panic。
+        pos = end
+            .checked_add(1)
+            .filter(|pos| *pos <= bytes.len())
+            .ok_or_else(|| batch_parse_error(spec))?;
+    }
+    Ok(contents)
+}
+
+fn batch_parse_error(spec: &str) -> CoreError {
+    CoreError::io(format!(
+        "无法解析 git cat-file 的输出（查询「{spec}」），为免漏扫这次推送中止"
+    ))
 }
 
 /// `**/<尾部>` 的匹配：尾部可以落在路径的任意一段之后。
@@ -227,4 +797,67 @@ fn blocked_error(hits: &[Hit]) -> CoreError {
         names.len(),
         names.join("；")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 仓库里缺对象时 `--batch-check` 回 `missing`：必须报错点名 oid，不能静默跳过。
+    /// （集成测试那边 rev-list 会先失败，所以这条走单元测试才验得到。）
+    #[test]
+    fn a_missing_object_is_reported_instead_of_being_skipped() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        git::run(dir.path(), &["init", "-q"]).expect("建空仓库");
+        let oid = "0".repeat(40);
+
+        let error = cat_file_meta(dir.path(), std::slice::from_ref(&oid))
+            .expect_err("missing 必须报错，不能当没内容可扫");
+
+        assert!(error.message.contains(&oid), "点名 oid：{}", error.message);
+    }
+
+    /// `--batch` 那边也回 `missing`：同样点名 oid，不说「解析失败」这种查不出病因的话。
+    #[test]
+    fn a_missing_blob_in_batch_output_names_the_oid() {
+        let oid = "a".repeat(40);
+        let error = parse_batch(
+            format!("{oid} missing\n").as_bytes(),
+            std::slice::from_ref(&oid),
+        )
+        .expect_err("missing 必须报错");
+
+        assert!(error.message.contains(&oid), "点名 oid：{}", error.message);
+    }
+
+    /// 回显的 oid 不是查询的那个：整批对不上，宁可中止也不能错位记内容。
+    #[test]
+    fn a_batch_echo_that_does_not_match_the_query_is_an_error() {
+        let spec = "a".repeat(40);
+        let other = "b".repeat(40);
+        let error = parse_batch(
+            format!("{other} blob 1\nX\n").as_bytes(),
+            std::slice::from_ref(&spec),
+        )
+        .expect_err("对不上必须报错");
+
+        assert!(
+            error.message.contains(&spec) && error.message.contains(&other),
+            "两边都要点名：{}",
+            error.message
+        );
+    }
+
+    /// 内容后面少一个分隔字节（理论上不会发生）：越界也要报错，不许 panic。
+    #[test]
+    fn a_batch_output_without_the_separator_after_content_is_an_error() {
+        let spec = "c".repeat(40);
+        let error = parse_batch(
+            format!("{spec} blob 1\nX").as_bytes(),
+            std::slice::from_ref(&spec),
+        )
+        .expect_err("少了尾分隔符必须报错");
+
+        assert!(error.message.contains("无法解析"), "{}", error.message);
+    }
 }
