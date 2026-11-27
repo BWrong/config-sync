@@ -94,17 +94,6 @@ impl AppState {
         }
     }
 
-    /// 换配置快照（只有 `save_settings` 用）。
-    fn set_runtime(&self, runtime: Runtime) {
-        match self.runtime.write() {
-            Ok(mut slot) => *slot = Arc::new(runtime),
-            Err(poisoned) => {
-                eprintln!("config-sync: 配置快照锁被毒化（有命令持锁时 panic），仍然换上新配置");
-                *poisoned.into_inner() = Arc::new(runtime);
-            }
-        }
-    }
-
     /// 写命令的互斥门闩：guard 得活在命令的整个作用域里（`let _gate = …`）。
     fn write_gate(&self) -> MutexGuard<'_, ()> {
         match self.write_gate.lock() {
@@ -119,9 +108,17 @@ impl AppState {
     /// 写命令的统一入口：先拿互斥门闩，再取配置快照，整段活儿都在门闩里跑。
     ///
     /// 读命令**不**走这里：它们只取一份快照（`runtime()`），不会被长任务排住（#31）。
-    fn write<T>(&self, work: impl FnOnce(&Runtime) -> T) -> T {
-        let _gate = self.write_gate();
-        work(&self.runtime())
+    ///
+    /// 「写」不止是改源目录里的仓库：`edit` 也走这里——它要么拉起编辑器（默认 `open`，
+    /// 或者 `editor_command` 的编辑器分支 `spawn` 即返回，持锁极短），要么（`open` 等退出码
+    /// 那支 / 需要回退时）等几十毫秒的进程退出。它动的是目标文件，跟 apply 落在同一批路径上，
+    /// 所以同样排进写队列，而不是当读命令放行。
+    fn write<T>(&self, work: impl FnOnce(&WriteScope<'_>) -> T) -> T {
+        let scope = WriteScope {
+            state: self,
+            _gate: self.write_gate(),
+        };
+        work(&scope)
     }
 
     /// 按当前源目录（重新）建立文件监视；监视不起来不阻塞启动，只是不能自动刷新。
@@ -135,6 +132,33 @@ impl AppState {
             }
         };
         *self.watcher.lock().expect("监视状态被毒化") = watcher;
+    }
+}
+
+/// 握着写门闩的句柄：拿到它才说明这条命令排在写队列里。
+///
+/// 存在的理由是 `set_runtime`：换配置快照会换掉整份 `Runtime`，必须与写命令串行。
+/// 把它做成只有 `write()` 造得出来的句柄上的方法，而不是 `AppState` 上的一个普通 `fn`，
+/// 将来就没法绕过门闩直接换（#34）。
+struct WriteScope<'a> {
+    state: &'a AppState,
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl WriteScope<'_> {
+    fn runtime(&self) -> Arc<Runtime> {
+        self.state.runtime()
+    }
+
+    /// 换配置快照（只有 `save_settings` 用）。
+    fn set_runtime(&self, runtime: Runtime) {
+        match self.state.runtime.write() {
+            Ok(mut slot) => *slot = Arc::new(runtime),
+            Err(poisoned) => {
+                eprintln!("config-sync: 配置快照锁被毒化（有命令持锁时 panic），仍然换上新配置");
+                *poisoned.into_inner() = Arc::new(runtime);
+            }
+        }
     }
 }
 
@@ -214,7 +238,7 @@ async fn has_repo(app: AppHandle) -> bool {
 async fn edit(app: AppHandle, target: String) -> Result<(), CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|runtime| runtime.core.edit(Path::new(&target)))
+            .write(|scope| scope.runtime().core.edit(Path::new(&target)))
     })
     .await
 }
@@ -241,7 +265,7 @@ async fn open_source_dir(app: AppHandle) -> Result<(), CoreError> {
 async fn clone_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
     blocking(move || {
         let state = app.state::<AppState>();
-        state.write(|runtime| runtime.core.clone(&remote))?;
+        state.write(|scope| scope.runtime().core.clone(&remote))?;
         // 克隆出来的 `home/` 现在才存在：重建监视器，别再盯着含 `.git` 的整棵树。
         state.watch(&app);
         Ok(())
@@ -254,7 +278,7 @@ async fn clone_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
 async fn set_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|runtime| runtime.core.set_remote(&remote))
+            .write(|scope| scope.runtime().core.set_remote(&remote))
     })
     .await
 }
@@ -264,7 +288,7 @@ async fn set_remote(app: AppHandle, remote: String) -> Result<(), CoreError> {
 async fn add(app: AppHandle, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome>, CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|runtime| runtime.core.add(&paths))
+            .write(|scope| scope.runtime().core.add(&paths))
     })
     .await
 }
@@ -274,7 +298,7 @@ async fn add(app: AppHandle, paths: Vec<PathBuf>) -> Result<Vec<AddOutcome>, Cor
 async fn remove(app: AppHandle, targets: Vec<PathBuf>) -> Result<Vec<RemoveOutcome>, CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|runtime| runtime.core.remove(&targets))
+            .write(|scope| scope.runtime().core.remove(&targets))
     })
     .await
 }
@@ -341,7 +365,7 @@ async fn plan_apply(
 async fn execute_apply(app: AppHandle, plan: ApplyPlan) -> Result<Vec<ApplyOutcome>, CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|runtime| runtime.core.execute_apply(&plan))
+            .write(|scope| scope.runtime().core.execute_apply(&plan))
     })
     .await
 }
@@ -372,7 +396,7 @@ async fn restore_backup(
 ) -> Result<Vec<RestoreOutcome>, CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|runtime| runtime.core.restore_backup(&plan))
+            .write(|scope| scope.runtime().core.restore_backup(&plan))
     })
     .await
 }
@@ -407,7 +431,7 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CoreErr
     blocking(move || {
         let state = app.state::<AppState>();
         // 换配置也是写操作：跟 apply / push 排在同一个队列里，不跟它们抢源目录。
-        state.write(|_| {
+        state.write(|scope| {
             let io = |message: String| CoreError {
                 kind: ErrorKind::Io,
                 message,
@@ -416,7 +440,7 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CoreErr
             let settings = settings.trimmed();
             settings.validate(&state.home).map_err(io)?;
             settings.save(&config_path(&state.home)).map_err(io)?;
-            state.set_runtime(Runtime::new(&state.home, settings, None));
+            scope.set_runtime(Runtime::new(&state.home, settings, None));
             // 源目录可能换了个地方，监视器跟着换。
             state.watch(&app);
             Ok(())
@@ -428,7 +452,11 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CoreErr
 /// 拉取：`fetch` + `merge --ff-only`，只更新源目录，不动任何目标文件。
 #[tauri::command]
 async fn pull(app: AppHandle) -> Result<(), CoreError> {
-    blocking(move || app.state::<AppState>().write(|runtime| runtime.core.pull())).await
+    blocking(move || {
+        app.state::<AppState>()
+            .write(|scope| scope.runtime().core.pull())
+    })
+    .await
 }
 
 /// 推送：硬拦 → `git add -A` → 自动提交 → `git push`，全在 Core 的一个方法里。
@@ -436,7 +464,7 @@ async fn pull(app: AppHandle) -> Result<(), CoreError> {
 async fn commit_and_push(app: AppHandle) -> Result<PushOutcome, CoreError> {
     blocking(move || {
         app.state::<AppState>()
-            .write(|runtime| runtime.core.commit_and_push())
+            .write(|scope| scope.runtime().core.commit_and_push())
     })
     .await
 }
@@ -456,8 +484,12 @@ async fn resolve_conflict(app: AppHandle, target: String, side: String) -> Resul
         }
     };
     blocking(move || {
-        app.state::<AppState>()
-            .write(|runtime| runtime.core.resolve_conflict(Path::new(&target), side))
+        app.state::<AppState>().write(|scope| {
+            scope
+                .runtime()
+                .core
+                .resolve_conflict(Path::new(&target), side)
+        })
     })
     .await
 }
@@ -715,12 +747,79 @@ mod tests {
             "中毒后读到了错的配置"
         );
         // 写路径照旧串行，且能把新配置写进去。
-        state.write(|_| {});
-        state.set_runtime(Runtime::new(root.path(), Settings::default(), None));
+        state
+            .write(|scope| scope.set_runtime(Runtime::new(root.path(), Settings::default(), None)));
         assert_eq!(
             state.runtime().settings,
             Settings::default(),
             "中毒后写不进新配置"
+        );
+    }
+
+    /// #34 验收：写门闩中毒后写命令仍严格互斥，读命令照常取快照。
+    ///
+    /// 中毒只有一种恢复方式是对的：`into_inner()` 拿回**同一把**锁，后面照旧排队。
+    /// 「毒了就放行」（换一把没人持的锁 / 干脆不锁）会让两段写命令同时跑，
+    /// 下面 `spans` 就会相交 → 红。改这段恢复逻辑时请反向验证一次。
+    #[test]
+    fn poisoned_write_gate_still_serialises_writers() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(state_with_repo(root.path()));
+
+        // 一条写命令持门闩时 panic：这就是门闩中毒的来源。
+        let poisoner = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let _gate = state.write_gate();
+                panic!("模拟写命令持门闩时 panic");
+            })
+        };
+        assert!(poisoner.join().is_err());
+        assert!(
+            state.write_gate.is_poisoned(),
+            "门闩没被毒化，这条断言就失去意义了"
+        );
+
+        // 读命令不受影响：取快照 + 真跑一次 `git status`。
+        assert_eq!(
+            state.runtime().source_dir,
+            root.path().join("source"),
+            "中毒后读到了错的配置"
+        );
+        assert!(
+            state.runtime().core.refresh().is_ok(),
+            "中毒后读命令跑不起来"
+        );
+
+        // 两段写命令并发：门闩中毒也得让它们排队。
+        let epoch = Instant::now();
+        let spans: Arc<Mutex<Vec<(Duration, Duration)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for hold in [Duration::from_millis(200), Duration::from_millis(100)] {
+            let state = Arc::clone(&state);
+            let spans = Arc::clone(&spans);
+            handles.push(std::thread::spawn(move || {
+                state.write(|_| {
+                    let start = epoch.elapsed();
+                    std::thread::sleep(hold);
+                    spans.lock().unwrap().push((start, epoch.elapsed()));
+                })
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut spans = spans.lock().unwrap().clone();
+        assert_eq!(spans.len(), 2, "两段写命令没都跑完：{spans:?}");
+        spans.sort_by_key(|(start, _)| *start);
+        let [(_, first_end), (second_start, _)] = spans[..] else {
+            unreachable!("刚断言过是两段");
+        };
+        println!("门闩中毒后两段写命令的区间：{spans:?}");
+        assert!(
+            second_start >= first_end,
+            "门闩中毒后两段写命令重叠了：{spans:?}"
         );
     }
 
@@ -781,7 +880,7 @@ mod tests {
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 let started = Instant::now();
-                let outcome = state.write(|runtime| runtime.core.commit_and_push());
+                let outcome = state.write(|scope| scope.runtime().core.commit_and_push());
                 let took = started.elapsed();
                 done.store(true, std::sync::atomic::Ordering::SeqCst);
                 (outcome, took)
