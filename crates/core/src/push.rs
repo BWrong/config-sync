@@ -285,6 +285,11 @@ struct Hit {
 }
 
 /// 在「工作区 ∪ 暂存区 ∪ 待推提交」上跑 9 条路径规则与 6 条内容规则。
+///
+/// 工作区与暂存区的内容扫描有单文件闸门：单个文件版本超过 `MAX_BLOB_BYTES`（16 MiB，
+/// 与待推 blob 一侧同一个口径）就不读内容、只走路径规则。这是有意的行为变更——6 条内容
+/// 正则对超大文件**不生效**，代价是一个 16 MiB+ 的日志/镜像不会整份进内存再被正则扫两遍。
+/// 待推 blob 那边是另一个方向：提交已经在仓库里，超限只能整次中止（跳过就等于漏扫）。
 fn scan(
     source_dir: &Path,
     facts: &state::GitFacts,
@@ -302,7 +307,18 @@ fn scan(
     let dirty_names: HashSet<String> = paths.iter().map(|path| repo_str(path)).collect();
     let staged_blobs = index_blobs(source_dir, &dirty_names)?;
     let index_specs: Vec<String> = staged_blobs.iter().map(|(_, sha)| sha.clone()).collect();
-    let index = cat_file_batch(source_dir, &index_specs)?;
+    // 先只问 size，超过闸门的版本不取内容（取内容就是整份进内存）。
+    let index_metas = cat_file_meta(source_dir, &index_specs)?;
+    let scannable_specs: Vec<String> = index_specs
+        .iter()
+        .filter(|sha| {
+            index_metas
+                .get(*sha)
+                .is_some_and(|(_, size)| *size <= MAX_BLOB_BYTES)
+        })
+        .cloned()
+        .collect();
+    let index = cat_file_batch(source_dir, &scannable_specs)?;
     for (path, sha) in &staged_blobs {
         if let Some(text) = index.get(sha) {
             check_content_rules(&mut hits, &mut seen, path, text);
@@ -312,6 +328,10 @@ fn scan(
     for path in &paths {
         let repo_path = repo_str(path);
         check_path_rules(&mut hits, &mut seen, &repo_path);
+        // 超过闸门：不读内容，只留路径规则（行为变更见 `scan` 的文档注释）。
+        if over_blob_gate(&source_dir.join(path)) {
+            continue;
+        }
         // 工作区版本读磁盘；二进制按有损 UTF-8 读，不影响正则。
         if let Ok(bytes) = std::fs::read(source_dir.join(path)) {
             check_content_rules(
@@ -569,6 +589,12 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} 字节")
     }
+}
+
+/// 内容扫描的尺寸闸门：`metadata` 就够，绝不为了判大小先读内容。
+/// 查不到 metadata（已删除、断链等）不算超大：那种路径本来就 `fs::read` 不出内容。
+fn over_blob_gate(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_BLOB_BYTES)
 }
 
 fn repo_str(path: &Path) -> String {
