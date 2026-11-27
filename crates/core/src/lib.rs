@@ -44,6 +44,11 @@ pub struct Core {
     config: Config,
 }
 
+/// `rev` 能不能解析成一个提交/引用（不存在时静默为 false）。
+fn rev_exists(source_dir: &Path, rev: &str) -> bool {
+    git::run(source_dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok()
+}
+
 impl Core {
     /// `home` 是镜像布局的根（目标文件根），`source_dir` 是 git 工作区。
     pub fn new(home: impl Into<PathBuf>, source_dir: impl Into<PathBuf>, config: Config) -> Self {
@@ -90,12 +95,82 @@ impl Core {
             })?;
         }
 
-        // `-C` 已经切进源目录，目标路径用 `.`。
-        git::run(&self.source_dir, &["clone", remote, "."]).map_err(|e| CoreError {
-            message: format!("从 {remote} clone 到 {} 失败", self.source_dir.display()),
-            ..e
+        // `-C` 已经切进源目录，目标路径用 `.`。分支来自设置：clone 完就停在那个分支上，
+        // 而不是停在远端的默认分支——否则第一次拉取/推送会把改动落到另一个分支。
+        let branch = self.branch()?;
+        git::run(&self.source_dir, &["clone", "--branch", branch, remote, "."]).map_err(|e| {
+            CoreError {
+                message: format!(
+                    "从 {remote} clone 到 {} 失败（分支 {branch} 是设置里指定的，远端没有它会直接报错）",
+                    self.source_dir.display()
+                ),
+                ..e
+            }
         })?;
         Ok(())
+    }
+
+    /// 设置里的分支：clone / 拉取 / 推送三条路径唯一的来源。
+    fn branch(&self) -> Result<&str, CoreError> {
+        let branch = self.config.branch.trim();
+        if branch.is_empty() {
+            return Err(CoreError::io(
+                "设置里的分支是空的：clone / 拉取 / 推送不知道用哪个分支；去设置里填一个（比如 main）",
+            ));
+        }
+        Ok(branch)
+    }
+
+    /// 保证源目录的 HEAD 就在设置的分支上，返回那个分支名。
+    ///
+    /// 当前分支与设置不一致时：工作区干净就切过去（本地有就 `switch`，只有远端有就
+    /// `switch -c --track`）；有未提交改动就拒绝并说清楚——切分支会把这些改动带走，
+    /// 撞上冲突还会半途失败，宁可停下。拒绝时一个字节都不动，没有丢任何改动。
+    fn ensure_branch(&self) -> Result<&str, CoreError> {
+        let branch = self.branch()?;
+        if !self.has_repo() {
+            return Err(CoreError::io(format!(
+                "源目录 {} 还不是 git 仓库，先 clone",
+                self.source_dir.display()
+            )));
+        }
+
+        let current = git::run(&self.source_dir, &["branch", "--show-current"])?;
+        if current == branch {
+            return Ok(branch);
+        }
+        if current.is_empty() {
+            return Err(CoreError::io(format!(
+                "源目录不在任何分支上（detached HEAD），设置的分支是 {branch}；\
+                 先手动切回 {branch} 再重试"
+            )));
+        }
+
+        let dirty = git::run(&self.source_dir, &["status", "--porcelain"])?;
+        let dirty_count = dirty.lines().filter(|line| !line.is_empty()).count();
+        if dirty_count > 0 {
+            return Err(CoreError::io(format!(
+                "源目录当前在 {current} 上，设置的分支是 {branch}，还有 {dirty_count} 个未提交改动：\
+                 这时切分支会把改动带走或覆盖，先提交（推送）或撤掉它们再重试；没有丢任何改动"
+            )));
+        }
+
+        let local = format!("refs/heads/{branch}");
+        let tracking = format!("origin/{branch}");
+        if rev_exists(&self.source_dir, &local) {
+            git::run(&self.source_dir, &["switch", branch])?;
+        } else if rev_exists(&self.source_dir, &tracking) {
+            git::run(
+                &self.source_dir,
+                &["switch", "-c", branch, "--track", &tracking],
+            )?;
+        } else {
+            return Err(CoreError::io(format!(
+                "源目录当前在 {current} 上，设置的分支 {branch} 本地和 origin 上都没有；\
+                 先确认分支名，或拉取一次让它出现"
+            )));
+        }
+        Ok(branch)
     }
 
     /// 拉取：`fetch` 之后只允许 `merge --ff-only`。
@@ -109,20 +184,19 @@ impl Core {
             ..e
         })?;
 
-        let upstream = git::run(
-            &self.source_dir,
-            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        )
-        .map_err(|e| CoreError {
-            message: "当前分支没有上游分支，无法拉取；先推送一次建立跟踪".to_string(),
+        // 分支来自设置，不需要先有上游：`fetch` 显式给出 refspec，源目录没有
+        // `remote.origin.fetch`（clone 之外建的仓库）也不会「fetch 完什么都没更新」。
+        let branch = self.ensure_branch()?;
+        let fetched = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+
+        git::run(&self.source_dir, &["fetch", "origin", &fetched]).map_err(|e| CoreError {
+            message: format!(
+                "拉取失败：无法从远端 {remote_url} 取回最新提交（远端可能没有 {branch} 分支）"
+            ),
             ..e
         })?;
 
-        git::run(&self.source_dir, &["fetch", "origin"]).map_err(|e| CoreError {
-            message: format!("拉取失败：无法从远端 {remote_url} 取回最新提交"),
-            ..e
-        })?;
-
+        let upstream = format!("origin/{branch}");
         git::run(&self.source_dir, &["merge", "--ff-only", &upstream]).map_err(|e| CoreError {
             message: format!(
                 "拉取被拒：无法快进到 {upstream}（本机有远端没有的提交，或工作区改动挡住了合并），\

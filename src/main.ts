@@ -1179,6 +1179,7 @@ async function renderSettings(): Promise<void> {
         <label>分支
           <input name="branch" value="${escapeHtml(view.settings.branch)}"
             autocomplete="off" spellcheck="false" />
+          <small>clone / 拉取 / 推送都按这个分支。源目录当前在别的分支上时，工作区干净会切过来；有未提交改动则拒绝并提示，不静默丢改动。</small>
         </label>
         <label>编辑器命令
           <input name="editor_command" value="${escapeHtml(view.settings.editor_command)}"
