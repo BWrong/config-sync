@@ -386,8 +386,10 @@ fn relative_to_home(target: &Path, home: &Path) -> Result<PathBuf, CoreError> {
 
 /// 源文件内容的指纹，只为「预览之后源文件变过没有」这一次比对服务。
 /// 按字节数行（不做 lossy 转换）：只给超闸门时那句原因用。
+/// 与 `str::lines()` 一个口径：末行不带换行也算一行（第 2 轮 N3）。
 fn line_count(bytes: &[u8]) -> usize {
-    bytes.iter().filter(|byte| **byte == b'\n').count()
+    let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
+    newlines + usize::from(bytes.last().is_some_and(|byte| *byte != b'\n'))
 }
 
 fn digest(bytes: &[u8]) -> String {

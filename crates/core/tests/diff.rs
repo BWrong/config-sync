@@ -123,17 +123,75 @@ fn a_diff_over_the_ondemand_gate_is_truncated_not_refused() {
         diff.reason
     );
     assert!(
-        diff.reason.contains("共 120000 行"),
-        "截断要报总行数：{}",
+        diff.reason.contains("行差异") || diff.reason.contains("5000 行"),
+        "按行截断就要说按行：{}",
         diff.reason
     );
-    // 内容真的给了，但只有前 5000 行的 diff，不是 12 万行。
-    assert!(diff.text.contains("+key_004999 = value"), "{}", diff.text);
-    assert!(!diff.text.contains("+key_005000 = value"), "{}", diff.text);
+    // 内容真的给了，但只有前 5000 行（带 ---/+++/@@ 头），不是 12 万行。
+    assert!(diff.text.contains("+key_004999 = value"), "截断丢了开头");
+    assert!(
+        !diff.text.contains("+key_005000 = value"),
+        "截断点之后的行不该出现"
+    );
     assert!(
         diff.text.lines().count() < 6000,
         "{}",
         diff.text.lines().count()
+    );
+}
+
+#[test]
+fn a_single_line_file_is_cut_by_bytes_not_dumped_whole() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 5 MiB 且没有换行：按行截一点都不剩，只能按字节截（第 2 轮 B1）。
+    f.write_source("home/blob.json", "old\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home("blob.json", &"x".repeat(5 * 1024 * 1024));
+
+    let diff = core.diff(&target).unwrap();
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(diff.truncated, "{diff:?}");
+    assert!(
+        diff.text.len() <= 400 * 1024,
+        "单行 5 MiB 被整段塞出来了：{} 字节",
+        diff.text.len()
+    );
+    assert!(
+        diff.text.is_char_boundary(diff.text.len()),
+        "截断落在了半个字符上"
+    );
+    assert!(
+        diff.reason.contains("按字节"),
+        "按字节截就得说按字节：{}",
+        diff.reason
+    );
+}
+
+#[test]
+fn a_difference_past_the_truncation_point_still_shows_something() {
+    let f = fixtures::Fixture::new();
+    let core = f.core();
+    // 12 万行只有最后一行不同：整份 diff 只有一个末尾的 hunk，截断不能把它截成空（第 2 轮 N1）。
+    let body: String = (0..120_000)
+        .map(|i| format!("key_{i:06} = value\n"))
+        .collect();
+    f.write_source("home/tail.conf", &body);
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let target = f.write_home(
+        "tail.conf",
+        &body.replace("key_119999 = value", "key_119999 = changed"),
+    );
+
+    let diff = core.diff(&target).unwrap();
+    assert!(!diff.omitted, "{diff:?}");
+    assert!(diff.truncated, "{diff:?}");
+    assert!(
+        diff.text.contains("-key_119999 = changed") && diff.text.contains("+key_119999 = value"),
+        "差异在第 12 万行时也得能看见：{:?}",
+        diff.text
     );
 }
 

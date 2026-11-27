@@ -293,11 +293,39 @@ impl Core {
                 String::new(),
             ));
         }
+        // 先算全文再截不可行：12 万行的全量 diff 要两分多钟（第 2 轮 B1）。
+        // 只对比头/尾两个窗口，窗口自己有字节与行数上限，单行大文件也压得住。
+        let head_old = head_window(&old);
+        let head_new = head_window(&new);
+        let head_diff = unified_diff(&old_label, &new_label, &head_old, &head_new);
+        if !head_diff.is_empty() {
+            let reason = if head_old.ends_with('\n') && head_new.ends_with('\n') {
+                format!(
+                    "已截断：每侧只对比了前 {DIFF_TRUNCATE_LINES} 行，完整内容请在编辑器里对比原文件"
+                )
+            } else {
+                format!(
+                    "已截断：每侧只对比了前 {} KB 字节（有超长行，按字节切），完整内容请在编辑器里对比原文件",
+                    DIFF_WINDOW_BYTES / 1024
+                )
+            };
+            return Ok(done(head_diff, false, true, reason));
+        }
+        // 差异全在头部窗口之外：给末尾窗口，别让用户点开看到空白（第 2 轮 N1）。
+        let tail_diff = unified_diff(
+            &old_label,
+            &new_label,
+            &tail_window(&old),
+            &tail_window(&new),
+        );
         Ok(done(
-            unified_diff(&old_label, &new_label, &head_lines(&old), &head_lines(&new)),
+            tail_diff,
             false,
             true,
-            format!("已截断：仅显示前 {DIFF_TRUNCATE_LINES} 行（共 {lines} 行）"),
+            format!(
+                "已截断：前 {DIFF_TRUNCATE_LINES} 行内没有差异，只对比了末尾 {DIFF_TRUNCATE_LINES} 行，\
+                 完整内容请在编辑器里对比原文件"
+            ),
         ))
     }
 
@@ -461,12 +489,55 @@ fn diff_side(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{} 不是 UTF-8 文本", path.display()))
 }
 
-/// 前 `DIFF_TRUNCATE_LINES` 行：截断后的 diff 只算这一段。
-fn head_lines(text: &str) -> String {
-    text.lines()
-        .take(DIFF_TRUNCATE_LINES)
-        .map(|line| format!("{line}\n"))
-        .collect()
+/// 头部窗口：最多 `DIFF_TRUNCATE_LINES` 行、`DIFF_WINDOW_BYTES` 字节，先到先算。
+///
+/// 单行大文件（压缩的 JSON、min.js、整条证书链）没有换行可切，只能按字节切在这一行里，
+/// 落点退到 char 边界，不切半个 UTF-8 字符（第 2 轮 B1）。
+fn head_window(text: &str) -> String {
+    let mut kept = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if index == DIFF_TRUNCATE_LINES {
+            break;
+        }
+        if kept.len() + line.len() + 1 > DIFF_WINDOW_BYTES {
+            if kept.is_empty() {
+                let at = floor_char_boundary(line, DIFF_WINDOW_BYTES);
+                kept.push_str(&line[..at]);
+            }
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
+/// 尾部窗口：差异全在头部窗口之外时用，上限同上（第 2 轮 N1）。
+fn tail_window(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut bytes = 0;
+    for line in text.lines().rev().take(DIFF_TRUNCATE_LINES) {
+        let extra = line.len() + 1;
+        if bytes + extra > DIFF_WINDOW_BYTES {
+            if kept.is_empty() {
+                let from = floor_char_boundary(line, line.len().saturating_sub(DIFF_WINDOW_BYTES));
+                kept.push(&line[from..]);
+            }
+            break;
+        }
+        kept.push(line);
+        bytes += extra;
+    }
+    kept.iter().rev().map(|line| format!("{line}\n")).collect()
+}
+
+/// 不超过 `at` 的 char 边界。
+fn floor_char_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// `git show <rev>:<路径>`；该版本里没有这个文件时按空内容（新增/删除的一侧）。
@@ -483,12 +554,14 @@ pub(crate) const DIFF_MAX_BYTES: usize = 256 * 1024;
 const DIFF_MAX_LINES: usize = 5000;
 
 /// 显式「点击查看」侧的闸门：用户主动点开一个文件，比预览宽两个数量级。
-/// 超过它也不算全量，只算前 `DIFF_TRUNCATE_LINES` 行并说明截断（#17 S2）。
+/// 超过它也不算全量，只对比头/尾窗口并说明截断（#17 S2）。
 const DIFF_ONDEMAND_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DIFF_ONDEMAND_MAX_LINES: usize = 100_000;
 
-/// 超过按需闸门时保留的行数。
+/// 超过按需闸门时只对比这两段窗口，每侧各有行数与字节上限（#17 S2）。
+/// 不算全量再截：12 万行的全量 diff 要两分多钟，比不截还糟（第 2 轮 B1）。
 const DIFF_TRUNCATE_LINES: usize = 5000;
+const DIFF_WINDOW_BYTES: usize = 256 * 1024;
 
 /// 显式 diff 的硬上限：再大就不读进内存，直接说「无法在此预览」。
 const DIFF_HARD_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -509,8 +582,8 @@ fn too_large_reason(bytes: usize, lines: Option<usize>) -> String {
             bytes.div_ceil(1024),
         ),
         None => format!(
-            "{DIFF_TOO_LARGE}：最大的一侧 {} KB，已超过 {limit} KB 的上限，没有读入内容；\
-             请在编辑器里对比这两个文件",
+            "{DIFF_TOO_LARGE}：最大的一侧 {} KB，已超过 {limit} KB 的上限，\
+             超过上限的那一侧没有读入内存；请在编辑器里对比这两个文件",
             bytes.div_ceil(1024),
         ),
     }

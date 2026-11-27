@@ -656,7 +656,7 @@ ${SETTINGS_BUTTON}
 
   app.querySelector<HTMLButtonElement>("[data-cancel-apply]")?.addEventListener("click", () => void cancelApply());
   app.querySelectorAll<HTMLElement>("[data-apply-diff]").forEach((hint) => {
-    hint.addEventListener("click", async () => {
+    const open = async (): Promise<void> => {
       hint.textContent = "正在读取差异…";
       try {
         const diff = await invoke<FileDiff>("diff", { target: hint.dataset.applyDiff });
@@ -664,6 +664,13 @@ ${SETTINGS_BUTTON}
       } catch (error) {
         hint.outerHTML = errorPanel(error);
       }
+    };
+    hint.addEventListener("click", () => void open());
+    // role="button" 就要能用键盘开（第 2 轮 N2）。
+    hint.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      void open();
     });
   });
   app.querySelector<HTMLButtonElement>(".confirm-apply")?.addEventListener("click", () => void confirmApply());

@@ -542,8 +542,9 @@ fn an_oversized_target_is_not_read_into_memory() {
     let big = item(&plan, &target);
     assert_eq!(big.action, ApplyAction::Overwrite);
     assert!(big.diff_omitted, "{}", big.diff_reason);
+    // 措辞别过头：源侧是读了的，只说「超过上限的那一侧没有读入内存」（第 2 轮 N3）。
     assert!(
-        big.diff_reason.contains("没有读入内容"),
+        big.diff_reason.contains("没有读入内存"),
         "{}",
         big.diff_reason
     );
@@ -570,9 +571,9 @@ fn an_oversized_pair_of_equal_size_is_read_but_never_diffed() {
         "{}",
         big.diff_reason
     );
-    // 读过就别再说「没有读入内容」：这句得报实际行数。
+    // 读过就别再说「没有读入内存」：这句得报实际行数。
     assert!(
-        !big.diff_reason.contains("没有读入内容"),
+        !big.diff_reason.contains("没有读入内存"),
         "{}",
         big.diff_reason
     );
