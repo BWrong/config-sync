@@ -185,26 +185,30 @@ impl PushTarget {
             }
         };
 
-        // 没有上游时本机所有提交都还没推出去；算不出来就按「全都算」处理，宁可不漏推。
-        let ahead = upstream
+        // 比较基准：上游优先；没有上游（或上游的 tracking ref 被删）时用远端同名分支
+        // （手动推过但没建跟踪），两者都不存在才整树。
+        let origin_branch = format!("origin/{branch}");
+        let scan_base = [upstream.as_deref(), Some(origin_branch.as_str())]
+            .into_iter()
+            .flatten()
+            .find(|rev| rev_exists(source_dir, rev))
+            .map(str::to_string);
+
+        // `ahead` 与 `scan_base` 必须同一个基准：远端已有同名分支且已同步时，ahead 得是 0
+        // （否则会谎报「推了 N 个已有提交」，还永远走网络）。
+        // 基准算不出来（如上游配置在、tracking ref 被删）就退回整树计数，宁可不漏推。
+        let ahead = scan_base
             .as_deref()
-            .and_then(|up| count_commits(source_dir, &format!("{up}..HEAD")))
+            .and_then(|base| count_commits(source_dir, &format!("{base}..HEAD")))
             .or_else(|| count_commits(source_dir, "HEAD"))
             .unwrap_or(0);
 
-        // 远端已有同名分支（手动推过但没建跟踪）时只扫它之后的提交，否则扫整个 HEAD 树。
-        let scan_base = match &upstream {
-            Some(up) => Some(up.clone()),
-            None => {
-                let origin_branch = format!("origin/{branch}");
-                git::run(source_dir, &["rev-parse", "--verify", "--quiet", &origin_branch])
-                    .ok()
-                    .map(|_| origin_branch)
-            }
-        };
-
         Ok(PushTarget { branch, upstream, ahead, scan_base })
     }
+}
+
+fn rev_exists(source_dir: &Path, rev: &str) -> bool {
+    git::run(source_dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok()
 }
 
 fn count_commits(source_dir: &Path, rev: &str) -> Option<u32> {
@@ -236,9 +240,17 @@ fn scan(
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen: HashSet<(&'static str, String)> = HashSet::new();
 
-    // 暂存区版本一次 batch 全部取完（未跟踪的文件不在暂存区，batch 会回 missing）。
-    let index_specs: Vec<String> = paths.iter().map(|path| index_spec(path)).collect();
+    // 暂存区版本：先把路径换成 blob sha，再一次 batch 取完。查询串里只出现 sha——
+    // 路径带换行/引号都不可能把一次查询切成两条，响应与查询也就永远一一对应。
+    let dirty_names: HashSet<String> = paths.iter().map(|path| repo_str(path)).collect();
+    let staged_blobs = index_blobs(source_dir, &dirty_names)?;
+    let index_specs: Vec<String> = staged_blobs.iter().map(|(_, sha)| sha.clone()).collect();
     let index = cat_file_batch(source_dir, &index_specs)?;
+    for (path, sha) in &staged_blobs {
+        if let Some(text) = index.get(sha) {
+            check_content_rules(&mut hits, &mut seen, path, text);
+        }
+    }
 
     for path in &paths {
         let repo_path = repo_str(path);
@@ -247,19 +259,19 @@ fn scan(
         if let Ok(bytes) = std::fs::read(source_dir.join(path)) {
             check_content_rules(&mut hits, &mut seen, &repo_path, &String::from_utf8_lossy(&bytes));
         }
-        if let Some(bytes) = index.get(&index_spec(path)) {
-            check_content_rules(&mut hits, &mut seen, &repo_path, bytes);
-        }
     }
 
     // 已提交未推送的提交：这次 push 会把它们送出去，内容按 HEAD 里的版本扫。
     let ahead = ahead_paths(source_dir, base)?;
-    let head_specs: Vec<String> = ahead.iter().map(|path| format!("HEAD:{path}")).collect();
-    let head = cat_file_batch(source_dir, &head_specs)?;
     for path in &ahead {
         check_path_rules(&mut hits, &mut seen, path);
-        if let Some(bytes) = head.get(&format!("HEAD:{path}")) {
-            check_content_rules(&mut hits, &mut seen, path, bytes);
+    }
+    let head_blobs = tree_blobs(source_dir, &ahead)?;
+    let head_specs: Vec<String> = head_blobs.iter().map(|(_, sha)| sha.clone()).collect();
+    let head = cat_file_batch(source_dir, &head_specs)?;
+    for (path, sha) in &head_blobs {
+        if let Some(text) = head.get(sha) {
+            check_content_rules(&mut hits, &mut seen, path, text);
         }
     }
 
@@ -270,9 +282,42 @@ fn repo_str(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// 暂存区里这个路径的对象名；未跟踪的文件取不到，batch 会回 `missing`。
-fn index_spec(path: &Path) -> String {
-    format!(":{}", repo_str(path))
+/// 索引里这些路径的 blob sha（`wanted` 为空则不查）。冲突多阶段时同一路径会有多条，逐个扫。
+fn index_blobs(
+    source_dir: &Path,
+    wanted: &HashSet<String>,
+) -> Result<Vec<(String, String)>, CoreError> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw = git::run(source_dir, &["ls-files", "-s", "-z"])?;
+    Ok(parse_meta_lines(&raw, 1)
+        .into_iter()
+        .filter(|(path, _)| wanted.contains(path))
+        .collect())
+}
+
+/// `HEAD` 树里这些路径的 blob sha。
+fn tree_blobs(source_dir: &Path, paths: &[String]) -> Result<Vec<(String, String)>, CoreError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["ls-tree", "-r", "-z", "HEAD", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let raw = git::run(source_dir, &args)?;
+    Ok(parse_meta_lines(&raw, 2))
+}
+
+/// `ls-files -s` / `ls-tree` 的 `-z` 输出：每条是 `<元信息>\t<路径>`，元信息里第 `sha_field`
+/// 个空格分隔字段是 blob sha。路径里有换行也无所谓，两者的分隔是 NUL。
+fn parse_meta_lines(raw: &str, sha_field: usize) -> Vec<(String, String)> {
+    raw.split('\0')
+        .filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            let sha = meta.split(' ').nth(sha_field)?.to_string();
+            Some((path.to_string(), sha))
+        })
+        .collect()
 }
 
 fn check_path_rules(hits: &mut Vec<Hit>, seen: &mut HashSet<(&'static str, String)>, path: &str) {
@@ -328,7 +373,7 @@ fn ahead_paths(source_dir: &Path, base: Option<&str>) -> Result<Vec<String>, Cor
     Ok(raw.split('\0').filter(|path| !path.is_empty()).map(str::to_string).collect())
 }
 
-/// 一次 `git cat-file --batch` 取一批对象的内容，键是查询串（`:路径` 或 `HEAD:路径`）。
+/// 一次 `git cat-file --batch` 取一批对象的内容，键是查询串（这里是 blob sha）。
 ///
 /// 一个进程覆盖任意多个文件：推送耗时不再随 dirty 文件数线性增长（#16）。
 fn cat_file_batch(
@@ -348,47 +393,65 @@ fn cat_file_batch(
         .spawn()
         .map_err(|e| CoreError::io(format!("无法启动系统 git：{e}")))?;
 
+    // 查询串是 blob sha（`[0-9a-f]{40,64}`），不含空白与换行，`\n` 分隔不会有歧义。
     let input = format!("{}\n", specs.join("\n"));
-    let mut stdin = child.stdin.take().expect("stdin 已设为 piped");
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| CoreError::io("git cat-file 的 stdin 没有打开"))?;
     // 写端放后台：大仓库里输出可能超过管道缓冲，边写边等读端会互锁。
-    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        stdin.write_all(input.as_bytes())?;
+        stdin.flush()
+    });
 
     let out = child
         .wait_with_output()
         .map_err(|e| CoreError::io(format!("读取 git cat-file 的输出失败：{e}")))?;
-    let _ = writer.join();
+    // 查询只写了一半 = git 那边少扫了文件，不能当「没命中」：写入与线程错误都整次失败。
+    writer
+        .join()
+        .map_err(|_| CoreError::io("写入 git cat-file 的查询时线程崩溃"))?
+        .map_err(|e| CoreError::io(format!("写入 git cat-file 的查询失败：{e}")))?;
     if !out.status.success() {
         return Err(CoreError::git(
             "git cat-file --batch 执行失败",
             String::from_utf8_lossy(&out.stderr).trim_end().to_string(),
         ));
     }
-    Ok(parse_batch(&out.stdout, specs))
+    parse_batch(&out.stdout, specs)
 }
 
-/// `--batch` 的输出按查询顺序一组：`<sha> <type> <size>\n<内容>\n`，缺失时是 `<名字> missing\n`。
-fn parse_batch(bytes: &[u8], specs: &[String]) -> HashMap<String, String> {
-    let mut contents = HashMap::new();
+/// `--batch` 的输出按查询顺序一组：`<sha> <type> <size>\n<内容>\n`。
+///
+/// 查询串只包含索引 / HEAD 里确实存在的 blob sha，所以每一组都必须解析成功；
+/// 解析不了就整次报错，不猜偏移、也不把剩余项当「没内容」（那是静默漏扫）。
+fn parse_batch(bytes: &[u8], specs: &[String]) -> Result<HashMap<String, String>, CoreError> {
+    let mut contents = HashMap::with_capacity(specs.len());
     let mut pos = 0;
     for spec in specs {
-        let Some(end) = bytes[pos..].iter().position(|byte| *byte == b'\n') else { break };
-        let header = String::from_utf8_lossy(&bytes[pos..pos + end]).into_owned();
-        pos += end + 1;
-        if header.ends_with(" missing") {
-            continue;
-        }
-        let Some(size) = header.rsplit_once(' ').and_then(|(_, size)| size.parse::<usize>().ok())
-        else {
-            break; // 头都解析不了就别猜偏移，剩下的当没有内容。
-        };
-        if pos + size > bytes.len() {
-            break;
-        }
-        let text = String::from_utf8_lossy(&bytes[pos..pos + size]).into_owned();
-        pos += size + 1; // 内容后面跟一字节分隔换行。
-        contents.insert(spec.clone(), text);
+        let header_end = bytes[pos..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| batch_parse_error(spec))?;
+        let header = String::from_utf8_lossy(&bytes[pos..pos + header_end]);
+        pos += header_end + 1;
+        let size = header
+            .rsplit_once(' ')
+            .and_then(|(_, size)| size.parse::<usize>().ok())
+            .ok_or_else(|| batch_parse_error(spec))?;
+        let end = pos.checked_add(size).filter(|end| *end <= bytes.len());
+        let end = end.ok_or_else(|| batch_parse_error(spec))?;
+        contents.insert(spec.clone(), String::from_utf8_lossy(&bytes[pos..end]).into_owned());
+        pos = end + 1; // 内容后面跟一字节分隔符。
     }
-    contents
+    Ok(contents)
+}
+
+fn batch_parse_error(spec: &str) -> CoreError {
+    CoreError::io(format!(
+        "无法解析 git cat-file 的输出（查询「{spec}」），为免漏扫这次推送中止"
+    ))
 }
 
 /// `**/<尾部>` 的匹配：尾部可以落在路径的任意一段之后。

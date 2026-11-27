@@ -305,3 +305,93 @@ fn a_first_push_with_local_changes_commits_and_sets_tracking() {
     assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha());
     assert_message_shape(&outcome.message, 1);
 }
+
+/// 路径里带换行（`cat-file` 查询串的分隔符）：工作区版本照样要拦。
+#[test]
+fn a_secret_in_a_path_containing_a_newline_is_blocked_in_the_workspace() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/bad\nname.txt", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+
+    let error = assert_blocked(&f, &f.core());
+
+    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
+    assert!(error.message.contains("home/bad\nname.txt"), "文件没被点名：{}", error.message);
+}
+
+/// 同一个路径，密钥只留在暂存区（工作区已经改干净）也必须拦。
+#[test]
+fn a_secret_in_a_path_containing_a_newline_is_blocked_in_the_index() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/bad\nname.txt", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+    f.git(&["add", "-A"]);
+    f.write_source("home/bad\nname.txt", "clean now\n");
+
+    let error = f.core().commit_and_push().expect_err("暂存区里的密钥也必须拦");
+
+    assert!(error.message.contains("推送被拒绝"), "message = {}", error.message);
+    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
+    assert!(error.message.contains("home/bad\nname.txt"), "文件没被点名：{}", error.message);
+    assert!(!f.git_try(&["rev-parse", "--verify", "HEAD"]), "不许留下提交");
+    assert!(!f.remote.join("refs/heads/main").exists(), "远端不该收到任何东西");
+}
+
+/// 待推提交里、路径带换行的文件同样扫得到。
+#[test]
+fn a_secret_in_an_unpushed_commit_under_a_path_with_a_newline_is_blocked() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    f.write_source("home/bad\nname.txt", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+    f.commit_all("local: oops");
+    assert!(!f.is_dirty(), "前提：工作区干净，密钥只在已提交的提交里");
+
+    let error = f.core().commit_and_push().expect_err("待推提交里的密钥也必须拦");
+
+    assert!(error.message.contains("ghp_"), "规则没被点名：{}", error.message);
+    assert!(error.message.contains("home/bad\nname.txt"), "文件没被点名：{}", error.message);
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), remote_before, "远端不该收到任何东西");
+}
+
+/// 没有上游、但远端已有同名分支且已同步：ahead 必须是 0，既不谎报「推了已有提交」，
+/// 也不为「确认无事可做」跑一次网络（远端已搬走，联网必然失败）。
+#[test]
+fn a_repo_without_upstream_whose_remote_is_already_in_sync_reports_nothing_and_pushes_nothing() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("local: first");
+    // 手动推一次但不建跟踪：本地仍没有上游，远端已有同名分支。
+    f.git(&["push", "origin", "main"]);
+    assert!(!f.git_try(&["rev-parse", "--abbrev-ref", "@{u}"]), "前提：仍没有上游");
+    std::fs::rename(&f.remote, f.path("remote.offline.git")).expect("把远端挪走");
+    let before = f.head_sha();
+
+    let outcome = f.core().commit_and_push().expect("远端已同步时不该报错");
+
+    assert!(!outcome.committed, "{outcome:?}");
+    assert_eq!(outcome.existing_commits, 0, "远端已同步就不许谎报已有提交：{outcome:?}");
+    assert_eq!(f.head_sha(), before, "不许空提交");
+    assert_eq!(f.git(&["rev-parse", "origin/main"]), before, "远端跟踪分支原样不动");
+}
+
+/// 上游配置还在、远端跟踪分支却被删了：算不出 ahead 也不能当成「没有需要推送的改动」。
+#[test]
+fn a_deleted_remote_tracking_ref_does_not_hide_local_commits() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("local: first");
+    f.push();
+    f.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+    f.write_source("home/.zshrc", "export A=2\n");
+    f.commit_all("local: second");
+    assert!(!f.is_dirty(), "前提：工作区干净，要让推进去只能靠 ahead 判断");
+
+    let outcome = f.core().commit_and_push().expect("算不出 ahead 也不能当成没事可做");
+
+    assert!(!outcome.committed, "{outcome:?}");
+    assert!(outcome.existing_commits >= 1, "{outcome:?}");
+    assert_eq!(f.git_remote(&["rev-parse", "main"]), f.head_sha(), "本地提交必须推上去");
+    assert_eq!(f.git(&["rev-parse", "origin/main"]), f.head_sha(), "推送后跟踪分支恢复");
+}
