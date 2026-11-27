@@ -72,7 +72,7 @@ branch = "main"
 
 写命令（apply / restore / push / pull / clone / set_remote / add / remove / edit / resolve_conflict /
 save_settings）在一条队列里串行，互不重叠；读命令（`refresh`、`diff`、`plan_apply`、
-`plan_restore_backup`、inventory 系、`list_backups`、`settings_view`、`has_repo`、`source_dir`、
+`plan_restore_backup`、`list_backups`、`settings_view`、`has_repo`、`source_dir`、
 `open_source_dir`、`onboarding_candidates`）**不排这条队**，也不碰它：只取一份当前配置快照就去
 干活（`src-tauri/src/lib.rs` 的 `AppState::runtime()`，锁只被持几纳秒）。
 

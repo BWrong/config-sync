@@ -78,20 +78,9 @@ impl AppState {
         }
     }
 
-    /// 当前配置快照：锁只在这几纳秒里被持着，拿到 `Arc` 就走。
-    ///
-    /// 中毒说明有命令持锁时 panic 过。这里留一行日志、拿回最后写入的内容继续，
-    /// 不让编程错误悄悄退化成「没有仓库」（#31）。
+    /// 当前配置快照（中毒处理见 `read_runtime`）。
     fn runtime(&self) -> Arc<Runtime> {
-        match self.runtime.read() {
-            Ok(runtime) => Arc::clone(&runtime),
-            Err(poisoned) => {
-                eprintln!(
-                    "config-sync: 配置快照锁被毒化（有命令持锁时 panic），先按最后写入的配置继续"
-                );
-                Arc::clone(&poisoned.into_inner())
-            }
-        }
+        read_runtime(&self.runtime)
     }
 
     /// 写命令的互斥门闩：guard 得活在命令的整个作用域里（`let _gate = …`）。
@@ -115,7 +104,7 @@ impl AppState {
     /// 所以同样排进写队列，而不是当读命令放行。
     fn write<T>(&self, work: impl FnOnce(&WriteScope<'_>) -> T) -> T {
         let scope = WriteScope {
-            state: self,
+            runtime: &self.runtime,
             _gate: self.write_gate(),
         };
         work(&scope)
@@ -135,30 +124,54 @@ impl AppState {
     }
 }
 
+/// 当前配置快照：锁只在这几纳秒里被持着，拿到 `Arc` 就走。
+///
+/// 中毒说明有命令持锁时 panic 过。这里留一行日志、拿回最后写入的内容继续，
+/// 不让编程错误悄悄退化成「没有仓库」（#31）。
+fn read_runtime(slot: &RwLock<Arc<Runtime>>) -> Arc<Runtime> {
+    match slot.read() {
+        Ok(runtime) => Arc::clone(&runtime),
+        Err(poisoned) => {
+            eprintln!(
+                "config-sync: 配置快照锁被毒化（有命令持锁时 panic），先按最后写入的配置继续"
+            );
+            Arc::clone(&poisoned.into_inner())
+        }
+    }
+}
+
+/// 整体换掉配置快照：中毒时也换（拿回最后写入的内容，再覆盖）。
+fn write_runtime(slot: &RwLock<Arc<Runtime>>, runtime: Runtime) {
+    match slot.write() {
+        Ok(mut slot) => *slot = Arc::new(runtime),
+        Err(poisoned) => {
+            eprintln!("config-sync: 配置快照锁被毒化（有命令持锁时 panic），仍然换上新配置");
+            *poisoned.into_inner() = Arc::new(runtime);
+        }
+    }
+}
+
 /// 握着写门闩的句柄：拿到它才说明这条命令排在写队列里。
 ///
 /// 存在的理由是 `set_runtime`：换配置快照会换掉整份 `Runtime`，必须与写命令串行。
 /// 把它做成只有 `write()` 造得出来的句柄上的方法，而不是 `AppState` 上的一个普通 `fn`，
 /// 将来就没法绕过门闩直接换（#34）。
+///
+/// 它刻意只交配置快照这一块、不交 `&AppState`：`AppState::write()` / `write_gate()`
+/// 会再锁一次门闩，而 `Mutex` 不可重入，写闭包里调到就是自锁。窄结构从类型上堵住这条缝（#36）。
 struct WriteScope<'a> {
-    state: &'a AppState,
+    runtime: &'a RwLock<Arc<Runtime>>,
     _gate: MutexGuard<'a, ()>,
 }
 
 impl WriteScope<'_> {
     fn runtime(&self) -> Arc<Runtime> {
-        self.state.runtime()
+        read_runtime(self.runtime)
     }
 
     /// 换配置快照（只有 `save_settings` 用）。
     fn set_runtime(&self, runtime: Runtime) {
-        match self.state.runtime.write() {
-            Ok(mut slot) => *slot = Arc::new(runtime),
-            Err(poisoned) => {
-                eprintln!("config-sync: 配置快照锁被毒化（有命令持锁时 panic），仍然换上新配置");
-                *poisoned.into_inner() = Arc::new(runtime);
-            }
-        }
+        write_runtime(self.runtime, runtime);
     }
 }
 
