@@ -313,7 +313,7 @@ fn scan(
     for (path, sha) in &staged_blobs {
         let (_, size) = index_metas.get(sha).ok_or_else(|| missing_object(sha))?;
         if *size > MAX_BLOB_BYTES {
-            return Err(blob_too_large("暂存区", path, *size));
+            return Err(blob_too_large("暂存区", &source_dir.join(path), *size));
         }
     }
     let index = cat_file_batch(source_dir, &index_specs)?;
@@ -327,7 +327,7 @@ fn scan(
         let repo_path = repo_str(path);
         check_path_rules(&mut hits, &mut seen, &repo_path);
         // 超过闸门：不读内容，整次中止（与暂存区、待推 blob 同一个 fail-closed 口径）。
-        check_worktree_size(source_dir, path, &repo_path)?;
+        check_worktree_size(source_dir, path)?;
         // 工作区版本读磁盘；二进制按有损 UTF-8 读，不影响正则。
         if let Ok(bytes) = std::fs::read(source_dir.join(path)) {
             check_content_rules(
@@ -591,19 +591,19 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 /// 超过上限不是「跳过内容扫描」，而是整次中止——跳过就等于大文件里的密钥照推。
 /// 查不到 metadata（已删除、断链等）谈不上超大：那种路径本来就 `fs::read` 不出内容，
 /// 内容规则也就没有可扫的东西（暂存区版本另有自己的闸门）。
-fn check_worktree_size(source_dir: &Path, path: &Path, repo_path: &str) -> Result<(), CoreError> {
-    match std::fs::metadata(source_dir.join(path)) {
-        Ok(meta) if meta.len() > MAX_BLOB_BYTES => {
-            Err(blob_too_large("工作区", repo_path, meta.len()))
-        }
+fn check_worktree_size(source_dir: &Path, path: &Path) -> Result<(), CoreError> {
+    let full = source_dir.join(path);
+    match std::fs::metadata(&full) {
+        Ok(meta) if meta.len() > MAX_BLOB_BYTES => Err(blob_too_large("工作区", &full, meta.len())),
         _ => Ok(()),
     }
 }
 
-/// 单个文件版本超闸门的固定四项文案：哪一个文件、当前多大、上限、怎么办。
-fn blob_too_large(origin: &str, path: &str, size: u64) -> CoreError {
+/// 单个文件版本超闸门的固定四项文案：哪一个文件（完整路径，能直接去打开）、当前多大、
+/// 上限、怎么办。尺寸一律过 `human_bytes`，上限用 `MAX_BLOB_BYTES`，与待推 blob 侧同源。
+fn blob_too_large(origin: &str, path: &Path, size: u64) -> CoreError {
     over_limit(
-        format!("{origin}文件「{path}」占"),
+        format!("{origin}文件「{}」占", path.to_string_lossy()),
         human_bytes(size),
         human_bytes(MAX_BLOB_BYTES),
         "把它移出受管目录，或先手动处理掉再推送",

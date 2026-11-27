@@ -1066,28 +1066,35 @@ fn a_local_branch_upstream_falls_back_to_origin_and_the_configured_branch() {
     assert_eq!(again.existing_commits, 0, "{again:?}");
 }
 
-/// 单个文件版本的内容扫描闸门 = `MAX_BLOB_BYTES`（16 MiB，与待推 blob 一侧同一口径）。
-/// 这里造 20 MiB 的稀疏文件：只真写开头那段内容，其余靠 `set_len` 拉长，不真写 20 MiB。
-const OVERSIZED_BYTES: u64 = 20 * 1024 * 1024;
+/// 单个文件版本的内容扫描闸门 = `MAX_BLOB_BYTES`（16 MiB，与待推 blob 一侧同一口径）；
+/// 口径是「大于才算超」，所以恰好 16 MiB 仍要整份扫描。
+const GATE_BYTES: u64 = 16 * 1024 * 1024;
 /// 闸门在失败文案里的样子（`human_bytes` 的固定格式）。
 const GATE_TEXT: &str = "16.0 MiB";
 
-fn write_oversized(f: &fixtures::Fixture, rel_path: &str, content: &str) {
+/// 造一个指定长度的稀疏文件：只真写开头那段内容，其余靠 `set_len` 拉长，不真写那么多字节。
+fn write_sparse(f: &fixtures::Fixture, rel_path: &str, content: &str, len: u64) {
     use std::io::Write;
 
     let path = f.source_dir.join(rel_path);
     std::fs::create_dir_all(path.parent().expect("必有父目录")).expect("建父目录");
     let mut file = std::fs::File::create(&path).expect("建大文件");
     file.write_all(content.as_bytes()).expect("写前缀");
-    file.set_len(OVERSIZED_BYTES).expect("拉长到闸门之上");
+    file.set_len(len).expect("拉长到指定长度");
 }
 
-/// 超过闸门的 dirty 文件不做内容扫描，但**不是跳过**：整次中止，文案点名文件与两个尺寸。
+/// 刚超过闸门的稀疏文件（20 MiB）：内容里有密钥，用来证明闸门在内容扫描之前就中止。
+fn write_oversized(f: &fixtures::Fixture, rel_path: &str, content: &str) {
+    write_sparse(f, rel_path, content, 20 * 1024 * 1024);
+}
+
+/// 超过闸门的 dirty 文件不做内容扫描，但**不是跳过**：整次中止，文案点名完整路径与两个尺寸。
 /// 跳过就等于大文件里的密钥照推——DESIGN 规则 3 明禁「超限跳过」。
 #[test]
 fn an_oversized_dirty_file_aborts_the_push_with_the_gate_message() {
     let f = fixtures::Fixture::new();
     write_oversized(&f, "home/big.log", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+    let full_path = f.source_dir.join("home/big.log");
 
     let error = f
         .core()
@@ -1095,8 +1102,10 @@ fn an_oversized_dirty_file_aborts_the_push_with_the_gate_message() {
         .expect_err("超过闸门必须整次中止，不能跳过内容扫描");
 
     assert!(
-        error.message.contains("home/big.log"),
-        "必须点名文件：{}",
+        error
+            .message
+            .contains(&full_path.to_string_lossy().to_string()),
+        "必须点名完整路径：{}",
         error.message
     );
     assert!(
@@ -1124,6 +1133,67 @@ fn an_oversized_dirty_file_aborts_the_push_with_the_gate_message() {
     );
 }
 
+/// 中止后既不提交也不推送：已经有历史时，本地 HEAD 与远端 ref 都必须一动不动
+/// （与「待推提交超限」同一个终态）。
+#[test]
+fn the_gate_aborts_before_any_commit_or_push() {
+    let f = fixtures::Fixture::new();
+    f.write_source("home/.zshrc", "export A=1\n");
+    f.commit_all("config-sync: 1 files");
+    f.push();
+    let head_before = f.head_sha();
+    let remote_before = f.git_remote(&["rev-parse", "main"]);
+
+    write_oversized(&f, "home/big.log", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
+
+    let error = f.core().commit_and_push().expect_err("超过闸门必须中止");
+    assert!(error.message.contains(GATE_TEXT), "{}", error.message);
+    assert_eq!(f.head_sha(), head_before, "不许偷偷提交");
+    assert_eq!(f.git(&["rev-list", "--count", "HEAD"]), "1", "提交数不许变");
+    assert_eq!(
+        f.git_remote(&["rev-parse", "main"]),
+        remote_before,
+        "远端 ref 不许动"
+    );
+    assert!(f.is_dirty(), "改动必须原样留着");
+}
+
+/// 边界：恰好 16 MiB 不算超（口径是 `>`），照样整份扫描。带密钥的被内容规则拦下，
+/// 干净的直接推走——两种结果都说明内容扫描真的跑了。
+#[test]
+fn a_file_exactly_at_the_gate_is_still_scanned_in_full() {
+    let f = fixtures::Fixture::new();
+    write_sparse(
+        &f,
+        "home/secret.log",
+        "GITHUB_TOKEN=ghp_0123456789abcdef\n",
+        GATE_BYTES,
+    );
+    let error = f
+        .core()
+        .commit_and_push()
+        .expect_err("正好 16 MiB 仍要扫内容，密钥必须被拦");
+    assert!(
+        error.message.contains("ghp_"),
+        "必须由内容规则拦下：{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("上限"),
+        "不该走尺寸中止：{}",
+        error.message
+    );
+
+    let g = fixtures::Fixture::new();
+    write_sparse(&g, "home/big.log", "clean\n", GATE_BYTES);
+    let outcome = g
+        .core()
+        .commit_and_push()
+        .expect("正好 16 MiB 的干净文件应当照常推送");
+    assert!(outcome.committed, "{outcome:?}");
+    assert_eq!(g.git_remote(&["rev-parse", "main"]), g.head_sha());
+}
+
 /// 暂存区里超过闸门的版本同样整次中止：工作区那份改成小小的一份干净内容，
 /// 就只剩暂存区的大版本——闸门必须也在这里 fail-closed。
 #[test]
@@ -1132,6 +1202,7 @@ fn an_oversized_staged_version_aborts_the_push_too() {
     write_oversized(&f, "home/big.log", "GITHUB_TOKEN=ghp_0123456789abcdef\n");
     f.git(&["add", "-A"]);
     f.write_source("home/big.log", "clean now\n");
+    let full_path = f.source_dir.join("home/big.log");
 
     let error = f
         .core()
@@ -1139,10 +1210,12 @@ fn an_oversized_staged_version_aborts_the_push_too() {
         .expect_err("暂存区里超过闸门的版本也必须整次中止");
 
     assert!(
-        error.message.contains("暂存区文件「home/big.log」")
+        error
+            .message
+            .contains(&format!("暂存区文件「{}」", full_path.to_string_lossy()))
             && error.message.contains("20.0 MiB")
             && error.message.contains(GATE_TEXT),
-        "必须点名暂存区文件与两个尺寸：{}",
+        "必须点名暂存区的完整路径与两个尺寸：{}",
         error.message
     );
     assert!(
