@@ -12,6 +12,9 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { branch: "main".to_string(), editor_command: String::new() }
+        Config {
+            branch: "main".to_string(),
+            editor_command: String::new(),
+        }
     }
 }

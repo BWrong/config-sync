@@ -11,7 +11,9 @@ pub(crate) const MIRROR_ROOT: &str = "home";
 /// 只接受普通文件：符号链接语义在 v1 之外（见 DESIGN.md）。但符号链接不能被
 /// **静默**跳过——调用方应把 `skipped_symlinks` 呈现给用户，否则 `ln -s` 管理的
 /// 文件会无声地不出现在清单里（C2）。
-pub(crate) fn managed_relative_paths(mirror_root: &Path) -> Result<(Vec<PathBuf>, usize), CoreError> {
+pub(crate) fn managed_relative_paths(
+    mirror_root: &Path,
+) -> Result<(Vec<PathBuf>, usize), CoreError> {
     let mut out = Vec::new();
     let mut skipped_symlinks = 0usize;
     walk(mirror_root, mirror_root, &mut out, &mut skipped_symlinks)?;
@@ -33,7 +35,8 @@ fn walk(
     };
 
     for entry in entries {
-        let entry = entry.map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", dir.display())))?;
+        let entry =
+            entry.map_err(|e| CoreError::io(format!("读取 {} 失败：{e}", dir.display())))?;
         let path = entry.path();
         let file_type = entry
             .file_type()

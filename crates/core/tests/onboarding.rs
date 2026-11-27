@@ -20,12 +20,18 @@ fn candidates_are_a_fixed_list_under_home_marked_existing_or_missing() {
 
     // 固定的一组常见配置文件，与磁盘内容无关（存在与否只体现在 exists 上）。
     for expected in ["~/.zshrc", "~/.gitconfig", "~/.config/nvim/init.lua"] {
-        assert!(paths.contains(&expected), "候选里应有 {expected}：{paths:?}");
+        assert!(
+            paths.contains(&expected),
+            "候选里应有 {expected}：{paths:?}"
+        );
     }
 
     let zshrc = candidates.iter().find(|c| c.path == "~/.zshrc").unwrap();
     assert!(zshrc.exists, "本机有 .zshrc，应标成存在");
-    let gitconfig = candidates.iter().find(|c| c.path == "~/.gitconfig").unwrap();
+    let gitconfig = candidates
+        .iter()
+        .find(|c| c.path == "~/.gitconfig")
+        .unwrap();
     assert!(!gitconfig.exists, "本机没有 .gitconfig，应标成不存在");
 
     // 候选都在 $HOME 内，交给 `add` 的是 `~/…` 形式：没有绝对路径，也没有 `..`。
@@ -50,7 +56,14 @@ fn sensitive_files_are_never_offered_as_candidates() {
     let candidates = candidates(&f);
     let offered: Vec<&str> = candidates.iter().map(|c| c.path.as_str()).collect();
 
-    for forbidden in ["history", "id_rsa", "id_ed25519", "credential", "token", "secret"] {
+    for forbidden in [
+        "history",
+        "id_rsa",
+        "id_ed25519",
+        "credential",
+        "token",
+        "secret",
+    ] {
         assert!(
             !offered.iter().any(|path| path.contains(forbidden)),
             "{forbidden} 不能出现在候选里：{offered:?}"
@@ -58,7 +71,10 @@ fn sensitive_files_are_never_offered_as_candidates() {
     }
 
     // `.ssh/config` 不是私钥，存在就该出现：过滤没有误伤整棵 .ssh。
-    let ssh_config = candidates.iter().find(|c| c.path == "~/.ssh/config").expect("缺 ~/.ssh/config");
+    let ssh_config = candidates
+        .iter()
+        .find(|c| c.path == "~/.ssh/config")
+        .expect("缺 ~/.ssh/config");
     assert!(ssh_config.exists, "{ssh_config:?}");
 }
 
@@ -78,10 +94,16 @@ fn checked_candidates_go_through_add_and_show_up_as_managed_rows() {
     assert_eq!(picked.len(), 2, "只有真存在的两个文件可勾选：{picked:?}");
 
     let outcomes = core.add(&picked).unwrap();
-    assert!(outcomes.iter().all(|o| o.result == AddResult::Added), "{outcomes:?}");
+    assert!(
+        outcomes.iter().all(|o| o.result == AddResult::Added),
+        "{outcomes:?}"
+    );
 
     // 走的是同一条 add：逐字节复制进镜像位置，$HOME 里的文件不被改写。
-    assert_eq!(std::fs::read_to_string(f.source_dir.join("home/.zshrc")).unwrap(), "export A=1\n");
+    assert_eq!(
+        std::fs::read_to_string(f.source_dir.join("home/.zshrc")).unwrap(),
+        "export A=1\n"
+    );
     assert_eq!(f.read_home(".zshrc"), "export A=1\n");
 
     let entries = core.inventory().unwrap();
@@ -90,5 +112,8 @@ fn checked_candidates_go_through_add_and_show_up_as_managed_rows() {
         vec![f.home.join(".gitconfig"), f.home.join(".zshrc")],
         "{entries:?}"
     );
-    assert!(entries.iter().all(|e| e.status == Status::PendingCommit), "{entries:?}");
+    assert!(
+        entries.iter().all(|e| e.status == Status::PendingCommit),
+        "{entries:?}"
+    );
 }

@@ -24,11 +24,19 @@ pub enum ErrorKind {
 
 impl CoreError {
     pub(crate) fn io(message: impl Into<String>) -> Self {
-        CoreError { kind: ErrorKind::Io, message: message.into(), stderr: None }
+        CoreError {
+            kind: ErrorKind::Io,
+            message: message.into(),
+            stderr: None,
+        }
     }
 
     pub(crate) fn git(message: impl Into<String>, stderr: impl Into<String>) -> Self {
-        CoreError { kind: ErrorKind::Git, message: message.into(), stderr: Some(stderr.into()) }
+        CoreError {
+            kind: ErrorKind::Git,
+            message: message.into(),
+            stderr: Some(stderr.into()),
+        }
     }
 }
 

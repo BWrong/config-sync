@@ -39,7 +39,10 @@ const CONTENT_RULES: &[&str] = &[
 ];
 
 static CONTENT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    CONTENT_RULES.iter().map(|rule| Regex::new(rule).expect("内容规则是合法正则")).collect()
+    CONTENT_RULES
+        .iter()
+        .map(|rule| Regex::new(rule).expect("内容规则是合法正则"))
+        .collect()
 });
 
 /// 一次推送的结果，供状态条显示。
@@ -73,18 +76,28 @@ impl Core {
 
         git::run(&self.source_dir, &["add", "-A"])?;
         let files = staged_file_count(&self.source_dir)?;
-        let message =
-            format!("config-sync: {files} files ({})", chrono::Local::now().format("%Y-%m-%d %H:%M"));
-        git::run(&self.source_dir, &["commit", "-m", &message])
-            .map_err(|e| CoreError { message: format!("自动提交「{message}」失败"), ..e })?;
+        let message = format!(
+            "config-sync: {files} files ({})",
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        );
+        git::run(&self.source_dir, &["commit", "-m", &message]).map_err(|e| CoreError {
+            message: format!("自动提交「{message}」失败"),
+            ..e
+        })?;
 
         // 第一次推送没有上游，顺手建立跟踪（拉取那边靠它判断能否 fetch）。
         let branch = git::run(&self.source_dir, &["branch", "--show-current"])?;
-        let push: Vec<String> = if git::run(&self.source_dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok() {
-            vec!["push".to_string()]
-        } else {
-            vec!["push".to_string(), "-u".to_string(), "origin".to_string(), branch]
-        };
+        let push: Vec<String> =
+            if git::run(&self.source_dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok() {
+                vec!["push".to_string()]
+            } else {
+                vec![
+                    "push".to_string(),
+                    "-u".to_string(),
+                    "origin".to_string(),
+                    branch,
+                ]
+            };
         let args: Vec<&str> = push.iter().map(String::as_str).collect();
         git::run(&self.source_dir, &args).map_err(|e| CoreError {
             message: format!("已自动提交「{message}」，但推送失败：远端没有接受这个提交"),
@@ -95,7 +108,12 @@ impl Core {
     }
 
     fn outcome(&self, committed: bool, files: u32, message: String) -> PushOutcome {
-        PushOutcome { committed, files, message, remote_url: self.remote_url().unwrap_or_default() }
+        PushOutcome {
+            committed,
+            files,
+            message,
+            remote_url: self.remote_url().unwrap_or_default(),
+        }
     }
 }
 
@@ -132,8 +150,15 @@ fn scan(source_dir: &Path) -> Result<Vec<Hit>, CoreError> {
         let repo_path = path.to_string_lossy().replace('\\', "/");
         let mut push_hit = |kind: &'static str, rule: &'static str| {
             // 同一规则在同一文件上只报一次（暂存区与工作区各扫一遍）。
-            if !hits.iter().any(|hit| hit.rule == rule && hit.path == repo_path) {
-                hits.push(Hit { kind, rule, path: repo_path.clone() });
+            if !hits
+                .iter()
+                .any(|hit| hit.rule == rule && hit.path == repo_path)
+            {
+                hits.push(Hit {
+                    kind,
+                    rule,
+                    path: repo_path.clone(),
+                });
             }
         };
 
@@ -160,8 +185,7 @@ fn contents(source_dir: &Path, repo_path: &Path) -> Vec<String> {
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     // 未跟踪的文件不在暂存区，`git show :<路径>` 会失败，按「没有这份内容」处理。
-    let staged =
-        git::run(source_dir, &["show", &format!(":{}", repo_path.display())]).ok();
+    let staged = git::run(source_dir, &["show", &format!(":{}", repo_path.display())]).ok();
     worktree.into_iter().chain(staged).collect()
 }
 

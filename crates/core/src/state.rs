@@ -30,7 +30,9 @@ impl GitFacts {
         let mut fields = porcelain.split('\0').filter(|field| !field.is_empty());
         while let Some(field) = fields.next() {
             // 每条是 `XY <路径>`；rename/copy 的原路径是紧跟着的下一个字段。
-            let Some((code, path)) = field.split_at_checked(3) else { continue };
+            let Some((code, path)) = field.split_at_checked(3) else {
+                continue;
+            };
             let code = &code[..2];
             let path = PathBuf::from(path);
             if code.contains('U') || code == "AA" || code == "DD" {
@@ -59,7 +61,14 @@ impl GitFacts {
         } else {
             git::run(
                 source_dir,
-                &["diff", "--diff-filter=D", "--name-only", "-z", "@{u}", "HEAD"],
+                &[
+                    "diff",
+                    "--diff-filter=D",
+                    "--name-only",
+                    "-z",
+                    "@{u}",
+                    "HEAD",
+                ],
             )?
             .split('\0')
             .filter(|path| !path.is_empty())
@@ -67,7 +76,12 @@ impl GitFacts {
             .collect()
         };
 
-        Ok(GitFacts { dirty, unmerged, remote_changed, push_deleted })
+        Ok(GitFacts {
+            dirty,
+            unmerged,
+            remote_changed,
+            push_deleted,
+        })
     }
 
     /// 未提交改动涉及的仓库内路径（推送前的硬拦扫这些文件）。

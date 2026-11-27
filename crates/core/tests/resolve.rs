@@ -43,9 +43,14 @@ fn ours_keeps_the_local_version_and_commits() {
     make_conflict(&f);
     assert_eq!(only_status(&core), Status::Conflict);
 
-    core.resolve_conflict(&target(&f), Side::Ours).expect("保留本机版本应成功");
+    core.resolve_conflict(&target(&f), Side::Ours)
+        .expect("保留本机版本应成功");
     // 解决后远端仍领先（fetch 已取回），这一行从冲突回落为待拉取。
-    assert_eq!(only_status(&core), Status::PendingPull, "解决后状态回落待拉取");
+    assert_eq!(
+        only_status(&core),
+        Status::PendingPull,
+        "解决后状态回落待拉取"
+    );
 
     assert_eq!(f.read_home(".zshrc"), "export A=1\n");
     assert_eq!(
@@ -68,8 +73,13 @@ fn theirs_restores_the_remote_version_and_commits() {
     make_conflict(&f);
     assert_eq!(only_status(&core), Status::Conflict);
 
-    core.resolve_conflict(&target(&f), Side::Theirs).expect("采用远端版本应成功");
-    assert_eq!(only_status(&core), Status::Pending, "解决后源/目标不同：远端版尚未应用，目标文件还是旧版 → 待应用");
+    core.resolve_conflict(&target(&f), Side::Theirs)
+        .expect("采用远端版本应成功");
+    assert_eq!(
+        only_status(&core),
+        Status::Pending,
+        "解决后源/目标不同：远端版尚未应用，目标文件还是旧版 → 待应用"
+    );
 
     assert_eq!(f.read_home(".zshrc"), "export A=1\n");
     assert_eq!(
@@ -101,17 +111,27 @@ fn resolving_one_file_leaves_other_conflicts_and_other_dirty_files_alone() {
 
     // 只有 .zshrc 是冲突（.vimrc 本地没改，只是远端领先 → 待拉取）。
     let entries = core.inventory().expect("读取清单");
-    let zshrc = entries.iter().find(|e| e.target.ends_with(".zshrc")).unwrap();
-    let vimrc = entries.iter().find(|e| e.target.ends_with(".vimrc")).unwrap();
+    let zshrc = entries
+        .iter()
+        .find(|e| e.target.ends_with(".zshrc"))
+        .unwrap();
+    let vimrc = entries
+        .iter()
+        .find(|e| e.target.ends_with(".vimrc"))
+        .unwrap();
     assert_eq!(zshrc.status, Status::Conflict);
     assert_eq!(vimrc.status, Status::PendingPull);
 
-    core.resolve_conflict(&f.home.join(".zshrc"), Side::Ours).expect("解决 .zshrc");
+    core.resolve_conflict(&f.home.join(".zshrc"), Side::Ours)
+        .expect("解决 .zshrc");
 
     // 其它行不受影响：.vimrc 的源目录内容没被碰（只 fetch 到 refs，工作区原样），
     // 远端领先仍未解决（fetch 已把它推到 2 commits behind）→ 待拉取。
     let entries = core.inventory().expect("读取清单");
-    let vimrc = entries.iter().find(|e| e.target.ends_with(".vimrc")).unwrap();
+    let vimrc = entries
+        .iter()
+        .find(|e| e.target.ends_with(".vimrc"))
+        .unwrap();
     assert_eq!(vimrc.status, Status::PendingPull, "其它行不受影响");
     // .vimrc 内容:advance_remote 在源目录 fetch 了远端,但工作区文件保持本地提交的版本
     // （只 fetch 不 merge）；源目录内容不是 REMOTE 版,而是本地提交的 "set nocompatible\n"
@@ -134,9 +154,15 @@ fn resolving_a_non_conflicting_file_is_a_human_error() {
     f.push();
     f.write_home(".vimrc", "set nocompatible\n");
 
-    let error = core.resolve_conflict(&f.home.join(".vimrc"), Side::Ours).unwrap_err();
+    let error = core
+        .resolve_conflict(&f.home.join(".vimrc"), Side::Ours)
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Io, "{error:?}");
-    assert!(error.message.contains("不冲突"), "message = {}", error.message);
+    assert!(
+        error.message.contains("不冲突"),
+        "message = {}",
+        error.message
+    );
 }
 
 #[test]
@@ -146,12 +172,25 @@ fn resolving_a_file_kept_clean_that_is_only_ahead_on_remote_is_a_human_error() {
     // 远端领先但本地没改 → 待拉取，不是冲突，不能按文件解决。
     make_clean_remote_ahead(&f);
     let entries = core.inventory().expect("读取清单");
-    let vimrc = entries.iter().find(|e| e.target.ends_with(".vimrc")).unwrap();
-    assert_eq!(vimrc.status, Status::PendingPull, "待拉取行不该是冲突: {entries:?}");
+    let vimrc = entries
+        .iter()
+        .find(|e| e.target.ends_with(".vimrc"))
+        .unwrap();
+    assert_eq!(
+        vimrc.status,
+        Status::PendingPull,
+        "待拉取行不该是冲突: {entries:?}"
+    );
 
-    let error = core.resolve_conflict(&f.home.join(".vimrc"), Side::Ours).unwrap_err();
+    let error = core
+        .resolve_conflict(&f.home.join(".vimrc"), Side::Ours)
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Io, "{error:?}");
-    assert!(error.message.contains("不冲突"), "message = {}", error.message);
+    assert!(
+        error.message.contains("不冲突"),
+        "message = {}",
+        error.message
+    );
 }
 
 #[test]
@@ -160,11 +199,17 @@ fn resolving_a_missing_file_is_a_human_error() {
     let core = f.core();
     make_conflict(&f);
 
-        let error = core.resolve_conflict(&f.home.join(".gitconfig"), Side::Ours).unwrap_err();
-        assert_eq!(error.kind, ErrorKind::Io, "{error:?}");
-        assert!(error.message.contains("不存在"), "message = {}", error.message);
-        // fetch 前校验先拦下：不存在的文件不触发网络调用，源目录保持 make_conflict 留下的真实冲突形态。
-        assert!(f.is_dirty(), "冲突形态本身是带未提交改动的，不该被额外清理");
+    let error = core
+        .resolve_conflict(&f.home.join(".gitconfig"), Side::Ours)
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Io, "{error:?}");
+    assert!(
+        error.message.contains("不存在"),
+        "message = {}",
+        error.message
+    );
+    // fetch 前校验先拦下：不存在的文件不触发网络调用，源目录保持 make_conflict 留下的真实冲突形态。
+    assert!(f.is_dirty(), "冲突形态本身是带未提交改动的，不该被额外清理");
 }
 
 #[test]
@@ -174,9 +219,15 @@ fn resolving_a_path_outside_home_is_a_human_error() {
     make_conflict(&f);
 
     // 路径在 $HOME 外：最早被拦下，不触发 fetch。
-    let error = core.resolve_conflict(Path::new("/etc/hosts"), Side::Ours).unwrap_err();
+    let error = core
+        .resolve_conflict(Path::new("/etc/hosts"), Side::Ours)
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Io, "{error:?}");
-    assert!(error.message.contains("不在"), "message = {}", error.message);
+    assert!(
+        error.message.contains("不在"),
+        "message = {}",
+        error.message
+    );
 }
 
 #[test]
@@ -190,10 +241,14 @@ fn resolving_a_real_merge_conflict_uses_the_git_checkout_semantics() {
     f.write_source("home/.zshrc", "export A=1\nexport LOCAL=7\n");
     f.commit_all("config-sync: 1 files");
     // 真合并留下未合并状态（索引 stage 2/3）。
-    assert!(!f.git_try(&["merge", "origin/main"]), "merge 应因路径冲突失败");
+    assert!(
+        !f.git_try(&["merge", "origin/main"]),
+        "merge 应因路径冲突失败"
+    );
     assert_eq!(only_status(&core), Status::Conflict);
 
-    core.resolve_conflict(&target(&f), Side::Theirs).expect("采用远端版本应成功");
+    core.resolve_conflict(&target(&f), Side::Theirs)
+        .expect("采用远端版本应成功");
 
     assert_eq!(
         read_source(&f, "home/.zshrc"),
@@ -213,9 +268,15 @@ fn a_failed_fetch_carries_the_original_stderr() {
     let missing = format!("file://{}", f.path("missing.git").display());
     f.git(&["remote", "set-url", "origin", &missing]);
 
-    let error = core.resolve_conflict(&target(&f), Side::Theirs).unwrap_err();
+    let error = core
+        .resolve_conflict(&target(&f), Side::Theirs)
+        .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Git, "{error:?}");
-    assert!(error.message.contains("取回最新提交"), "message = {}", error.message);
+    assert!(
+        error.message.contains("取回最新提交"),
+        "message = {}",
+        error.message
+    );
     let stderr = error.stderr.unwrap();
     assert!(
         stderr.contains("does not appear to be a git repository"),
@@ -224,10 +285,17 @@ fn a_failed_fetch_carries_the_original_stderr() {
     // fetch 失败前用户已有未提交改动（make_conflict 的形态即是）：失败后那些改动都还在，
     // 没被 fetch 弄丢、没留下任何 merge/索引痕迹。
     assert!(
-        !f.git(&["status", "--porcelain"]).lines().any(|l| !l.trim().is_empty() && !l.trim_start().starts_with(" M ") && !l.trim_start().starts_with("M ")),
+        !f.git(&["status", "--porcelain"])
+            .lines()
+            .any(|l| !l.trim().is_empty()
+                && !l.trim_start().starts_with(" M ")
+                && !l.trim_start().starts_with("M ")),
         "fetch 失败不应引入新的索引/未合并条目"
     );
-    assert!(f.git(&["status", "--porcelain"]).contains("home/.zshrc"), "原有改动必须保留");
+    assert!(
+        f.git(&["status", "--porcelain"]).contains("home/.zshrc"),
+        "原有改动必须保留"
+    );
 }
 
 fn read_source(f: &fixtures::Fixture, rel: &str) -> String {
