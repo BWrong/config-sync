@@ -317,11 +317,12 @@ fn scan(
 
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+    let mut path_rules = PathRuleHits::default();
 
     // 路径规则先跑完全部路径，再进尺寸闸门：两者都拦，先后只决定用户先看到哪一条文案。
     // 命中路径规则的文件本就不该进仓库，比「太大了」更贴病因，所以哪怕它同时超大也先报它。
     for path in &paths {
-        check_path_rules(&mut hits, &mut seen, &repo_str(path));
+        check_path_rules(&mut hits, &mut seen, &mut path_rules, &repo_str(path));
     }
     if !hits.is_empty() {
         return Ok(hits);
@@ -376,7 +377,7 @@ fn scan(
     // （含之后被删掉的路径）——按最终 diff 扫会漏掉「加了又删」的那个密钥 blob。
     let pending = pending_blobs(source_dir, base, ahead)?;
     for blob in &pending {
-        check_path_rules(&mut hits, &mut seen, &blob.path);
+        check_path_rules(&mut hits, &mut seen, &mut path_rules, &blob.path);
     }
     let pending_specs: Vec<String> = pending.iter().map(|blob| blob.oid.clone()).collect();
     let pending_contents = cat_file_batch(source_dir, &pending_specs)?;
@@ -679,11 +680,51 @@ fn parse_meta_lines(raw: &str, sha_field: usize) -> Vec<(String, String)> {
         .collect()
 }
 
-fn check_path_rules(hits: &mut Vec<Hit>, seen: &mut HashSet<(&'static str, String)>, path: &str) {
-    for rule in PATH_RULES {
-        if path_rule_matches(rule, path) {
+fn check_path_rules(
+    hits: &mut Vec<Hit>,
+    seen: &mut HashSet<(&'static str, String)>,
+    rules: &mut PathRuleHits,
+    path: &str,
+) {
+    let bits = rules.of(path);
+    for (index, rule) in PATH_RULES.iter().enumerate() {
+        if bits & (1 << index) != 0 {
             record(hits, seen, "路径", rule, path);
         }
+    }
+}
+
+/// 路径规则的判定表：同一条路径只把 9 条规则跑一遍（#42-b）。
+///
+/// 一条路径会被扫不止一次：待推区间里同一个文件的多个 blob 版本、工作区改了又提交过的文件，
+/// 每进一次 `check_path_rules` 就是 9 遍字符串匹配。判定的出处仍是 `path_rule_matches`，
+/// 这里只存结果不参与推导，所以逐条结论与不加缓存时完全一样。
+#[derive(Default)]
+struct PathRuleHits {
+    /// 仓库内路径 → 命中的规则位图（bit i 对应 `PATH_RULES[i]`）。
+    bits: HashMap<String, u64>,
+    /// #42-b 的取证用：9 条规则真正被执行了多少遍。
+    #[cfg(test)]
+    evaluations: usize,
+}
+
+impl PathRuleHits {
+    fn of(&mut self, path: &str) -> u64 {
+        if let Some(bits) = self.bits.get(path) {
+            return *bits;
+        }
+        let mut bits = 0;
+        for (index, rule) in PATH_RULES.iter().enumerate() {
+            #[cfg(test)]
+            {
+                self.evaluations += 1;
+            }
+            if path_rule_matches(rule, path) {
+                bits |= 1 << index;
+            }
+        }
+        self.bits.insert(path.to_string(), bits);
+        bits
     }
 }
 
@@ -937,5 +978,76 @@ mod tests {
         .expect_err("少了尾分隔符必须报错");
 
         assert!(error.message.contains("无法解析"), "{}", error.message);
+    }
+
+    /// 路径规则的样本表：命中一条的、命中两条的、一条都不命中的、靠 `**/` 落到尾段的。
+    const RULE_SAMPLE: &[&str] = &[
+        "home/id_rsa",
+        "home/.ssh/id_ed25519",
+        "home/.ssh/id_ed25519.pub",
+        "home/credentials.json",
+        "certs/server.pem",
+        "certs/client.p12",
+        "home/.netrc",
+        "home/.zsh_history",
+        "home/.aws/credentials",
+        "id_rsa",
+        "./home/.aws/credentials",
+        "home/profile",
+        "home/notes.md",
+        "home/.ssh/known_hosts",
+    ];
+
+    /// #42-b 对拍：缓存给出的判定逐条等于直接跑规则表。
+    #[test]
+    fn the_path_rule_cache_agrees_with_the_rule_table() {
+        let mut rules = PathRuleHits::default();
+        for path in RULE_SAMPLE {
+            let bits = rules.of(path);
+            for (index, rule) in PATH_RULES.iter().enumerate() {
+                assert_eq!(
+                    bits & (1 << index) != 0,
+                    path_rule_matches(rule, path),
+                    "「{rule}」在「{path}」上对不上"
+                );
+            }
+        }
+    }
+
+    /// #42-b 幂等：同一条路径判两次结论一样，且第二次一遍规则都不跑。
+    #[test]
+    fn the_path_rule_cache_judges_each_path_once() {
+        let mut rules = PathRuleHits::default();
+        let first = rules.of("home/.ssh/id_ed25519");
+        assert_eq!(rules.evaluations, PATH_RULES.len(), "第一次要把 9 条跑一遍");
+        assert_eq!(
+            rules.of("home/.ssh/id_ed25519"),
+            first,
+            "同一输入两次判定必须一致"
+        );
+        assert_eq!(rules.evaluations, PATH_RULES.len(), "第二次一遍都不该跑");
+        let _ = rules.of("home/.ssh/id_ed25519.pub");
+        assert_eq!(rules.evaluations, PATH_RULES.len() * 2, "换一条路径才重跑");
+    }
+
+    /// #42-b：同一条路径走两遍 `check_path_rules`，报出来的命中一字不差（去重与次序不变）。
+    #[test]
+    fn the_path_rule_cache_reports_the_same_hits() {
+        let mut rules = PathRuleHits::default();
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        check_path_rules(&mut hits, &mut seen, &mut rules, "home/.ssh/id_ed25519");
+        let first: Vec<(&'static str, String)> = hits
+            .iter()
+            .map(|hit| (hit.rule, hit.path.clone()))
+            .collect();
+        check_path_rules(&mut hits, &mut seen, &mut rules, "home/.ssh/id_ed25519");
+        let again: Vec<(&'static str, String)> = hits
+            .iter()
+            .map(|hit| (hit.rule, hit.path.clone()))
+            .collect();
+
+        assert_eq!(first.len(), 2, "id_ed25519* 与 .ssh/id_* 各一条：{first:?}");
+        assert_eq!(again, first, "第二次不许再多报一条");
     }
 }

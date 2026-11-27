@@ -39,7 +39,7 @@ pub use resolve::Side;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 pub struct Core {
@@ -140,6 +140,13 @@ struct CacheData {
     planned: HashMap<PathBuf, PlannedSource>,
     planned_bytes: usize,
     fork_status: Option<ForkStatus>,
+    facts: Option<FactsCache>,
+}
+
+/// 上次读到的 git 事实，连同读它那一刻的 `.git` 身份（#42-a）。
+struct FactsCache {
+    stamp: Vec<(PathBuf, Option<Stamp>)>,
+    facts: Arc<state::GitFacts>,
 }
 
 impl Caches {
@@ -402,10 +409,35 @@ impl Core {
         self.status(&state::GitFacts::read(&self.source_dir)?)
     }
 
+    /// 上次读到的 git 事实：`.git` 里决定 `git status` 输出的那些文件一个都没动就直接复用。
+    /// 刷新已经读过一份了，点开一行 diff 不必再为一行字重跑一遍 `git status`（#42-a）。
+    ///
+    /// 失效条件：分支/HEAD、索引、refs、`FETCH_HEAD`、配置、忽略规则里任意一处变了，或者
+    /// 那份事实压根还没读过。工作区内容的改动不落进 `.git`，所以不设工作区戳——读之前之后
+    /// 的戳对不上（有别的进程正在改仓库）就照常返回但不缓存，宁可慢一次也不给出对不上号的事实。
+    fn facts(&self) -> Result<Arc<state::GitFacts>, CoreError> {
+        let stamp = git_stamp(&self.source_dir);
+        if let Some(cached) = &self.caches.lock().facts
+            && Some(&cached.stamp) == stamp.as_ref()
+        {
+            return Ok(Arc::clone(&cached.facts));
+        }
+        let facts = Arc::new(state::GitFacts::read(&self.source_dir)?);
+        if let Some(stamp) = stamp
+            && git_stamp(&self.source_dir).as_ref() == Some(&stamp)
+        {
+            self.caches.lock().facts = Some(FactsCache {
+                stamp,
+                facts: Arc::clone(&facts),
+            });
+        }
+        Ok(facts)
+    }
+
     /// 一次刷新要的两半（清单 + 状态条），同一份 git 事实算出来：
     /// 前端原来分两次 IPC 各跑一遍 git，现在一次 IPC、一份 `git status`（#19）。
     pub fn refresh(&self) -> Result<Refresh, CoreError> {
-        let facts = state::GitFacts::read(&self.source_dir)?;
+        let facts = self.facts()?;
         let entries = self.entries(&facts)?;
         let status = self.status(&facts)?;
         Ok(Refresh { entries, status })
@@ -488,7 +520,7 @@ impl Core {
         let source = self.source_dir.join(paths::MIRROR_ROOT).join(rel);
         let repo_path = repo_path(rel);
         let repo = repo_path.display().to_string();
-        let facts = state::GitFacts::read(&self.source_dir)?;
+        let facts = self.facts()?;
         // 源文件已经被删（待提交的删除）时没有可比的一侧，磁盘侧按「无可比对象」算。
         let disk = if source.is_file() {
             self.disk(rel)?
@@ -812,6 +844,53 @@ fn stamp(meta: &std::fs::Metadata) -> Option<Stamp> {
         ctime_nsec: meta.ctime_nsec(),
         ino: meta.ino(),
     })
+}
+
+/// `.git` 里决定 `git status` 输出的那些文件，以及它们此刻的身份（#42-a）。
+///
+/// 工作区内容不在里面：改一个受管文件不会动 `.git` 一个字节，那一路归清单自己比。
+/// 文件不存在记作 `None`，后来出现了也算变了。`.git` 不是目录（worktree / submodule
+/// 的 gitdir 文件）就返回 `None`：说不清就不用缓存，只慢一点，不会错。
+fn git_stamp(source_dir: &Path) -> Option<Vec<(PathBuf, Option<Stamp>)>> {
+    let git_dir = source_dir.join(".git");
+    if !git_dir.is_dir() {
+        return None;
+    }
+    let mut files = vec![
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        git_dir.join("packed-refs"),
+        git_dir.join("FETCH_HEAD"),
+        git_dir.join("config"),
+        git_dir.join("info").join("exclude"),
+        source_dir.join(".gitignore"),
+    ];
+    collect_files(&git_dir.join("refs"), &mut files);
+    files.sort();
+    Some(
+        files
+            .into_iter()
+            .map(|path| {
+                let stamp = std::fs::metadata(&path).ok().and_then(|meta| stamp(&meta));
+                (path, stamp)
+            })
+            .collect(),
+    )
+}
+
+/// 把 `dir` 下的普通文件全收进来（`refs` 里分支、标签各占一个文件）。
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
 }
 
 /// 两侧长度已确认相等时，读内容比字节（错误文案与判等口径不变）。
@@ -1256,5 +1335,66 @@ mod tests {
             cold_runs - baseline >= 4,
             "冷启动 {cold_runs} 次 vs 基线 {baseline} 次"
         );
+    }
+
+    /// #42-a：刷新刚读过的 git 事实，点开一行 diff 直接复用，不再起一个 `git status`。
+    #[test]
+    fn a_row_diff_reuses_the_facts_refresh_already_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home(tmp.path());
+        let core = Core::new(&home, repo(tmp.path()), Config::default());
+        let target = home.join("profile");
+        std::fs::write(&target, "export A=1\n").unwrap();
+
+        // 改前：diff 自己再读一遍 git 事实，凭空多一个进程。
+        git::reset_git_runs();
+        let cold = core.diff(&target).unwrap();
+        let cold_runs = git::git_runs();
+
+        core.refresh().unwrap();
+        git::reset_git_runs();
+        let warm = core.diff(&target).unwrap();
+        let warm_runs = git::git_runs();
+
+        assert_eq!(warm, cold, "复用缓存的 facts 不许改变 diff 的结论");
+        assert_eq!(cold_runs, 1, "改前每点开一行就是一次 git status");
+        assert_eq!(
+            warm_runs, 0,
+            "刷新之后点开一行：{cold_runs} 个 git 进程 → {warm_runs} 个"
+        );
+    }
+
+    /// #42-a：索引/ref 一动，缓存的事实立刻作废，结论跟着变。
+    #[test]
+    fn a_staged_change_invalidates_the_reused_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home(tmp.path());
+        let source_dir = repo(tmp.path());
+        let core = Core::new(&home, &source_dir, Config::default());
+        let target = home.join("profile");
+        std::fs::write(&target, "export A=1\n").unwrap();
+        assert_eq!(core.refresh().unwrap().entries[0].status, Status::InSync);
+
+        // 源目录里改内容再暂存：`.git/index` 变了，缓存必须当场作废。
+        std::fs::write(
+            source_dir.join(paths::MIRROR_ROOT).join("profile"),
+            "export A=2\n",
+        )
+        .unwrap();
+        git::run(&source_dir, &["add", "-A"]).unwrap();
+
+        let diff = core.diff(&target).unwrap();
+        assert_eq!(diff.status, Status::PendingCommit, "暂存了就是待提交");
+        assert!(
+            diff.text.contains("HEAD:home/profile"),
+            "待提交比的是 HEAD 与源文件：{}",
+            diff.text
+        );
+
+        // 重新读到的那份也进了缓存：接着再点一行不再重读 facts，只剩取 diff 侧内容那一次 git。
+        git::reset_git_runs();
+        let again = core.diff(&target).unwrap();
+        assert_eq!(again, diff, "同一份事实，结论不变");
+        assert_eq!(git::git_runs(), 1, "第二次点开只剩读 HEAD 内容的那一次");
     }
 }
